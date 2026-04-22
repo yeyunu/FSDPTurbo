@@ -55,7 +55,7 @@ class QuantizeConfig:
 
 
 @dataclass
-class ParallelEngineConfig:
+class FSDPTurboConfig:
     data_parallel_size: int = 1
 
     fully_shard_parallel_size: int = 1
@@ -87,7 +87,7 @@ class ParallelEngineConfig:
 
     def validate_fsdp_config(self):
         ''' fully shard plan
-        config = ParallelEngineConfig(
+        config = FSDPTurboConfig(
             fsdp_plan=FSDPPlanConfig(
                 'ignored_modules':['*mlp.experts*'],
                 'apply_modules': {
@@ -108,7 +108,7 @@ class ParallelEngineConfig:
     def validate_tp_config(self):
         ''' tensor parallelize plan
 
-        config = ParallelEngineConfig(
+        config = FSDPTurboConfig(
             tp_plan=TPPlanConfig(
                 colwise_parallel=['*.q_proj', '*.k_proj', '*.v_proj'],
                 rowwise_parallel=['*.o_proj']
@@ -123,7 +123,7 @@ class ParallelEngineConfig:
     def validate_ep_config(self):
         ''' expert parallelize plan
 
-        config = ParallelEngineConfig(
+        config = FSDPTurboConfig(
             ep_plan=EPPlanConfig(
                 apply_modules: ['*mlp.experts*'],
                 dispatcher: 'eager', 'fused', 'mc2'

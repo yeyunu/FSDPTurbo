@@ -8,7 +8,7 @@ from functools import reduce
 import torch
 from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 
-from fsdp_turbo.parallel_engine_config import ParallelEngineConfig
+from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.utils.log import print_rank
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ def get_last_mesh_dim(mesh_shape):
     return last_mesh
 
 
-def init_parallel_state(config: ParallelEngineConfig):
+def init_parallel_state(config: FSDPTurboConfig):
     field_names = {field.name for field in fields(ParallelState)}
     parallel_state_config = {k: v for k, v in asdict(config).items() if k in field_names}
     return ParallelState(**parallel_state_config)

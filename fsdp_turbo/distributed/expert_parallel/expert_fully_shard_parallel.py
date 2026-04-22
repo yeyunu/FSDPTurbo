@@ -4,7 +4,7 @@ import torch
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.tensor import Shard
 
-from fsdp_turbo.parallel_engine_config import EPPlanConfig
+from fsdp_turbo.fsdp_turbo_config import EPPlanConfig
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.str_match import module_name_match
 

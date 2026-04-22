@@ -7,7 +7,7 @@
 from typing import Dict, List, Protocol, Union
 import torch.nn as nn
 
-from fsdp_turbo.parallel_engine_config import QuantizeConfig
+from fsdp_turbo.fsdp_turbo_config import QuantizeConfig
 
 
 class ModelConverter(Protocol):

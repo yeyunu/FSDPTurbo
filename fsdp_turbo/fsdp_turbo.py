@@ -7,13 +7,13 @@ from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import \
 from fsdp_turbo.distributed.parallel_state import init_parallel_state
 from fsdp_turbo.distributed.tensor_parallel.tensor_parallel import tensor_parallel_modules
 from fsdp_turbo.memory.recompute.recompute import recompute_modules
-from fsdp_turbo.parallel_engine_config import ParallelEngineConfig
+from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.distributed.expert_parallel.expert_parallel import expert_parallelize_modules
 
 
-class MindSpeedParallelEngine(torch.nn.Module):
-    def __init__(self, config: ParallelEngineConfig, model: torch.nn.Module):
-        super(MindSpeedParallelEngine, self).__init__()
+class FSDPTurbo(torch.nn.Module):
+    def __init__(self, config: FSDPTurboConfig, model: torch.nn.Module):
+        super(FSDPTurbo, self).__init__()
         self.config = config
         self.model = model
 

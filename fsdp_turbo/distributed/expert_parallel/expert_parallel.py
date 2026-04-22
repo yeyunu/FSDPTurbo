@@ -10,7 +10,7 @@ from torch.distributed.tensor import Shard, DTensor, Replicate, distribute_tenso
 
 from fsdp_turbo.distributed.expert_parallel.dispatcher import get_experts_forward_fn
 from fsdp_turbo.distributed.expert_parallel.dispatcher_mc2 import get_experts_forward_mc2_fn
-from fsdp_turbo.parallel_engine_config import EPPlanConfig
+from fsdp_turbo.fsdp_turbo_config import EPPlanConfig
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.str_match import module_name_match
 
