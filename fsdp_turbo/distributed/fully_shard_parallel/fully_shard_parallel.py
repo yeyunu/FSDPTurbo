@@ -7,7 +7,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
-from fsdp_turbo.parallel_engine_config import FSDPPlanConfig
+from fsdp_turbo.fsdp_turbo_config import FSDPPlanConfig
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.str_match import module_name_match
 from fsdp_turbo.utils.dtype import get_dtype

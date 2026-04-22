@@ -7,7 +7,7 @@ from dataclasses import field
 import torch
 import torch_npu
 
-from fsdp_turbo.parallel_engine_config import QuantizeConfig
+from fsdp_turbo.fsdp_turbo_config import QuantizeConfig
 
 
 class FP8Format:

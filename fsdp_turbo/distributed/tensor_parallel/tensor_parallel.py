@@ -5,7 +5,7 @@ import torch
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel, SequenceParallel, parallelize_module
 
-from fsdp_turbo.parallel_engine_config import TPPlanConfig
+from fsdp_turbo.fsdp_turbo_config import TPPlanConfig
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.str_match import module_name_match
 

@@ -11,7 +11,7 @@ import torch.nn as nn
 from fsdp_turbo.quantization.mxfp8_config import get_mxfp8linear_config
 from fsdp_turbo.quantization.converter.model_converter import register_model_converter
 from fsdp_turbo.quantization.utils import module_filter_fn
-from fsdp_turbo.parallel_engine_config import QuantizeConfig
+from fsdp_turbo.fsdp_turbo_config import QuantizeConfig
 
 
 class MXLinearConverter:
