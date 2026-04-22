@@ -3,9 +3,9 @@
 import torch
 
 from torch.distributed.tensor import DTensor
-from fsdp_turbo.distributed.expert_parallel.utils import normalize_expert_args, permute, unpermute
+from fsdp_turbo.distributed.expert_parallel.utils import normalize_expert_args
 from fsdp_turbo.distributed.dist_ops import all_to_all, gather_along_first_dim_expert_parallel
-from mindspeed.ops.grouped_matmul import eager_grouped_matmul, fused_grouped_matmul
+from fsdp_turbo.ops.moe import grouped_matmul, permute, unpermute
 
 
 def get_experts_forward_fn(ep_group, fused):
@@ -38,8 +38,6 @@ def dispatch_mlp_combine(ep_group, fused, hidden_states, top_k_index, top_k_weig
                          num_global_experts,
                          expert_ids_per_ep_rank):
     gate_up_weights, down_weights = weights
-    experts_computation = fused_experts_computation if fused else eager_experts_computation
-
     # MoE preprocess to get local/global indices and AllToAll split sizes
     permute_indices, split_sizes = dispatch_preprocess(ep_group, top_k_index, num_global_experts,
                                                        expert_ids_per_ep_rank)
@@ -47,7 +45,7 @@ def dispatch_mlp_combine(ep_group, fused, hidden_states, top_k_index, top_k_weig
     hidden_states, unpermute_indices = alltoall_dispatch(ep_group, hidden_states, top_k_index, permute_indices,
                                                          split_sizes)
     hidden_states = experts_computation(hidden_states, permute_indices[0], gate_up_weights, down_weights,
-                                        act_fn)
+                                        act_fn, fused)
     hidden_states = alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes)
     return hidden_states
 
@@ -90,17 +88,10 @@ def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes
     return hidden_states, (unpermute_indices1, unpermute_indices2)
 
 
-def eager_experts_computation(hidden_states, split_list, gate_up_weights, down_weights, act_fn):
-    gate, up = eager_grouped_matmul(hidden_states, split_list, gate_up_weights).chunk(2, dim=-1)
+def experts_computation(hidden_states, split_list, gate_up_weights, down_weights, act_fn, fused):
+    gate, up = grouped_matmul(hidden_states, split_list, gate_up_weights, use_eager=not fused).chunk(2, dim=-1)
     act = act_fn(gate) * up
-    hidden_states = eager_grouped_matmul(act, split_list, down_weights)
-    return hidden_states
-
-
-def fused_experts_computation(hidden_states, split_list, gate_up_weights, down_weights, act_fn):
-    gate, up = fused_grouped_matmul(hidden_states, split_list, gate_up_weights).chunk(2, dim=-1)
-    act = act_fn(gate) * up
-    hidden_states = fused_grouped_matmul(act, split_list, down_weights)
+    hidden_states = grouped_matmul(act, split_list, down_weights, use_eager=not fused)
     return hidden_states
 
 

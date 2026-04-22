@@ -2,8 +2,7 @@
 import torch
 
 from fsdp_turbo.distributed.dist_ops import gather_along_first_dim_expert_parallel
-from fsdp_turbo.distributed.expert_parallel.utils import permute, unpermute
-from mindspeed.ops.grouped_matmul_mc2 import all2all_grouped_matmul, grouped_matmul_all2all
+from fsdp_turbo.ops.moe import permute, unpermute, all2all_grouped_matmul, grouped_matmul_all2all
 
 
 def get_experts_forward_mc2_fn(ep_group):
