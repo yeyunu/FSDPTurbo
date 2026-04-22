@@ -77,3 +77,11 @@ def module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
                 return False
 
     return False
+
+
+def view_as_n_dim(input_tensor, dim=2):
+    if dim < 2:
+        raise AssertionError("dim should be greater than or equal to 2")
+    if len(input_tensor.shape) != dim:
+        return input_tensor.view(-1, *input_tensor.shape[-dim + 1:])
+    return input_tensor
