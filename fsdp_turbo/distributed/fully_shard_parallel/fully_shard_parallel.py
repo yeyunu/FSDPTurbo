@@ -1,13 +1,13 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import logging
-from typing import Set, Any
+from typing import Set, List, Any, Optional
 
 import torch
-from torch.distributed.fsdp import fully_shard
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from fsdp_turbo.fsdp_turbo_config import FSDPPlanConfig
+from fsdp_turbo.distributed.fine_grained_fully_shard import get_fsdp_strategy
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.str_match import module_name_match
 from fsdp_turbo.utils.dtype import get_dtype
@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, fsdp_plan: FSDPPlanConfig):
     ignored_modules, ignored_params = get_ignored_modules(model, fsdp_plan)
     fsdp_modules = get_fsdp_modules(model, fsdp_plan, ignored_modules)
+    hook_modules = get_fsdp_hook_modules(model, fsdp_plan)
     mp_policy = get_mixprecision_policy(fsdp_plan)
     config = {
         'mesh': fsdp_mesh,
@@ -26,11 +27,15 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, 
         'mp_policy': mp_policy,
     }
 
+    strategy = get_fsdp_strategy(fsdp_plan.fsdp_implementation)
+    fully_shard_fn = strategy.get_unified_fully_shard_fn()
+
     for module, plan in fsdp_modules.items():
         module_config = config.copy()
         module_config.update(plan)
-        fully_shard(module, **module_config)
-    fully_shard(model, **config)
+        hook_module = find_hook_module(module, hook_modules)
+        fully_shard_fn(module, hook_module=hook_module, **config)
+    fully_shard_fn(model, **config)
     set_modules_to_prefetch(model, fsdp_modules, fsdp_plan)
     return model
 
@@ -84,6 +89,55 @@ def get_fsdp_modules(model: torch.nn.Module, fsdp_plan: FSDPPlanConfig, ignored_
     if len(fsdp_modules) == 0:
         raise RuntimeError(f'[FSDP2] No module named {fsdp_plan.apply_modules.keys()}.')
     return fsdp_modules
+
+
+def _post_order_traverse(model: torch.nn.Module, parent_path: str = ""):
+    """
+    Perform post-order traversal of model submodules.
+
+    Post-order traversal ensures child modules are visited before their parents,
+    which is important for FSDP to properly handle nested modules.
+
+    Args:
+        model: The model to traverse.
+        parent_path: The path to the current module in the hierarchy.
+
+    Yields:
+        Tuple of (module_path, module) for each module in the model.
+    """
+    for name, child in model.named_children():
+        child_path = f"{parent_path}.{name}" if parent_path else name
+        yield from _post_order_traverse(child, child_path)
+    yield parent_path, model
+
+
+def get_fsdp_hook_modules(model: torch.nn.Module, fsdp_plan: FSDPPlanConfig) -> List[Any]:
+    fsdp_hook_modules = []
+    if fsdp_plan.apply_modules is None:
+        return fsdp_hook_modules
+
+    # Traverse all modules in the model
+    if fsdp_plan.hook_modules:
+        for name, module in _post_order_traverse(model):
+            # Check if module matches any pattern in the FSDP plan
+            for pattern in fsdp_plan.hook_modules:
+                if module_name_match(pattern, name):
+                    print_rank(logger.debug, f'[FSDP2]: Apply fsdp2 hook to hook_module <{name}>')
+                    fsdp_hook_modules.append(module)
+        # Ensure at least one module matches the FSDP plan
+        if len(fsdp_hook_modules) == 0:
+            raise RuntimeError(f'[FSDP2] No module named {fsdp_plan.hook_modules}.')
+
+    return fsdp_hook_modules
+
+
+def find_hook_module(target_module: torch.nn.Module, hook_module_list: List[torch.nn.Module]) -> Optional[
+    torch.nn.Module]:
+    for hook_module in hook_module_list:
+        for _, sub_mod in hook_module.named_modules():
+            if sub_mod is target_module:
+                return hook_module
+    return None
 
 
 def get_ignored_modules(model: torch.nn.Module, fsdp_plan: FSDPPlanConfig):

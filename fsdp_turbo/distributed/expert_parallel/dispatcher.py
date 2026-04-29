@@ -13,7 +13,7 @@ def get_experts_forward_fn(ep_group, fused):
         # Ensure correct parameter order and dimensions
         top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
         hidden_states_shape = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
 
         gate_up_proj = (self.gate_up_proj.to_local()
                         if isinstance(self.gate_up_proj, DTensor)

@@ -11,14 +11,22 @@ class FSDPPlanConfig:
     apply_modules: Dict[str, Any] = None
 
     # mp_policy settings
-    param_dtype: Optional[torch.dtype] = None
-    reduce_dtype: Optional[torch.dtype] = None
-    output_dtype: Optional[torch.dtype] = None
+    param_dtype: Optional[str] = None
+    reduce_dtype: Optional[str] = None
+    output_dtype: Optional[str] = None
     cast_forward_inputs: bool = True
 
     # prefetch settings
     num_to_forward_prefetch: Optional[int] = 0
     num_to_backward_prefetch: Optional[int] = 0
+
+    # fsdp2 hook manager
+    hook_modules: Optional[List[str]] = None
+
+    # FSDP implementation strategy
+    # 'custom': Use FSDPTurbo custom FSDP implementation
+    # 'native': Use PyTorch native FSDP implementation (default)
+    fsdp_implementation: Literal['custom', 'native'] = 'native'
 
 
 @dataclass
