@@ -1,5 +1,5 @@
 import torch
-from fsdp_turbo.ops import register_op
+from fsdp_turbo.ops.registry import register_op
 
 try:
     import torch_npu
