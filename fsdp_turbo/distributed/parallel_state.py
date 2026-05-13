@@ -35,7 +35,7 @@ def get_last_mesh_dim(mesh_shape):
 
 def init_parallel_state(config: FSDPTurboConfig):
     field_names = {field.name for field in fields(ParallelState)}
-    parallel_state_config = {k: v for k, v in asdict(config).items() if k in field_names}
+    parallel_state_config = {k: v for k, v in asdict(config.distributed).items() if k in field_names}
     return ParallelState(**parallel_state_config)
 
 
@@ -78,16 +78,22 @@ class ParallelState(metaclass=Singleton):
         mesh_shape = (self.expert_data_parallel_size,) + mesh_shape
         self.add_device_mesh_groups(mesh_dim_names, mesh_shape)
 
-        print_rank(logger.info, f'Parallel state initialized:\n {self.__str__()}')
+        print_rank(logger.info, f'Parallel state initialized:\n{self.__str__()}')
 
     def __str__(self):
-        info = ''
+        sep = '=' * 60
+        lines = [sep, f'{"Parallel State":^60}', sep,
+            f'  {"Mesh":<10} {"Enabled":<10} {"Group Size":<12} {"Rank":<8} Device Mesh',
+            '-' * 60,
+        ]
         for name, _ in self.device_mesh_map.items():
             enable = self.is_group_enable(name)
             size = self.get_group_size(name)
+            rank = self.get_rank(name)
             mesh = self.get_device_mesh(name)
-            info += f'[{name}] = {enable} | Group size: {size} | device mesh:{mesh} \n'
-        return info
+            lines.append(f'  {name:<10} {str(enable):<10} {size:<12} {rank:<8} {mesh}')
+        lines.append(sep)
+        return '\n'.join(lines)
 
     @property
     def is_initialized(self) -> bool:
@@ -169,3 +175,7 @@ class ParallelState(metaclass=Singleton):
             setattr(self, 'get_{}_group_size'.format(mesh_name), types.MethodType(get_size, self))
             setattr(self, 'get_{}_rank'.format(mesh_name), types.MethodType(get_rank, self))
             setattr(self, 'get_{}_device_mesh'.format(mesh_name), types.MethodType(get_mesh, self))
+
+
+def get_parallel_state() -> ParallelState:
+    return ParallelState()

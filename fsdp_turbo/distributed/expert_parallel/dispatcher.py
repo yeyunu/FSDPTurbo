@@ -26,27 +26,27 @@ def get_experts_forward_fn(ep_group, fused):
         act_fn = self.act_fn
         num_global_experts = self.num_global_experts
         expert_ids_per_ep_rank = self.expert_ids_per_ep_rank
+        act_limit = self.limit if hasattr(self, 'limit') else None
 
         hidden_states = dispatch_mlp_combine(ep_group, fused, hidden_states, top_k_index, top_k_weights, weights, act_fn,
-                                             num_global_experts, expert_ids_per_ep_rank)
+                                             num_global_experts, expert_ids_per_ep_rank, act_limit)
 
         return hidden_states.view(*hidden_states_shape)
     return experts_forward
 
 
 def dispatch_mlp_combine(ep_group, fused, hidden_states, top_k_index, top_k_weights, weights, act_fn,
-                         num_global_experts,
-                         expert_ids_per_ep_rank):
+                         num_global_experts, expert_ids_per_ep_rank, act_limit):
     gate_up_weights, down_weights = weights
     # MoE preprocess to get local/global indices and AllToAll split sizes
     permute_indices, split_sizes = dispatch_preprocess(ep_group, top_k_index, num_global_experts,
                                                        expert_ids_per_ep_rank)
     # AllToAll dispatch --> MLP computation --> AllToAll combine
     hidden_states, unpermute_indices = alltoall_dispatch(ep_group, hidden_states, top_k_index, permute_indices,
-                                                         split_sizes)
+                                                         split_sizes, fused)
     hidden_states = experts_computation(hidden_states, permute_indices[0], gate_up_weights, down_weights,
-                                        act_fn, fused)
-    hidden_states = alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes)
+                                        act_fn, act_limit, fused)
+    hidden_states = alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes, fused)
     return hidden_states
 
 
@@ -76,29 +76,32 @@ def dispatch_preprocess(ep_group, top_k_index, num_global_experts, expert_ids_pe
     return (num_tokens_per_local_expert, global_indices), (input_split, output_splits)
 
 
-def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes):
+def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes, fused):
     local_indices, global_indices = indices
     input_split, output_splits = split_sizes
 
-    hidden_states, unpermute_indices1 = permute(hidden_states, top_k_index)
+    hidden_states, unpermute_indices1 = permute(hidden_states, top_k_index, use_eager=not fused)
     torch.npu.current_stream().synchronize()
     hidden_states = all_to_all(ep_group, hidden_states, output_splits.numpy(), input_split.numpy())
-    hidden_states, unpermute_indices2 = permute(hidden_states, global_indices)
+    hidden_states, unpermute_indices2 = permute(hidden_states, global_indices, use_eager=not fused)
 
     return hidden_states, (unpermute_indices1, unpermute_indices2)
 
 
-def experts_computation(hidden_states, split_list, gate_up_weights, down_weights, act_fn, fused):
+def experts_computation(hidden_states, split_list, gate_up_weights, down_weights, act_fn, act_limit, fused):
     gate, up = grouped_matmul(hidden_states, split_list, gate_up_weights, use_eager=not fused).chunk(2, dim=-1)
+    if act_limit is not None:
+        gate = gate.clamp(max=act_limit)
+        up = up.clamp(min=-act_limit, max=act_limit)
     act = act_fn(gate) * up
     hidden_states = grouped_matmul(act, split_list, down_weights, use_eager=not fused)
     return hidden_states
 
 
-def alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes):
+def alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes, fused):
     unpermute_indices1, unpermute_indices2 = unpermute_indices
     input_split, output_splits = split_sizes
-    hidden_states = unpermute(hidden_states, unpermute_indices2)
+    hidden_states = unpermute(hidden_states, unpermute_indices2, use_eager=not fused)
     hidden_states = all_to_all(ep_group, hidden_states, input_split.numpy(), output_splits.numpy())
-    hidden_states = unpermute(hidden_states, unpermute_indices1, top_k_weights)
+    hidden_states = unpermute(hidden_states, unpermute_indices1, top_k_weights, use_eager=not fused)
     return hidden_states
