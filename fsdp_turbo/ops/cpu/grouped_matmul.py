@@ -37,6 +37,7 @@ def grouped_matmul_cpu(inputs, m_split, weights):
     final_hidden_states = torch.zeros(output_shape, dtype=inputs.dtype, device=inputs.device)
 
     # Calculate group boundaries from cumulative sum
+
     group_list = [0] + torch.cumsum(m_split, dim=0).tolist()
 
     # Process each group separately

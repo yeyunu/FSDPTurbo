@@ -12,6 +12,8 @@ from fsdp_turbo.fsdp_turbo_config import (
     FSDPPlanConfig,
     EPPlanConfig,
     TPPlanConfig,
+    DistributedConfig,
+    MemoryConfig,
 )
 from fsdp_turbo.utils.device import set_accelerator_compatible
 from fsdp_turbo.utils.log import set_log_level
@@ -92,35 +94,39 @@ def get_complete_custom_config():
     - Prefetch for communication optimization
     """
     return FSDPTurboConfig(
-        fully_shard_parallel_size=FULLY_SHARD_PARALLEL_SIZE,
-        fsdp_plan=FSDPPlanConfig(
-            ignored_modules=[],
-            apply_modules={
-                'model.layers.{*}': {},
-                'model.embed_tokens': {},
-                'lm_head': {},
-            },
-            param_dtype='bf16',
-            reduce_dtype='fp32',
-            output_dtype='bf16',
-            hook_modules=['model.layers.{*}'],
-            fsdp_implementation='custom',
-            num_to_forward_prefetch=1,
-            num_to_backward_prefetch=1,
+        distributed=DistributedConfig(
+            fully_shard_parallel_size=FULLY_SHARD_PARALLEL_SIZE,
+            fsdp_plan=FSDPPlanConfig(
+                ignored_modules=[],
+                apply_modules={
+                    'model.layers.{*}': {},
+                    'model.embed_tokens': {},
+                    'lm_head': {},
+                },
+                param_dtype='bf16',
+                reduce_dtype='fp32',
+                output_dtype='bf16',
+                hook_modules=['model.layers.{*}'],
+                fsdp_implementation='custom',
+                num_to_forward_prefetch=1,
+                num_to_backward_prefetch=1,
+            ),
+            tensor_parallel_size=TENSOR_PARALLEL_SIZE,
+            tp_plan=TPPlanConfig(
+                colwise_parallel=['*.q_proj', '*.k_proj', '*.v_proj'],
+                rowwise_parallel=['*.o_proj'],
+            ),
+            expert_parallel_size=EXPERT_PARALLEL_SIZE,
+            expert_fully_shard_parallel_size=EXPERT_FULLY_SHARD_PARALLEL_SIZE,
+            ep_plan=EPPlanConfig(
+                apply_modules=['model.layers.{*}.mlp.experts'],
+                dispatcher='fused',
+            ),
         ),
-        tensor_parallel_size=TENSOR_PARALLEL_SIZE,
-        tp_plan=TPPlanConfig(
-            colwise_parallel=['*.q_proj', '*.k_proj', '*.v_proj'],
-            rowwise_parallel=['*.o_proj'],
+        memory=MemoryConfig(
+            recompute=True,
+            recompute_plan=['model.layers.{*}'],
         ),
-        expert_parallel_size=EXPERT_PARALLEL_SIZE,
-        expert_fully_shard_parallel_size=EXPERT_FULLY_SHARD_PARALLEL_SIZE,
-        ep_plan=EPPlanConfig(
-            apply_modules=['model.layers.{*}.mlp.experts'],
-            dispatcher='fused',
-        ),
-        recompute=True,
-        recompute_plan=['model.layers.{*}'],
     )
 
 

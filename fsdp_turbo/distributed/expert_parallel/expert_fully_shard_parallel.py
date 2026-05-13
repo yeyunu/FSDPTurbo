@@ -19,7 +19,7 @@ def expert_fully_shard_modules(model: torch.nn.Module, efsdp_mesh, ep_plan: EPPl
     efsdp_hook_modules = get_fsdp_hook_modules(model, fsdp_plan)
     config = {'mesh': efsdp_mesh,
               'mp_policy': MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
-              'shard_placement_fn': lambda x: Shard(1)}
+              'shard_placement_fn': lambda x: Shard(1) if x.dim() > 1 else Shard(0)}
 
     apply_hccl_premul_sum_patch()
     strategy = get_fsdp_strategy(fsdp_plan.fsdp_implementation)

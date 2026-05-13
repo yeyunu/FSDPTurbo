@@ -25,36 +25,36 @@ class FSDPTurbo(torch.nn.Module):
         self.apply_fsdp_modules()
 
     def apply_fsdp_modules(self):
-        self.model = fully_shard_parallel_modules(self.model, self.parallel_state.get_fsdp_device_mesh(), self.config.fsdp_plan)
+        self.model = fully_shard_parallel_modules(self.model, self.parallel_state.get_fsdp_device_mesh(), self.config.distributed.fsdp_plan)
 
     def apply_tp_modules(self):
-        if self.config.tensor_parallel_size == 1:
+        if self.config.distributed.tensor_parallel_size == 1:
             return
-        self.model = tensor_parallel_modules(self.model, self.parallel_state.get_tp_device_mesh(), self.config.tp_plan)
+        self.model = tensor_parallel_modules(self.model, self.parallel_state.get_tp_device_mesh(), self.config.distributed.tp_plan)
 
     def apply_ep_modules(self):
-        if self.config.expert_parallel_size > 1:
-            self.model = expert_parallelize_modules(self.model, self.parallel_state.get_ep_device_mesh(), self.config.ep_plan)
+        if self.config.distributed.expert_parallel_size > 1:
+            self.model = expert_parallelize_modules(self.model, self.parallel_state.get_ep_device_mesh(), self.config.distributed.ep_plan)
             self.model = expert_fully_shard_modules(
                 self.model,
                 self.parallel_state.get_efsdp_device_mesh(),
-                self.config.ep_plan,
-                self.config.fsdp_plan,
+                self.config.distributed.ep_plan,
+                self.config.distributed.fsdp_plan,
             )
 
     def apply_recompute_modules(self):
-        if not self.config.recompute:
+        if not self.config.memory.recompute:
             return
-        self.model = recompute_modules(self.model, self.config.recompute_plan)
+        self.model = recompute_modules(self.model, self.config.memory.recompute_plan)
 
     def apply_quantization_modules(self):
         """Apply quantization based on quantization_format + quantization_recipe."""
-        if not self.config.quantization_plan.quant_recipe:
+        if not self.config.quantization.quantization_plan.quant_recipe:
             return
         try:
             from fsdp_turbo.quantization.converter.model_converter import build_model_converter
 
-            model_converters = build_model_converter(self.config.quantization_plan)
+            model_converters = build_model_converter(self.config.quantization.quantization_plan)
             model_converters.convert(self.model)
         except Exception as e:
             raise RuntimeError(f"Failed to convert quantization plan") from e
