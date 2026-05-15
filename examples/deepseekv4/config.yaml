@@ -19,6 +19,7 @@ optimizer:
   warmup_ratio: 0.03
   lr_scheduler_type: "CosineAnnealingLR"
   min_lr: 3.0e-5
+  clip_grad: 1.0
 
 # --- Run Configuration ---
 run:
@@ -26,10 +27,7 @@ run:
   max_steps: -1
   num_train_epochs: 1
   gradient_accumulation_steps: 1
-  save_steps: 500
   logging_steps: 1
-  output_dir: "./output"
-  resume_from_checkpoint: null
   profile:
     enabled: false
     wait_steps: 0
@@ -42,6 +40,15 @@ run:
     profile_memory: false
     with_stack: false
 
+# --- Checkpoint Configuration ---
+checkpoint:
+  output_dir: "./output"
+  save_steps: 500
+  strict: true
+  save_optim: true
+  load_optim: true
+  resume_from_checkpoint: null
+
 # --- Data Configuration ---
 data:
   dataset_path: "Salesforce/wikitext"
@@ -52,7 +59,7 @@ data:
   max_seq_length: 1024
   num_workers: 8
   pin_memory: true
-  shuffle: true
+  shuffle: false
 
 # --- Distributed Configuration ---
 distributed:

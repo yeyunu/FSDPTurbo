@@ -1,6 +1,5 @@
 import os
 import logging
-from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -39,6 +38,7 @@ class BaseTrainer:
         self._ckpt_manager = None
         self._monitor = None
         self._global_step = 0
+        self._consumed_samples = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -57,57 +57,116 @@ class BaseTrainer:
 
     def train(self, resume_from_checkpoint: Optional[str] = None):
         """Main training loop."""
-        checkpoint = resume_from_checkpoint or self.config.run.resume_from_checkpoint
+        print_rank(logger.info, "\n"+ str(self.config))
 
-        if checkpoint and self._ckpt_manager is not None:
-            self._load_checkpoint(checkpoint)
-
-        self.model.train()
-
+        self._prepare_training(resume_from_checkpoint)
         max_steps = self._resolve_max_steps()
-
-        if self.dataloader is None:
-            raise RuntimeError("dataloader is None. Override build_data_manager() to provide a dataloader.")
 
         print_rank(logger.info, "***** Running training *****")
         print_rank(logger.info, f"  Max steps = {max_steps}")
         print_rank(logger.info, f"  Gradient accumulation steps = {self.config.run.gradient_accumulation_steps}")
 
-        self._global_step = 0
         with self._create_profiler() as prof:
+            # Compute start epoch and skip batches from consumed_samples.
+            dataset_size = len(self.dataloader.dataset) if self.dataloader is not None else 0
+            samples_per_epoch = dataset_size if dataset_size > 0 else 0
+            if self._consumed_samples > 0 and samples_per_epoch > 0:
+                start_epoch = self._consumed_samples // samples_per_epoch
+                skip_batches = (self._consumed_samples % samples_per_epoch) // self.config.data.batch_size
+                print_rank(logger.info, f"  Resuming from consumed_samples={self._consumed_samples}: "
+                                        f"start_epoch={start_epoch}, skip_batches={skip_batches}")
+            else:
+                start_epoch = 0
+                skip_batches = 0
+
             for epoch in range(self.config.run.num_train_epochs):
                 print_rank(logger.info, f"  Epoch {epoch + 1}/{self.config.run.num_train_epochs}")
+                # Set epoch on DistributedSampler for proper shuffling across epochs.
+                if self.dataloader is not None and hasattr(self.dataloader, "sampler") \
+                        and hasattr(self.dataloader.sampler, "set_epoch"):
+                    self.dataloader.sampler.set_epoch(epoch)
+
+                # Skip epochs and batches we already consumed.
+                if epoch < start_epoch:
+                    continue
                 for step, batch in enumerate(self.dataloader):
-                    loss = self.train_step(batch)
+                    if epoch == start_epoch and step < skip_batches:
+                        continue
+                    self._monitor.on_step_start()
+                    loss, aux_loss = self.train_step(batch)
+
+                    # Track how many samples have been processed.
+                    if isinstance(batch, dict):
+                        batch_size = next((v.shape[0] for v in batch.values()
+                                          if isinstance(v, torch.Tensor)), 1)
+                    elif isinstance(batch, (list, tuple)):
+                        batch_size = batch[0].shape[0] if isinstance(batch[0], torch.Tensor) else 1
+                    else:
+                        batch_size = 1
+                    self._consumed_samples += batch_size
 
                     if (step + 1) % self.config.run.gradient_accumulation_steps == 0:
-                        self.optimizer.step()
-                        if self.lr_scheduler is not None:
-                            self.lr_scheduler.step()
-                        self.optimizer.zero_grad()
+                        grad_norm = self._on_optimizer_step()
                         self._global_step += 1
-
-                        if self._global_step % self.config.run.logging_steps == 0:
-                            loss_val = loss.item()
-                            print_rank(logger.info, f"  Step {self._global_step} | Loss: {loss_val:.6f}")
-                            if self._monitor is not None:
-                                self._monitor.log(self._global_step, loss_val)
-
-                        if self._ckpt_manager is not None and self._global_step % self.config.run.save_steps == 0:
-                            self._save_checkpoint()
-
+                        self._on_log_step(loss, grad_norm, aux_loss)
+                        self._on_checkpoint_step()
                         if prof is not None:
                             prof.step()
 
                     if 0 < max_steps <= self._global_step:
                         break
-
                 if 0 < max_steps <= self._global_step:
                     break
 
         print_rank(logger.info, f"Training complete. Total steps: {self._global_step}")
+        self._monitor.summary()
+
+    # ------------------------------------------------------------------
+    # Training loop hooks
+    # ------------------------------------------------------------------
+
+    def _prepare_training(self, resume_from_checkpoint: Optional[str] = None):
+        """Resume from checkpoint and set model to train mode."""
+        self._global_step = 0
+        checkpoint = resume_from_checkpoint or self.config.checkpoint.resume_from_checkpoint
+        if checkpoint and self._ckpt_manager is not None:
+            self._load_checkpoint(checkpoint)
+        self.model.train()
+
+        if self.dataloader is None:
+            raise RuntimeError("dataloader is None. Override build_dataloader() to provide a dataloader.")
+
+    def _on_optimizer_step(self) -> float:
+        """Clip gradients, step optimizer and scheduler, zero grads.
+
+        Returns the gradient norm before clipping (for monitoring).
+        Override to inject custom logic between clipping and stepping.
+        """
+        grad_norm = self._clip_grad_norm()
+        self.optimizer.step()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+        self.optimizer.zero_grad()
+        return grad_norm
+
+    def _on_log_step(self, loss: torch.Tensor, grad_norm: float, aux_loss: Optional[torch.Tensor] = None):
+        """Log training metrics if the logging interval is reached."""
+        if self._global_step % self.config.run.logging_steps != 0:
+            return
+        loss_val = loss.item()
+        aux_loss_val = aux_loss.item() if aux_loss is not None else None
         if self._monitor is not None:
-            self._monitor.summary()
+            self._monitor.log(self._global_step, loss_val, grad_norm, aux_loss=aux_loss_val)
+        else:
+            parts = [f"Step {self._global_step} | Loss: {loss_val:.6f}"]
+            if aux_loss_val is not None:
+                parts.append(f"Aux Loss: {aux_loss_val:.6f}")
+            print_rank(logger.info, f"  {' | '.join(parts)}")
+
+    def _on_checkpoint_step(self):
+        """Save checkpoint if the save interval is reached."""
+        if self._ckpt_manager is not None and self._global_step % self.config.checkpoint.save_steps == 0:
+            self._save_checkpoint()
 
     def train_step(self, batch):
         """Execute a single training step: forward + backward."""
@@ -115,7 +174,8 @@ class BaseTrainer:
         outputs = self.model(**batch)
         loss = outputs.loss / self.config.run.gradient_accumulation_steps
         loss.backward()
-        return loss
+        aux_loss = outputs.aux_loss if hasattr(outputs, 'aux_loss') else None
+        return loss, aux_loss
 
     # ------------------------------------------------------------------
     # Distributed initialization
@@ -126,18 +186,8 @@ class BaseTrainer:
         if torch.distributed.is_initialized():
             return
 
-        try:
-            import torch_npu  # noqa: F401
-            from torch_npu.contrib import transfer_to_npu  # noqa: F401
-            fallback, backend = torch.npu, "hccl"
-        except ImportError:
-            if torch.cuda.is_available():
-                fallback, backend = torch.cuda, "nccl"
-            else:
-                raise RuntimeError("No available accelerator (NPU/CUDA).")
-
         from fsdp_turbo.utils.device import set_accelerator_compatible
-        set_accelerator_compatible(fallback)
+        backend = set_accelerator_compatible()
         set_log_level("INFO")
 
         local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -222,59 +272,17 @@ class BaseTrainer:
 
     def build_dataloader(self):
         """Build dataloader from HuggingFace datasets."""
-        data_cfg = self.config.data
-        if data_cfg is None or not data_cfg.dataset_path:
-            print_rank(logger.warning, "dataset_path is empty, skipping dataloader build.")
-            return None
-
-        try:
-            from datasets import load_dataset
-        except ImportError:
-            raise ImportError("`datasets` library is required for build_dataloader. Install it with: pip install datasets")
-        
-        print_rank(logger.info, f"> Building DataLoader for {data_cfg.dataset_path} {data_cfg.dataset_config} {data_cfg.split}")
-        dataset = load_dataset(data_cfg.dataset_path, data_cfg.dataset_config, split=data_cfg.split)
-
-        if self.tokenizer is not None:
-            def tokenize_function(examples):
-                return self.tokenizer(
-                    examples[data_cfg.text_column],
-                    truncation=True,
-                    max_length=data_cfg.max_seq_length,
-                    padding="max_length",
-                )
-
-            dataset = dataset.map(tokenize_function, batched=True)
-            dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
-
-            def add_labels(examples):
-                examples["labels"] = examples["input_ids"].clone()
-                return examples
-
-            dataset = dataset.map(add_labels)
-
-        sampler = None
-        if torch.distributed.is_initialized():
-            from torch.utils.data.distributed import DistributedSampler
-            sampler = DistributedSampler(dataset, shuffle=data_cfg.shuffle)
-            shuffle = False
-        else:
-            shuffle = data_cfg.shuffle
-
-        from torch.utils.data import DataLoader
-        return DataLoader(
-            dataset,
-            batch_size=data_cfg.batch_size,
-            shuffle=shuffle,
-            sampler=sampler,
-            num_workers=data_cfg.num_workers,
-            pin_memory=data_cfg.pin_memory,
-        )
+        from fsdp_turbo.training.dataloader import build_dataloader
+        return build_dataloader(self.config.data, tokenizer=self.tokenizer)
 
     def build_checkpointer(self):
         """Build checkpoint manager."""
         print_rank(logger.info, "> Building Checkpointer...")
-        return Checkpointer(self.config.run.output_dir)
+        return Checkpointer(
+            self.config.checkpoint.output_dir,
+            save_optim=self.config.checkpoint.save_optim,
+            load_optim=self.config.checkpoint.load_optim,
+        )
 
     def build_monitor(self):
         """Build training monitor."""
@@ -286,43 +294,8 @@ class BaseTrainer:
     # ------------------------------------------------------------------
 
     def _create_profiler(self):
-        profile_cfg = self.config.run.profile
-        if not profile_cfg.enabled:
-            return nullcontext()
-
-        schedule = torch.profiler.schedule(
-            wait=profile_cfg.wait_steps,
-            warmup=profile_cfg.warmup_steps,
-            active=profile_cfg.active_steps,
-            repeat=profile_cfg.repeat,
-            skip_first=profile_cfg.skip_first,
-        )
-
-        try:
-            import torch_npu
-            experimental_config = torch_npu.profiler._ExperimentalConfig(
-                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
-                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
-                l2_cache=False,
-            )
-            return torch_npu.profiler.profile(
-                activities=[torch_npu.profiler.ProfilerActivity.NPU, torch_npu.profiler.ProfilerActivity.CPU],
-                record_shapes=profile_cfg.record_shapes,
-                profile_memory=profile_cfg.profile_memory,
-                with_stack=profile_cfg.with_stack,
-                experimental_config=experimental_config,
-                schedule=schedule,
-                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(profile_cfg.output_dir),
-            )
-        except ImportError:
-            return torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-                record_shapes=profile_cfg.record_shapes,
-                profile_memory=profile_cfg.profile_memory,
-                with_stack=profile_cfg.with_stack,
-                schedule=schedule,
-                on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_cfg.output_dir),
-            )
+        from fsdp_turbo.training.profiler import create_profiler
+        return create_profiler(self.config.run.profile)
 
     def _resolve_max_steps(self):
         if self.config.run.max_steps > 0:
@@ -341,10 +314,73 @@ class BaseTrainer:
             return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         return batch
 
+    def _clip_grad_norm(self):
+        """Clip gradient norm and return the total norm before clipping.
+
+        Uses clip_grad and clip_grad_norm_type from OptimizerConfig.
+        Delegates to the FSDP-aware clip_grads module.
+        Returns the gradient norm before clipping for monitoring.
+        """
+        from fsdp_turbo.training.clip_grads import clip_grad_norm
+        return clip_grad_norm(
+            self.model,
+            max_norm=self.config.optimizer.clip_grad,
+            norm_type=self.config.optimizer.clip_grad_norm_type,
+            group=self._get_grad_sync_group(),
+        )
+
+    def _compute_grad_norm(self):
+        """Compute the total gradient norm without clipping."""
+        from fsdp_turbo.training.clip_grads import compute_grad_norm
+        return compute_grad_norm(
+            list(self.model.parameters()),
+            norm_type=self.config.optimizer.clip_grad_norm_type,
+            group=self._get_grad_sync_group(),
+        )
+
+    def _get_grad_sync_group(self):
+        """Return the process group for gradient norm all-reduce.
+
+        Override this in subclasses to provide a specific group (e.g.
+        the data-parallel group).  Returns ``None`` by default, which
+        lets ``clip_grads`` infer the group from DTensor gradients
+        automatically.
+        """
+        return None
+
     def _save_checkpoint(self):
         if self._ckpt_manager is not None and hasattr(self._ckpt_manager, "save"):
-            self._ckpt_manager.save(self.model, self.optimizer, self.lr_scheduler, self._global_step)
+            self._ckpt_manager.save(
+                self.model, self.optimizer, self.lr_scheduler, self._global_step,
+                data_cfg=self.config.data, dataloader=self.dataloader,
+                consumed_samples=self._consumed_samples,
+            )
 
     def _load_checkpoint(self, checkpoint_path):
         if self._ckpt_manager is not None and hasattr(self._ckpt_manager, "load"):
-            self._ckpt_manager.load(checkpoint_path, self.model, self.optimizer, self.lr_scheduler)
+            ckpt_info = self._ckpt_manager.load(
+                checkpoint_path, self.model, self.optimizer, self.lr_scheduler,
+                strict=self.config.checkpoint.strict,
+            )
+            # Restore global_step only if the dataset hasn't changed.
+            saved_fp = ckpt_info.get("dataset_fingerprint", "")
+            current_fp = None
+            if self.config is not None and self.config.data is not None:
+                from fsdp_turbo.training.checkpoint import dataset_fingerprint
+                current_fp = dataset_fingerprint(self.config.data)
+
+            if saved_fp and saved_fp == current_fp:
+                self._global_step = ckpt_info.get("global_step", 0)
+                self._consumed_samples = ckpt_info.get("consumed_samples", 0)
+                print_rank(logger.info, f"Restored global_step to {self._global_step}, "
+                                        f"consumed_samples to {self._consumed_samples} (dataset unchanged)")
+            else:
+                self._global_step = 0
+                self._consumed_samples = 0
+                print_rank(logger.warning, "Dataset changed since checkpoint; global_step and consumed_samples reset")
+
+            # Restore dataloader sampler state if available.
+            dl_state = ckpt_info.get("dataloader_state_dict")
+            if dl_state is not None and self.dataloader is not None:
+                if hasattr(self.dataloader, "sampler") and hasattr(self.dataloader.sampler, "load_state_dict"):
+                    self.dataloader.sampler.load_state_dict(dl_state)

@@ -18,9 +18,33 @@ def accelerator_getattr(module, fallback_module):
     return __getattr__
 
 
-def set_accelerator_compatible(fallback_module=torch.npu):
+def set_accelerator_compatible():
+    """Set up ``torch.accelerator`` to delegate to the detected device backend.
+
+    Automatically detects the available accelerator in the following order:
+    1. NPU (Huawei Ascend) — if ``torch_npu`` is importable
+    2. CUDA (NVIDIA GPU) — if ``torch.cuda.is_available()``
+
+    Returns:
+        str: The distributed backend name (``"hccl"`` for NPU, ``"nccl"`` for CUDA).
+
+    Raises:
+        RuntimeError: If no supported accelerator is found.
+    """
+    try:
+        import torch_npu  # noqa: F401
+        from torch_npu.contrib import transfer_to_npu  # noqa: F401
+        fallback_module = torch.npu
+        backend = "hccl"
+    except ImportError:
+        if torch.cuda.is_available():
+            fallback_module = torch.cuda
+            backend = "nccl"
+        else:
+            raise RuntimeError("No available accelerator (NPU/CUDA).")
+
     accelerator_module = types.ModuleType('torch.accelerator')
-    accelerator_module.__doc__ = 'Fallback accelerator module that delegates to torch.npu'
+    accelerator_module.__doc__ = f'Fallback accelerator module that delegates to {fallback_module}'
     for attr in dir(torch.accelerator):
         if attr.startswith('__'):
             continue
@@ -29,3 +53,5 @@ def set_accelerator_compatible(fallback_module=torch.npu):
     accelerator_module.__getattr__ = accelerator_getattr(accelerator_module, fallback_module)
     torch.accelerator = accelerator_module
     sys.modules['torch.accelerator'] = accelerator_module
+
+    return backend
