@@ -2,7 +2,7 @@ import argparse
 import logging
 import os
 
-from datasets import load_dataset
+import torch
 
 from fsdp_turbo.fsdp_turbo import FSDPTurbo
 from fsdp_turbo.fsdp_turbo_config import load_config_from_yaml
@@ -39,6 +39,12 @@ class DeepseekV4Trainer(BaseTrainer):
 
         print_rank(logger.info, "> Applying FSDPTurbo parallelism...")
         model = FSDPTurbo(self.config, model)
+
+        # indexer grad bypass
+        for name, module in model.named_modules():
+            if "indexer" in name:
+                for n, p in module.named_parameters():
+                    p.grad = torch.zeros_like(p.data)
         return model
 
     def train_step(self, batch):

@@ -30,6 +30,8 @@ class OptimizerConfig:
     warmup_ratio: float = 0.0
     lr_scheduler_type: str = "cosine"
     min_lr: float = 0.0
+    clip_grad: float = 1.0
+    clip_grad_norm_type: float = 2.0
 
 
 @dataclass
@@ -65,11 +67,18 @@ class TrainRunConfig:
     max_steps: int = -1
     num_train_epochs: int = 1
     gradient_accumulation_steps: int = 1
-    save_steps: int = 500
     logging_steps: int = 1
+    profile: ProfileConfig = field(default_factory=ProfileConfig)
+
+
+@dataclass
+class CheckpointConfig:
     output_dir: str = "./output"
     resume_from_checkpoint: Optional[str] = None
-    profile: ProfileConfig = field(default_factory=ProfileConfig)
+    save_steps: int = 500
+    strict: bool = True
+    save_optim: bool = True
+    load_optim: bool = True
 
 
 @dataclass
@@ -165,6 +174,7 @@ class FSDPTurboConfig:
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     data: DataConfig = field(default_factory=DataConfig)
     run: TrainRunConfig = field(default_factory=TrainRunConfig)
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
@@ -262,30 +272,53 @@ class FSDPTurboConfig:
                 return str(v)
             return repr(v)
 
-        def _format_dataclass(obj, indent=2):
-            lines = []
-            prefix = " " * indent
+        # First pass: collect all leaf fields to determine max name width.
+        def _collect_leaves(obj, prefix=""):
+            leaves = []
             for f in dc.fields(obj):
                 val = getattr(obj, f.name)
+                display = f.name if not prefix else f"{prefix}.{f.name}"
                 if val is None:
-                    lines.append(f"{prefix}{f.name}: None")
+                    leaves.append((display, "None"))
                 elif dc.is_dataclass(val) and not isinstance(val, torch.dtype):
-                    lines.append(f"{prefix}{f.name}:")
-                    lines.extend(_format_dataclass(val, indent + 2))
+                    leaves.extend(_collect_leaves(val, display))
                 else:
-                    lines.append(f"{prefix}{f.name}: {_format_value(val)}")
-            return lines
+                    leaves.append((display, _format_value(val)))
+            return leaves
 
         sep = "=" * 60
-        sections = [
-            ("Model", self.model),
-            ("Optimizer", self.optimizer),
-            ("Data", self.data),
-            ("Run", self.run),
-            ("Distributed", self.distributed),
-            ("Memory", self.memory),
-            ("Quantization", self.quantization),
-        ]
+        # Auto-discover sections from dataclass fields that are themselves dataclasses.
+        sections = []
+        for f in dc.fields(self):
+            val = getattr(self, f.name)
+            if dc.is_dataclass(val) and not isinstance(val, torch.dtype):
+                sections.append((f.name.capitalize(), val))
+
+        # Collect all leaves across sections to find max name width.
+        all_leaves = []
+        for section_name, section_obj in sections:
+            all_leaves.extend(_collect_leaves(section_obj))
+        max_name_len = max(len(name) for name, _ in all_leaves) if all_leaves else 20
+
+        # Second pass: render with aligned values.
+        def _format_dataclass(obj, indent=2, prefix=""):
+            lines = []
+            for f in dc.fields(obj):
+                val = getattr(obj, f.name)
+                display = f.name if not prefix else f"{prefix}.{f.name}"
+                if val is None:
+                    val_str = "None"
+                elif dc.is_dataclass(val) and not isinstance(val, torch.dtype):
+                    lines.extend(_format_dataclass(val, indent, display))
+                    continue
+                else:
+                    val_str = _format_value(val)
+                # Pad name + dashes so that value starts at value_col.
+                padded_name = " " * indent + display
+                total_name_width = indent + max_name_len
+                dash_count = max(1, total_name_width - len(padded_name) + 2)
+                lines.append(f"{padded_name} {'-' * dash_count} {val_str}")
+            return lines
 
         lines = [sep, f'{"FSDPTurboConfig":^60}', sep]
         for section_name, section_obj in sections:
@@ -367,12 +400,15 @@ def load_config_from_yaml(yaml_path):
     optimizer_raw = raw.pop("optimizer", None)
     data_raw = raw.pop("data", None)
     run_raw = raw.pop("run", None)
+    checkpoint_raw = raw.pop("checkpoint", None)
 
     model_cfg = _dict_to_dataclass(ModelConfig, model_raw) if model_raw is not None else ModelConfig()
     optimizer_cfg = _dict_to_dataclass(OptimizerConfig,
                                        optimizer_raw) if optimizer_raw is not None else OptimizerConfig()
     data_cfg = _dict_to_dataclass(DataConfig, data_raw) if data_raw is not None else DataConfig()
     run_cfg = _dict_to_dataclass(TrainRunConfig, run_raw) if run_raw is not None else TrainRunConfig()
+    checkpoint_cfg = _dict_to_dataclass(CheckpointConfig,
+                                        checkpoint_raw) if checkpoint_raw is not None else CheckpointConfig()
 
     # Extract distributed sub-config
     distributed_raw = raw.pop("distributed", None)
@@ -425,6 +461,7 @@ def load_config_from_yaml(yaml_path):
         optimizer=optimizer_cfg,
         data=data_cfg,
         run=run_cfg,
+        checkpoint=checkpoint_cfg,
         distributed=distributed_cfg,
         memory=memory_cfg,
         quantization=quantization_cfg,

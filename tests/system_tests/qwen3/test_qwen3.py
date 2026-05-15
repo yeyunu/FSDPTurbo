@@ -46,7 +46,7 @@ def initialization():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.npu.set_device(local_rank)
 
-    set_accelerator_compatible(torch.npu)
+    set_accelerator_compatible()
     set_seed(SEED)
     set_log_level(LOG_LEVEL)
 
