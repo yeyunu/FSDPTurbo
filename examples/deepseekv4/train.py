@@ -25,6 +25,7 @@ class DeepseekV4Trainer(BaseTrainer):
 
     def build_model(self):
         from transformers.models.deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4Config
+        import modeling_deepseek_v4
 
         print_rank(logger.info, "> Building DeepseekV4 Model...")
         model_config = DeepseekV4Config()
