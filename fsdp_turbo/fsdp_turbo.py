@@ -9,6 +9,7 @@ from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import \
     fully_shard_parallel_modules
 from fsdp_turbo.distributed.parallel_state import init_parallel_state
 from fsdp_turbo.distributed.tensor_parallel.tensor_parallel import tensor_parallel_modules
+from fsdp_turbo.memory.chunk_batch.chunk_batch import chunk_batch_modules
 from fsdp_turbo.memory.recompute.recompute import recompute_modules
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.distributed.expert_parallel.expert_parallel import expert_parallelize_modules
@@ -134,6 +135,7 @@ class FSDPTurbo(torch.nn.Module):
         self.apply_tp_modules()
         self.apply_ep_modules()
         self.apply_recompute_modules()
+        self.apply_chunk_batch_modules()
         self.apply_quantization_modules()
         self.apply_fsdp_modules()
 
@@ -271,6 +273,11 @@ class FSDPTurbo(torch.nn.Module):
         if not self.config.memory.recompute:
             return
         self.model = recompute_modules(self.model, self.config.memory.recompute_plan)
+
+    def apply_chunk_batch_modules(self):
+        if not self.config.memory.chunk_batch:
+            return
+        self.model = chunk_batch_modules(self.model, self.config.memory.chunk_batch_plan)
 
     def apply_quantization_modules(self):
         """Apply quantization based on quantization_format + quantization_recipe."""

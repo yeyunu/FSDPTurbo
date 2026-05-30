@@ -177,9 +177,48 @@ class DistributedConfig:
 
 
 @dataclass
+class ChunkBatchPlanConfig:
+    """Configuration for chunked micro-batch execution.
+
+    The feature wraps selected module forwards and executes them with smaller
+    slices along the configured batch dimension. This is useful when a large
+    module's activation or temporary workspace peak is proportional to batch
+    size.
+
+    Example:
+        ``chunk_mbs=1`` with an input tensor shaped ``[4, 2048, hidden]`` runs
+        the selected forward four times with tensors shaped ``[1, 2048, hidden]``
+        and then concatenates the outputs back to ``[4, 2048, hidden]``.
+
+        For Qwen-style decoder layers, a typical plan is:
+            apply_modules=["model.layers.{*}"]
+            batch_dim=0
+            chunk_arg_indexs=[0]
+            chunk_kwarg_names=["hidden_states", "attention_mask"]
+    """
+    chunk_mbs: int = 1
+    # Module-name patterns to patch, for example "model.layers.{*}".
+    apply_modules: List[str] = None
+    # Tensor dimension that represents batch. HF decoder layers usually use 0.
+    batch_dim: int = 0
+    # Positional forward arguments that should be sliced by batch.
+    chunk_arg_indexs: Optional[List[int]] = None
+    # Keyword forward arguments that should be sliced by batch.
+    chunk_kwarg_names: Optional[List[str]] = None
+
+
+@dataclass
 class MemoryConfig:
+    """Memory-saving feature switches.
+
+    ``recompute`` reduces saved activations by re-running module forwards during
+    backward. ``chunk_batch`` reduces per-module forward/backward peaks by
+    splitting the batch dimension into smaller micro batches.
+    """
     recompute: bool = False
     recompute_plan: List[str] = None
+    chunk_batch: bool = False
+    chunk_batch_plan: Optional[ChunkBatchPlanConfig] = None
 
 
 @dataclass
@@ -203,6 +242,7 @@ class FSDPTurboConfig:
         self.validate_tp_config()
         self.validate_ep_config()
         self.validate_recompute_config()
+        self.validate_chunk_batch_config()
         self.validate_quantization_config()
         self.validate_fsdp_config()
 
@@ -269,6 +309,28 @@ class FSDPTurboConfig:
 
     def validate_recompute_config(self):
         self.memory.recompute_plan = [] if self.memory.recompute_plan is None else self.memory.recompute_plan
+
+    def validate_chunk_batch_config(self):
+        """Normalize and validate chunk-batch configuration.
+
+        The selected modules and at least one sliced input are required. Without
+        ``apply_modules`` no module would be patched; without arg/kwarg selectors
+        the wrapper cannot infer batch size or know which tensors must be sliced.
+        """
+        if not self.memory.chunk_batch:
+            return
+        self.memory.chunk_batch_plan = ChunkBatchPlanConfig() if self.memory.chunk_batch_plan is None else self.memory.chunk_batch_plan
+        if self.memory.chunk_batch_plan.chunk_mbs <= 0:
+            raise ValueError("chunk_mbs must be positive.")
+        self.memory.chunk_batch_plan.apply_modules = [] if self.memory.chunk_batch_plan.apply_modules is None else self.memory.chunk_batch_plan.apply_modules
+        self.memory.chunk_batch_plan.chunk_arg_indexs = [] if self.memory.chunk_batch_plan.chunk_arg_indexs is None else self.memory.chunk_batch_plan.chunk_arg_indexs
+        self.memory.chunk_batch_plan.chunk_kwarg_names = [] if self.memory.chunk_batch_plan.chunk_kwarg_names is None else self.memory.chunk_batch_plan.chunk_kwarg_names
+        if not self.memory.chunk_batch_plan.apply_modules:
+            raise ValueError("chunk_batch_plan.apply_modules must not be empty when chunk_batch is enabled.")
+        if not self.memory.chunk_batch_plan.chunk_arg_indexs and not self.memory.chunk_batch_plan.chunk_kwarg_names:
+            raise ValueError(
+                "chunk_batch_plan must specify chunk_arg_indexs or chunk_kwarg_names when chunk_batch is enabled."
+            )
 
     def validate_quantization_config(self):
         self.quantization.quantization_plan = QuantizeConfig() if self.quantization.quantization_plan is None else self.quantization.quantization_plan
@@ -395,9 +457,17 @@ def _dict_to_dataclass(cls, data):
             logger.warning(f"Ignoring unknown config key '{key}' for {cls.__name__}")
             continue
         ft = field_types[key]
+        origin = getattr(ft, "__origin__", None)
+        optional_dataclass = None
+        if origin is Union:
+            for arg in ft.__args__:
+                if arg is not type(None) and dc.is_dataclass(arg):
+                    optional_dataclass = arg
+                    break
         if dc.is_dataclass(ft) and isinstance(value, dict):
-            actual_cls = ft
-            kwargs[key] = _dict_to_dataclass(actual_cls, value)
+            kwargs[key] = _dict_to_dataclass(ft, value)
+        elif optional_dataclass is not None and isinstance(value, dict):
+            kwargs[key] = _dict_to_dataclass(optional_dataclass, value)
         else:
             kwargs[key] = _coerce_value(value, ft)
     return cls(**kwargs)

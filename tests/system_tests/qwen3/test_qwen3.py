@@ -1,10 +1,11 @@
 import os
+import time
 
 import torch
 import torch_npu
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 from fsdp_turbo.fsdp_turbo import FSDPTurbo
 from fsdp_turbo.fsdp_turbo_config import (
@@ -14,6 +15,7 @@ from fsdp_turbo.fsdp_turbo_config import (
     TPPlanConfig,
     DistributedConfig,
     MemoryConfig,
+    ChunkBatchPlanConfig,
 )
 from fsdp_turbo.utils.device import set_accelerator_compatible
 from fsdp_turbo.utils.log import set_log_level
@@ -23,22 +25,36 @@ from fsdp_turbo.utils.random import set_seed
 # ============================================================
 # Configuration
 # ============================================================
-MODEL_PATH = 'Qwen/Qwen3-30B-A3B'
-DATASET_PATH = 'wikitext/wikitext-2-raw-v1'
+MODEL_PATH = os.environ.get('MODEL_PATH', 'Qwen/Qwen3-30B-A3B')
+DATASET_PATH = os.environ.get('DATASET_PATH', 'wikitext')
+DATASET_CONFIG = os.environ.get('DATASET_CONFIG', 'wikitext-2-raw-v1')
+DATASET_SPLIT = os.environ.get('DATASET_SPLIT', 'train')
+DATASET_DISK_PATH = os.environ.get('DATASET_DISK_PATH')
+DATASET_TEXT_FILE = os.environ.get('DATASET_TEXT_FILE')
 SEED = 42
 LOG_LEVEL = 'INFO'
 
 # Training hyperparameters
-BATCH_SIZE = 1
-MAX_LENGTH = 512
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '1'))
+MAX_LENGTH = int(os.environ.get('MAX_LENGTH', '512'))
 LR = 1e-4
-NUM_STEPS = 3
+NUM_STEPS = int(os.environ.get('NUM_STEPS', '3'))
 
 # Parallel configuration
-TENSOR_PARALLEL_SIZE = 2
-EXPERT_PARALLEL_SIZE = 8
-EXPERT_FULLY_SHARD_PARALLEL_SIZE = 1
-FULLY_SHARD_PARALLEL_SIZE = 4
+TENSOR_PARALLEL_SIZE = int(os.environ.get('TENSOR_PARALLEL_SIZE', '2'))
+EXPERT_PARALLEL_SIZE = int(os.environ.get('EXPERT_PARALLEL_SIZE', '8'))
+EXPERT_FULLY_SHARD_PARALLEL_SIZE = int(os.environ.get('EXPERT_FULLY_SHARD_PARALLEL_SIZE', '1'))
+FULLY_SHARD_PARALLEL_SIZE = int(os.environ.get('FULLY_SHARD_PARALLEL_SIZE', '4'))
+
+# Chunk batch configuration
+ENABLE_CHUNK_BATCH = os.environ.get('ENABLE_CHUNK_BATCH', '0').lower() in ('1', 'true', 'yes', 'on')
+CHUNK_MBS = int(os.environ.get('CHUNK_MBS', '1'))
+CHUNK_BATCH_DIM = int(os.environ.get('CHUNK_BATCH_DIM', '0'))
+
+# Profiler configuration
+ENABLE_PROFILER = os.environ.get('ENABLE_PROFILER', '0').lower() in ('1', 'true', 'yes', 'on')
+PROFILE_MEMORY = os.environ.get('PROFILE_MEMORY', '0').lower() in ('1', 'true', 'yes', 'on')
+PROFILE_DIR = os.environ.get('PROFILE_DIR', './profile')
 
 
 def initialization():
@@ -60,7 +76,14 @@ def get_model_tokenizer():
 
 def get_dataloader(tokenizer, batch_size=BATCH_SIZE, max_length=MAX_LENGTH):
     """Load and tokenize the wikitext dataset, returning a DataLoader."""
-    dataset = load_dataset(DATASET_PATH, split='train')
+    if DATASET_DISK_PATH:
+        dataset = load_from_disk(DATASET_DISK_PATH)
+        if hasattr(dataset, 'keys'):
+            dataset = dataset[DATASET_SPLIT]
+    elif DATASET_TEXT_FILE:
+        dataset = load_dataset('text', data_files={DATASET_SPLIT: DATASET_TEXT_FILE}, split=DATASET_SPLIT)
+    else:
+        dataset = load_dataset(DATASET_PATH, DATASET_CONFIG, split=DATASET_SPLIT)
 
     def tokenize_function(examples):
         return tokenizer(examples['text'], truncation=True, max_length=max_length, padding='max_length')
@@ -93,6 +116,19 @@ def get_complete_custom_config():
     - Hook Module for fine-grained control
     - Prefetch for communication optimization
     """
+    chunk_batch_plan = None
+    if ENABLE_CHUNK_BATCH:
+        # Qwen3 decoder layers receive hidden_states with shape [B, S, H].
+        # The attention mask may also carry the full batch dimension, e.g.
+        # [B, 1, S, S], so it must be chunked together with hidden_states.
+        chunk_batch_plan = ChunkBatchPlanConfig(
+            chunk_mbs=CHUNK_MBS,
+            apply_modules=['model.layers.{*}'],
+            batch_dim=CHUNK_BATCH_DIM,
+            chunk_arg_indexs=[0],
+            chunk_kwarg_names=['hidden_states', 'attention_mask'],
+        )
+
     return FSDPTurboConfig(
         distributed=DistributedConfig(
             fully_shard_parallel_size=FULLY_SHARD_PARALLEL_SIZE,
@@ -126,6 +162,8 @@ def get_complete_custom_config():
         memory=MemoryConfig(
             recompute=True,
             recompute_plan=['model.layers.{*}'],
+            chunk_batch=ENABLE_CHUNK_BATCH,
+            chunk_batch_plan=chunk_batch_plan,
         ),
     )
 
@@ -190,11 +228,11 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
         prof_ctx = torch_npu.profiler.profile(
             activities=[torch_npu.profiler.ProfilerActivity.NPU, torch_npu.profiler.ProfilerActivity.CPU],
             record_shapes=False,
-            profile_memory=False,
+            profile_memory=PROFILE_MEMORY,
             with_stack=False,
             experimental_config=experimental_config,
             schedule=torch_npu.profiler.schedule(wait=0, warmup=0, active=1, repeat=1, skip_first=5000),
-            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler('./profile'),
+            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(PROFILE_DIR),
         )
     else:
         from contextlib import nullcontext
@@ -206,9 +244,13 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
                 break
 
             torch.distributed.barrier()
+            torch.npu.reset_peak_memory_stats()
             print(f'[Rank {torch.accelerator.current_device_index()}] start step {i}')
 
+            step_start = time.perf_counter()
             loss = train_step(model, batch, optimizer)
+            torch.npu.synchronize()
+            step_time = time.perf_counter() - step_start
 
             if enable_profiler:
                 prof.step()
@@ -217,6 +259,7 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
             if torch.accelerator.current_device_index() == 0:
                 print(
                     f'[Rank {torch.accelerator.current_device_index()}] step {i} '
+                    f'step time: {step_time:.4f}s '
                     f'memory: {torch.npu.memory_allocated() / 1024**3:.4f} GB '
                     f'max memory: {torch.npu.max_memory_allocated() / 1024**3:.4f} GB',
                 )
@@ -239,7 +282,11 @@ def test_qwen3():
     trainer_with_config(
         config=get_complete_custom_config(),
         config_name='complete_custom',
-        description='FSDP2 + EP + TP + Recompute + Mixed Precision + Hook Module + Prefetch (Custom)',
+        description=(
+            'FSDP2 + EP + TP + Recompute + Mixed Precision + Hook Module + Prefetch (Custom)'
+            f' + ChunkBatch={ENABLE_CHUNK_BATCH}, ChunkMBS={CHUNK_MBS}'
+        ),
+        enable_profiler=ENABLE_PROFILER,
     )
 
     if torch.accelerator.current_device_index() == 0:
