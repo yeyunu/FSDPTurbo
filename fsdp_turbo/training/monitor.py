@@ -1,6 +1,8 @@
 import logging
 import time
 
+import torch
+
 from fsdp_turbo.utils.log import print_rank
 
 logger = logging.getLogger(__name__)
@@ -13,10 +15,14 @@ class Monitor:
         self.logging_steps = logging_steps
         self.loss_history = []
         self._step_start_time = None
+        self._memory_backend = None
 
     def on_step_start(self):
         """Record the start time of a step. Call before train_step."""
         self._step_start_time = time.perf_counter()
+        self._memory_backend = self._get_memory_backend()
+        if self._memory_backend is not None:
+            self._memory_backend.reset_peak_memory_stats()
 
     def log(self, step: int, loss: float, grad_norm: float = None, aux_loss: float = None):
         step_time = None
@@ -32,6 +38,11 @@ class Monitor:
             parts.append(f"Aux Loss: {aux_loss:.6f}")
         if step_time is not None:
             parts.append(f"Step Time: {step_time:.4f}s")
+        memory_stats = self._get_memory_stats()
+        if memory_stats is not None:
+            allocated_gb, peak_gb = memory_stats
+            parts.append(f"Memory: {allocated_gb:.4f} GB")
+            parts.append(f"Peak Memory: {peak_gb:.4f} GB")
 
         print_rank(logger.info, f"  {' | '.join(parts)}")
 
@@ -46,3 +57,18 @@ class Monitor:
             avg_time = sum(times) / len(times)
             parts.append(f"avg step time = {avg_time:.4f}s")
         print_rank(logger.info, f"Training summary: {', '.join(parts)}")
+
+    @staticmethod
+    def _get_memory_backend():
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return torch.npu
+        if torch.cuda.is_available():
+            return torch.cuda
+        return None
+
+    def _get_memory_stats(self):
+        backend = self._memory_backend or self._get_memory_backend()
+        if backend is None:
+            return None
+        backend.synchronize()
+        return backend.memory_allocated() / 1024**3, backend.max_memory_allocated() / 1024**3
