@@ -124,19 +124,26 @@ class FSDPTurbo(torch.nn.Module):
 
     def _init_cpu_path(self):
         """Traditional CPU initialization flow."""
-        logger.info("> Loading weights before parallel wrapping...")
-        WeightLoader.load(
-            model=self.model,
-            weights_path=self.weights_path,
-            device="cpu",
-            seed=self.seed,
+        has_real_params = any(
+            p.device.type != 'meta' for p in self.model.parameters()
         )
+        if self.weights_path is not None or not has_real_params:
+            logger.info("> Loading weights before parallel wrapping...")
+            WeightLoader.load(
+                model=self.model,
+                weights_path=self.weights_path,
+                device="cpu",
+                seed=self.seed,
+            )
+        else:
+            logger.info("> Model already has real parameters, skipping weight loading")
 
+        self.apply_quantization_modules()
         self.apply_tp_modules()
+        self._capture_tp_info_on_mx_linear()
         self.apply_ep_modules()
         self.apply_recompute_modules()
         self.apply_chunk_batch_modules()
-        self.apply_quantization_modules()
         self.apply_fsdp_modules()
 
         if self.config.distributed.fully_shard_parallel_size == 1:
@@ -274,6 +281,25 @@ class FSDPTurbo(torch.nn.Module):
             return
         self.model = recompute_modules(self.model, self.config.memory.recompute_plan)
 
+    def _capture_tp_info_on_mx_linear(self):
+        if self.config.distributed.tensor_parallel_size <= 1:
+            return
+        from fsdp_turbo.quantization.mx_formats.mx_linear import MXLinear
+        from torch.distributed.tensor import Shard, Partial
+        from fsdp_turbo.utils.str_match import module_name_match
+        tp_mesh = self.parallel_state.get_device_mesh('tp')
+        colwise = self.config.distributed.tp_plan.colwise_parallel or []
+        rowwise = self.config.distributed.tp_plan.rowwise_parallel or []
+        for name, mod in self.model.named_modules():
+            if not isinstance(mod, MXLinear):
+                continue
+            if any(module_name_match(p, name) for p in colwise):
+                mod._tp_mesh = tp_mesh
+                mod._tp_output_placements = [Shard(-1)]
+            elif any(module_name_match(p, name) for p in rowwise):
+                mod._tp_mesh = tp_mesh
+                mod._tp_output_placements = [Partial()]
+
     def apply_chunk_batch_modules(self):
         if not self.config.memory.chunk_batch:
             return
@@ -284,6 +310,11 @@ class FSDPTurbo(torch.nn.Module):
         if not self.config.quantization.quantization_plan.quant_recipe:
             return
         try:
+            # When recompute is enabled, forward may be called during backward.
+            # Force "all" mode so both fwd and bwd quantized tensors are available.
+            if self.config.memory.recompute:
+                self.config.quantization.quantization_plan.fsdp_low_precision_all_gather_mode = "all"
+
             from fsdp_turbo.quantization.converter.model_converter import build_model_converter
 
             model_converters = build_model_converter(self.config.quantization.quantization_plan)

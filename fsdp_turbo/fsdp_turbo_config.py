@@ -83,7 +83,7 @@ class CheckpointConfig:
 
 @dataclass
 class FSDPPlanConfig:
-    ignored_modules: List[str] = None
+    ignored_modules: List[str] = field(default_factory=list)
     apply_modules: Dict[str, Any] = None
     param_init_fn: Optional[Callable[[torch.nn.Module], None]] = None
 
@@ -135,6 +135,8 @@ class QuantizeConfig:
     quant_apply_modules: List[str] = None
     quant_ignored_modules: List[str] = None
     converters: List[str] = None
+    enable_fsdp_low_precision_all_gather: bool = True
+    fsdp_low_precision_all_gather_mode: str = "on-demand"
     quant_gmm: bool = False
     gemm_gradient_accumulation_fusion: bool = False
     extra_args: Dict[str, Any] = field(default_factory=dict)
