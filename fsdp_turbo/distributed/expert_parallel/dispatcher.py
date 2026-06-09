@@ -41,6 +41,8 @@ def dispatch_mlp_combine(ep_group, fused, hidden_states, top_k_index, top_k_weig
     # MoE preprocess to get local/global indices and AllToAll split sizes
     permute_indices, split_sizes = dispatch_preprocess(ep_group, top_k_index, num_global_experts,
                                                        expert_ids_per_ep_rank)
+    if fused and (permute_indices[0] == 0).any():
+        fused = False
     # AllToAll dispatch --> MLP computation --> AllToAll combine
     hidden_states, unpermute_indices = alltoall_dispatch(ep_group, hidden_states, top_k_index, permute_indices,
                                                          split_sizes, fused)

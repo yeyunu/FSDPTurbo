@@ -1,8 +1,7 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, NamedTuple
-from dataclasses import field
 
 import torch
 import torch_npu
@@ -69,15 +68,18 @@ class QuantBaseConfig:
 
 @dataclass
 class MXFP8LinearConfig(QuantBaseConfig):
+    enable_fsdp_low_precision_all_gather: bool = True
+    fsdp_low_precision_all_gather_mode: str = "on-demand"
     mxfp8_ignored_modules: list[str] = field(default_factory=list)
     mxfp8_apply_modules: list[str] = field(default_factory=list)
     converter: str = "quantize.linear.mx"
-
 
 def get_mxfp8linear_config(quant_config: QuantizeConfig):
     return MXFP8LinearConfig(
         quant_format=quant_config.quant_format,
         block_size=quant_config.block_size,
-        mxfp8_ignored_modules=quant_config.quant_ignored_modules,
-        mxfp8_apply_modules=quant_config.quant_apply_modules
+        mxfp8_ignored_modules=quant_config.quant_ignored_modules or [],
+        mxfp8_apply_modules=quant_config.quant_apply_modules or [],
+        enable_fsdp_low_precision_all_gather=quant_config.enable_fsdp_low_precision_all_gather,
+        fsdp_low_precision_all_gather_mode=quant_config.fsdp_low_precision_all_gather_mode,
     )

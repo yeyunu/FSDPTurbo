@@ -1,3 +1,4 @@
+import glob
 import os
 import time
 
@@ -5,7 +6,7 @@ import torch
 import torch_npu
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset
 
 from fsdp_turbo.fsdp_turbo import FSDPTurbo
 from fsdp_turbo.fsdp_turbo_config import (
@@ -15,6 +16,8 @@ from fsdp_turbo.fsdp_turbo_config import (
     TPPlanConfig,
     DistributedConfig,
     MemoryConfig,
+    QuantizeConfig,
+    QuantizationConfig,
     ChunkBatchPlanConfig,
 )
 from fsdp_turbo.utils.device import set_accelerator_compatible
@@ -29,8 +32,7 @@ MODEL_PATH = os.environ.get('MODEL_PATH', 'Qwen/Qwen3-30B-A3B')
 DATASET_PATH = os.environ.get('DATASET_PATH', 'wikitext')
 DATASET_CONFIG = os.environ.get('DATASET_CONFIG', 'wikitext-2-raw-v1')
 DATASET_SPLIT = os.environ.get('DATASET_SPLIT', 'train')
-DATASET_DISK_PATH = os.environ.get('DATASET_DISK_PATH')
-DATASET_TEXT_FILE = os.environ.get('DATASET_TEXT_FILE')
+DATASET_PARQUET_PATH = os.environ.get('DATASET_PARQUET_PATH')
 SEED = 42
 LOG_LEVEL = 'INFO'
 
@@ -50,6 +52,9 @@ FULLY_SHARD_PARALLEL_SIZE = int(os.environ.get('FULLY_SHARD_PARALLEL_SIZE', '4')
 ENABLE_CHUNK_BATCH = os.environ.get('ENABLE_CHUNK_BATCH', '0').lower() in ('1', 'true', 'yes', 'on')
 CHUNK_MBS = int(os.environ.get('CHUNK_MBS', '1'))
 CHUNK_BATCH_DIM = int(os.environ.get('CHUNK_BATCH_DIM', '0'))
+
+# Quantization configuration
+ENABLE_QUANT = os.environ.get('ENABLE_QUANT', '0').lower() in ('1', 'true', 'yes', 'on')
 
 # Profiler configuration
 ENABLE_PROFILER = os.environ.get('ENABLE_PROFILER', '0').lower() in ('1', 'true', 'yes', 'on')
@@ -76,12 +81,12 @@ def get_model_tokenizer():
 
 def get_dataloader(tokenizer, batch_size=BATCH_SIZE, max_length=MAX_LENGTH):
     """Load and tokenize the wikitext dataset, returning a DataLoader."""
-    if DATASET_DISK_PATH:
-        dataset = load_from_disk(DATASET_DISK_PATH)
-        if hasattr(dataset, 'keys'):
-            dataset = dataset[DATASET_SPLIT]
-    elif DATASET_TEXT_FILE:
-        dataset = load_dataset('text', data_files={DATASET_SPLIT: DATASET_TEXT_FILE}, split=DATASET_SPLIT)
+    if DATASET_PARQUET_PATH:
+        from datasets import Dataset
+        files = sorted(glob.glob(f'{DATASET_PARQUET_PATH}/*.parquet'))
+        if not files:
+            raise FileNotFoundError(f'No parquet files in {DATASET_PARQUET_PATH}')
+        dataset = Dataset.from_parquet(files)
     else:
         dataset = load_dataset(DATASET_PATH, DATASET_CONFIG, split=DATASET_SPLIT)
 
@@ -164,6 +169,14 @@ def get_complete_custom_config():
             recompute_plan=['model.layers.{*}'],
             chunk_batch=ENABLE_CHUNK_BATCH,
             chunk_batch_plan=chunk_batch_plan,
+        ),
+        quantization=QuantizationConfig(
+            quantization_plan=QuantizeConfig(
+                quant_recipe="mxfp8" if ENABLE_QUANT else None,
+                quant_format="E4M3",
+                converters=["quantize.linear.mx"],
+                quant_apply_modules=["model.layers.{*}"],
+            ),
         ),
     )
 
