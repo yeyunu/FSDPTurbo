@@ -1,13 +1,19 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import torch
 
+from fsdp_turbo.distributed.expert_parallel.utils import fixed_router_for_debug, normalize_expert_args
 from fsdp_turbo.distributed.dist_ops import gather_along_first_dim_expert_parallel
 from fsdp_turbo.ops.moe import permute, unpermute, all2all_grouped_matmul, grouped_matmul_all2all
 
 
-def get_experts_forward_mc2_fn(ep_group):
+def get_experts_forward_mc2_fn(ep_group, fixed_router=False):
     def experts_forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor):
         hidden_states_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+        top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
+        if fixed_router:
+            top_k_index, top_k_weights = fixed_router_for_debug(top_k_index, top_k_weights, self.num_global_experts)
+
         weights = (self.gate_up_proj.to_local(), self.down_proj.to_local())
         act_fn = self.act_fn
         num_global_experts = self.num_global_experts

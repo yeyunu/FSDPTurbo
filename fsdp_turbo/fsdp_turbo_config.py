@@ -122,7 +122,8 @@ class CPPlanConfig:
 @dataclass
 class EPPlanConfig:
     apply_modules: List[str] = None
-    dispatcher: Union[Literal["eager", "fused", "mc2"], Callable] = None
+    dispatcher: Union[Literal["eager", "fused", "mc2", "domino"], Callable] = None
+    fixed_router: bool = False
     apply_efsdp_modules: List[str] = None
     _gradient_divide_factor: float = None
 

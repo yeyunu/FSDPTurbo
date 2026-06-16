@@ -10,6 +10,7 @@ from torch.distributed.tensor import Shard, DTensor, Replicate, distribute_tenso
 
 from fsdp_turbo.distributed.expert_parallel.dispatcher import get_experts_forward_fn
 from fsdp_turbo.distributed.expert_parallel.dispatcher_mc2 import get_experts_forward_mc2_fn
+from fsdp_turbo.distributed.expert_parallel.domino_dispatcher import get_domino_experts_forward_fn
 from fsdp_turbo.fsdp_turbo_config import EPPlanConfig
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.str_match import module_name_match
@@ -42,7 +43,7 @@ def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, pl
         distribute_experts_module(module, ep_mesh)
 
         # replace forward with ep forward
-        experts_forward_fn = get_dispatcher_fn(plan.dispatcher, ep_group)
+        experts_forward_fn = get_dispatcher_fn(plan.dispatcher, ep_group, fixed_router=plan.fixed_router)
         module.forward = types.MethodType(experts_forward_fn, module)
     return modules
 
@@ -86,17 +87,19 @@ def distribute_experts_module(module: torch.nn.Module, ep_mesh: DeviceMesh):
                              # input_fn=prepare_distribute_input_fn, output_fn=prepare_distribute_output_fn)
 
 
-def get_dispatcher_fn(dispatcher, ep_group):
+def get_dispatcher_fn(dispatcher, ep_group, fixed_router=False):
     forward_fn = None
     if isinstance(dispatcher, Callable):
         forward_fn = partial(dispatcher, ep_group)
     elif isinstance(dispatcher, str):
         if dispatcher == 'eager':
-            forward_fn = get_experts_forward_fn(ep_group, fused=False)
+            forward_fn = get_experts_forward_fn(ep_group, fused=False, fixed_router=fixed_router)
         elif dispatcher == 'fused':
-            forward_fn = get_experts_forward_fn(ep_group, fused=True)
+            forward_fn = get_experts_forward_fn(ep_group, fused=True, fixed_router=fixed_router)
         elif dispatcher == 'mc2':
-            forward_fn = get_experts_forward_mc2_fn(ep_group)
+            forward_fn = get_experts_forward_mc2_fn(ep_group, fixed_router=fixed_router)
+        elif dispatcher == 'domino':
+            forward_fn = get_domino_experts_forward_fn(ep_group, fixed_router=fixed_router)
 
     if forward_fn is None:
         raise RuntimeError(f'Unsupported dispatcher {dispatcher}.')

@@ -3,17 +3,22 @@
 import torch
 
 from torch.distributed.tensor import DTensor
-from fsdp_turbo.distributed.expert_parallel.utils import normalize_expert_args
+from fsdp_turbo.distributed.expert_parallel.utils import (
+    fixed_router_for_debug,
+    normalize_expert_args,
+)
 from fsdp_turbo.distributed.dist_ops import all_to_all, gather_along_first_dim_expert_parallel
 from fsdp_turbo.ops.moe import grouped_matmul, permute, unpermute
 
 
-def get_experts_forward_fn(ep_group, fused):
+def get_experts_forward_fn(ep_group, fused, fixed_router=False):
     def experts_forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor):
         # Ensure correct parameter order and dimensions
-        top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
         hidden_states_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
+        if fixed_router:
+            top_k_index, top_k_weights = fixed_router_for_debug(top_k_index, top_k_weights, self.num_global_experts)
 
         gate_up_proj = (self.gate_up_proj.to_local()
                         if isinstance(self.gate_up_proj, DTensor)
