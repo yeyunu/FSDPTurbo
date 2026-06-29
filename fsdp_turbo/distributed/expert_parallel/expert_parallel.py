@@ -7,6 +7,7 @@ from typing import Callable
 import torch
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Shard, DTensor, Replicate, distribute_tensor, distribute_module
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from fsdp_turbo.distributed.expert_parallel.dispatcher import get_experts_forward_fn
 from fsdp_turbo.distributed.expert_parallel.dispatcher_mc2 import get_experts_forward_mc2_fn
@@ -74,8 +75,11 @@ def prepare_distribute_output_fn(module, outputs, device_mesh):
 
 
 def distribute_expert_weight(module_name, module, ep_mesh):
+    placements = [Shard(0)]
     for name, param in module.named_parameters(recurse=False):
-        dist_param = torch.nn.Parameter(distribute_tensor(param, ep_mesh, [Shard(0)]))
+        local_shape, global_offset = compute_local_shape_and_global_offset(param.shape, ep_mesh, placements)
+        slices = [slice(offset, offset + size) for offset, size in zip(global_offset, local_shape)]
+        dist_param = torch.nn.Parameter(DTensor.from_local(param[slices].detach().clone(), ep_mesh, placements))
         module.register_parameter(name, dist_param)
 
     for name, children_module in module.named_children():
