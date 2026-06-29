@@ -4,7 +4,7 @@ from typing import Set, List, Any, Optional
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy
 
 from fsdp_turbo.fsdp_turbo_config import FSDPPlanConfig
 from fsdp_turbo.distributed.fine_grained_fully_shard import get_fsdp_strategy
@@ -20,19 +20,11 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, 
     ignored_modules, ignored_params = get_ignored_modules(model, fsdp_plan)
     fsdp_modules = get_fsdp_modules(model, fsdp_plan, ignored_modules)
     hook_modules = get_fsdp_hook_modules(model, fsdp_plan)
-
-    has_param_init_fn = (
-        hasattr(fsdp_plan, 'param_init_fn')
-        and fsdp_plan.param_init_fn is not None
-    )
-
     mp_policy = get_mixprecision_policy(fsdp_plan)
-
     config = {
         'mesh': fsdp_mesh,
         'ignored_params': ignored_params,
         'mp_policy': mp_policy,
-        'reshard_after_forward': fsdp_plan.reshard_after_forward,
     }
 
     strategy = get_fsdp_strategy(fsdp_plan.fsdp_implementation)
@@ -41,50 +33,11 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, 
     for module, plan in fsdp_modules.items():
         module_config = config.copy()
         module_config.update(plan)
-
-        if has_param_init_fn:
-            fsdp_plan.param_init_fn(module)
-
         hook_module = find_hook_module(module, hook_modules)
-        fully_shard_fn(module, hook_module=hook_module, **module_config)
-
-    is_root_sharded = _is_fsdp_managed(model)
-
-    if not is_root_sharded:
-        fully_shard_fn(model, **config)
-
-    _move_cpu_params_to_device(model, fsdp_mesh)
+        fully_shard_fn(module, hook_module=hook_module, **config)
+    fully_shard_fn(model, **config)
     set_modules_to_prefetch(model, fsdp_modules, fsdp_plan)
     return model
-
-
-def _is_fsdp_managed(module: torch.nn.Module) -> bool:
-    return hasattr(module, "_fsdp_state") or hasattr(module, "_is_fully_sharded")
-
-
-def _move_cpu_params_to_device(model: torch.nn.Module, fsdp_mesh: DeviceMesh):
-    device_type = fsdp_mesh.device_type
-    if device_type not in ("npu", "cuda"):
-        return
-
-    try:
-        if device_type == "npu":
-            target_device = torch.device(f"npu:{torch.npu.current_device()}")
-        else:
-            target_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-        for p in set(model.parameters()):
-            if p.device.type == "cpu":
-                if type(p).__name__ in ('FSDPParam', 'FSDPParameter'):
-                    continue
-                p.data = p.data.to(target_device)
-
-        for b in set(model.buffers()):
-            if b.device.type == "cpu":
-                b.data = b.data.to(target_device)
-
-    except Exception as e:
-        logger.warning(f"Failed to move parameters to {device_type}: {e}")
 
 
 def set_modules_to_prefetch(model: torch.nn.Module, fsdp_modules: list[torch.nn.Module], fsdp_plan: FSDPPlanConfig):
@@ -162,6 +115,7 @@ def get_fsdp_hook_modules(model: torch.nn.Module, fsdp_plan: FSDPPlanConfig) -> 
     fsdp_hook_modules = []
     if fsdp_plan.apply_modules is None:
         return fsdp_hook_modules
+
     # Traverse all modules in the model
     if fsdp_plan.hook_modules:
         for name, module in _post_order_traverse(model):

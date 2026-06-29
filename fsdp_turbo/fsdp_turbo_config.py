@@ -85,14 +85,12 @@ class CheckpointConfig:
 class FSDPPlanConfig:
     ignored_modules: List[str] = field(default_factory=list)
     apply_modules: Dict[str, Any] = None
-    param_init_fn: Optional[Callable[[torch.nn.Module], None]] = None
 
     # mp_policy settings
     param_dtype: Optional[str] = None
     reduce_dtype: Optional[str] = None
     output_dtype: Optional[str] = None
     cast_forward_inputs: bool = True
-    reshard_after_forward: bool = True
 
     # prefetch settings
     num_to_forward_prefetch: Optional[int] = 0
@@ -144,24 +142,7 @@ class QuantizeConfig:
     fsdp_low_precision_all_gather_mode: str = "on-demand"
     quant_gmm: bool = False
     gemm_gradient_accumulation_fusion: bool = False
-    extra_args: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ModelLoadConfig:
-    model_name_or_path: str = ""
-    init_model_with_meta_device: bool = False
-    trust_remote_code: bool = False
-    train_from_scratch: bool = False
-    torch_dtype: Any = None
-    use_slow_tokenizer: bool = False
-    tie_word_embeddings: Optional[bool] = None
-    custom_config: Dict[str, Any] = field(default_factory=dict)
-    parallel_mode: Literal["none", "turbo", "fsdp_engine"] = "none"
-    parallel_config: Any = None
-    checkpoint_strict: bool = False
-    strict_weight_loading: Optional[bool] = None
-    device_index: int = 0
+    extra_args: Dict[str, Any] = field(default_factory=dict)  # for future extensibility
 
 
 @dataclass
