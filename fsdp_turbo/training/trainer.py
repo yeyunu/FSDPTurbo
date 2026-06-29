@@ -39,6 +39,7 @@ class BaseTrainer:
         self._monitor = None
         self._global_step = 0
         self._consumed_samples = 0
+        self._accumulated_losses = {"loss": [], "aux_loss": []}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -93,7 +94,11 @@ class BaseTrainer:
                     if epoch == start_epoch and step < skip_batches:
                         continue
                     self._monitor.on_step_start()
+                    batch = self.prepare_batch(batch)
                     loss, aux_loss = self.train_step(batch)
+                    self._accumulated_losses["loss"].append(loss.detach())
+                    if aux_loss is not None:
+                        self._accumulated_losses["aux_loss"].append(aux_loss.detach())
 
                     # Track how many samples have been processed.
                     if isinstance(batch, dict):
@@ -106,7 +111,12 @@ class BaseTrainer:
                     self._consumed_samples += batch_size
 
                     if (step + 1) % self.config.run.gradient_accumulation_steps == 0:
+                        synced = self.sync_loss(self._accumulated_losses)
+                        loss = synced["loss"]
+                        aux_loss = synced.get("aux_loss")
                         grad_norm = self._on_optimizer_step()
+                        for v in self._accumulated_losses.values():
+                            v.clear()
                         self._global_step += 1
                         self._on_log_step(loss, grad_norm, aux_loss)
                         self._on_checkpoint_step()
@@ -170,12 +180,56 @@ class BaseTrainer:
 
     def train_step(self, batch):
         """Execute a single training step: forward + backward."""
-        batch = self._move_batch_to_device(batch)
         outputs = self.model(**batch)
-        loss = outputs.loss / self.config.run.gradient_accumulation_steps
+        loss = outputs.loss
         loss.backward()
         aux_loss = outputs.aux_loss if hasattr(outputs, 'aux_loss') else None
         return loss, aux_loss
+
+    @classmethod
+    def sync_loss(cls, accumulated_losses: dict) -> dict:
+        """Synchronize accumulated losses across the CDP communication domain.
+
+        For each key in *accumulated_losses*, sums the list of detached loss
+        tensors locally, then performs an all-reduce average across ranks in
+        the CDP (Context Data Parallel) group.  When CDP is not enabled
+        (world_size == 1) the local sums are returned unchanged.
+
+        The method is generic and supports any number of named losses (e.g.
+        "loss", "aux_loss", or additional custom losses).
+
+        Args:
+            accumulated_losses: Dict mapping loss names to lists of detached
+                loss tensors accumulated across gradient-accumulation
+                micro-steps.
+
+        Returns:
+            Dict mapping the same loss names to scalar tensors with the
+            CDP-averaged sums.  Keys whose list is empty map to
+            None.
+        """
+        from fsdp_turbo.distributed.parallel_state import get_parallel_state
+        parallel_state = get_parallel_state()
+
+        cp_enabled = parallel_state.is_cp_enable()
+        if cp_enabled:
+            cp_group = parallel_state.get_cp_group()
+            cp_world_size = parallel_state.get_cp_group_size()
+
+        result = {}
+        for name, losses in accumulated_losses.items():
+            if not losses:
+                result[name] = None
+                continue
+            summed = torch.stack(losses).sum()
+            if cp_enabled:
+                synced = summed.clone()
+                torch.distributed.all_reduce(synced, op=torch.distributed.ReduceOp.SUM, group=cp_group)
+                synced.div_(cp_world_size)
+                result[name] = synced
+            else:
+                result[name] = summed
+        return result
 
     # ------------------------------------------------------------------
     # Distributed initialization
@@ -308,11 +362,36 @@ class BaseTrainer:
                 pass
         return 100000
 
+    def prepare_batch(self, batch):
+        """Move batch to device and optionally split along sequence dim for context parallelism."""
+        batch = self._move_batch_to_device(batch)
+        batch = self._split_batch_for_kv_allgather(batch)
+        batch = self._split_batch_for_ulysses(batch)
+        return batch
+
     def _move_batch_to_device(self, batch):
         device = torch.accelerator.current_accelerator()
         if isinstance(batch, dict):
-            return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
         return batch
+
+    def _split_batch_for_ulysses(self, batch):
+        """Split batch tensors along the sequence dimension for Ulysses context parallelism."""
+        if self.config.distributed.ulysses_parallel_size <= 1:
+            return batch
+        from fsdp_turbo.distributed.context_parallel.ulysses.utils import ulysses_split_batch_data
+        from fsdp_turbo.distributed.parallel_state import get_parallel_state
+        parallel_state = get_parallel_state()
+        return ulysses_split_batch_data(batch, parallel_state.get_ulysses_group())
+
+    def _split_batch_for_kv_allgather(self, batch):
+        """Split batch tensors along the sequence dimension for KV all-gather context parallelism."""
+        if self.config.distributed.kv_allgather_parallel_size <= 1:
+            return batch
+        from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import kv_allgather_split_batch_data
+        from fsdp_turbo.distributed.parallel_state import get_parallel_state
+        parallel_state = get_parallel_state()
+        return kv_allgather_split_batch_data(batch, parallel_state.get_kvallgather_group())
 
     def _clip_grad_norm(self):
         """Clip gradient norm and return the total norm before clipping.

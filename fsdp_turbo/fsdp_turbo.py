@@ -10,6 +10,8 @@ from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import \
 from fsdp_turbo.distributed.parallel_state import init_parallel_state
 from fsdp_turbo.distributed.tensor_parallel.tensor_parallel import tensor_parallel_modules
 from fsdp_turbo.memory.chunk_batch.chunk_batch import chunk_batch_modules
+from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_context_parallel import ulysses_context_parallelize_modules
+from fsdp_turbo.distributed.context_parallel.kv_allgather.kv_allgather_context_parallel import kv_allgather_context_parallelize_modules
 from fsdp_turbo.memory.recompute.recompute import recompute_modules
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.distributed.expert_parallel.expert_parallel import expert_parallelize_modules
@@ -84,6 +86,7 @@ class FSDPTurbo(torch.nn.Module):
         self._post_process_meta()
 
         self.apply_tp_modules()
+        self.apply_cp_modules()
         self.apply_ep_modules()
         self.apply_recompute_modules()
         self.apply_quantization_modules()
@@ -141,6 +144,7 @@ class FSDPTurbo(torch.nn.Module):
         self.apply_quantization_modules()
         self.apply_tp_modules()
         self._capture_tp_info_on_mx_linear()
+        self.apply_cp_modules()
         self.apply_ep_modules()
         self.apply_recompute_modules()
         self.apply_chunk_batch_modules()
@@ -264,6 +268,27 @@ class FSDPTurbo(torch.nn.Module):
         if self.config.distributed.tensor_parallel_size == 1:
             return
         self.model = tensor_parallel_modules(self.model, self.parallel_state.get_tp_device_mesh(), self.config.distributed.tp_plan)
+
+    def apply_cp_modules(self):
+        cp_plan = self.config.distributed.cp_plan
+        if cp_plan is None:
+            return
+        # KV all-gather context parallelism
+        if self.config.distributed.kv_allgather_parallel_size > 1 and cp_plan.kv_allgather_core_attention_function:
+            self.model = kv_allgather_context_parallelize_modules(
+                self.model,
+                self.parallel_state.get_kvallgather_group(),
+                cp_plan,
+            )
+        
+        # Ulysses context parallelism
+        if self.config.distributed.ulysses_parallel_size > 1 and cp_plan.ulysses_core_attention_function:
+            self.model = ulysses_context_parallelize_modules(
+                self.model,
+                self.parallel_state.get_ulysses_group(),
+                cp_plan,
+            )
+
 
     def apply_ep_modules(self):
         if self.config.distributed.expert_parallel_size > 1:

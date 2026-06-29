@@ -66,9 +66,9 @@ distributed:
   data_parallel_size: 1
   fully_shard_parallel_size: 8
   tensor_parallel_size: 1
-  context_parallel_size: 1
-  ulysses_parallel_size: 1
-  expert_parallel_size: 8
+  kv_allgather_parallel_size: 2
+  ulysses_parallel_size: 2
+  expert_parallel_size: 4
   expert_fully_shard_parallel_size: 1
   expert_data_parallel_size: 1
 
@@ -105,6 +105,13 @@ distributed:
     dispatcher: "fused"
     apply_efsdp_modules:
       - model.layers.{*}.mlp
+
+  cp_plan:
+    ulysses_core_attention_function: "transformers.models.deepseek_v4.modeling_deepseek_v4.eager_attention_forward"
+    ulysses_attention_type: "with_compressor"
+    ulysses_attn_output_transposed: true
+    kv_allgather_core_attention_function: "transformers.models.deepseek_v4.modeling_deepseek_v4.eager_attention_forward"
+    kv_allgather_attention_type: "with_compressor"
 
 # --- Memory Configuration ---
 memory:

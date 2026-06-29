@@ -116,7 +116,11 @@ class TPPlanConfig:
 
 @dataclass
 class CPPlanConfig:
-    pass
+    ulysses_core_attention_function: Union[str, List[str]] = None
+    ulysses_attention_type: Union[Literal["default", "with_compressor", "GDN"], Callable] = "default"
+    ulysses_attn_output_transposed: bool = False
+    kv_allgather_core_attention_function: Union[str, List[str]] = None
+    kv_allgather_attention_type: Union[Literal["default", "with_compressor"], Callable] = "default"
 
 
 @dataclass
@@ -170,8 +174,9 @@ class DistributedConfig:
     tensor_parallel_size: int = 1
     tp_plan: TPPlanConfig = None
 
-    context_parallel_size: int = 1
+    kv_allgather_parallel_size: int = 1
     ulysses_parallel_size: int = 1
+    cp_plan: CPPlanConfig = None
 
     expert_parallel_size: int = 1
     expert_fully_shard_parallel_size: int = 1
@@ -243,6 +248,7 @@ class FSDPTurboConfig:
 
     def __post_init__(self):
         self.validate_tp_config()
+        self.validate_cp_config()
         self.validate_ep_config()
         self.validate_recompute_config()
         self.validate_chunk_batch_config()
@@ -288,6 +294,29 @@ class FSDPTurboConfig:
         self.distributed.tp_plan.colwise_parallel = [] if self.distributed.tp_plan.colwise_parallel is None else self.distributed.tp_plan.colwise_parallel
         self.distributed.tp_plan.rowwise_parallel = [] if self.distributed.tp_plan.rowwise_parallel is None else self.distributed.tp_plan.rowwise_parallel
         self.distributed.tp_plan.sequence_parallel = [] if self.distributed.tp_plan.sequence_parallel is None else self.distributed.tp_plan.sequence_parallel
+
+    def validate_cp_config(self):
+        ''' context parallelize plan (Ulysses)
+
+        config = FSDPTurboConfig(
+            distributed=DistributedConfig(
+                kv_allgather_parallel_size=2,
+                ulysses_parallel_size=2,
+                cp_plan=CPPlanConfig(
+                    ulysses_core_attention_function='transformers.models.deepseek_v4.modeling_deepseek_v4.eager_attention_forward'
+                )
+            )
+        )
+        '''
+        self.distributed.cp_plan = CPPlanConfig() if self.distributed.cp_plan is None else self.distributed.cp_plan
+        if self.distributed.cp_plan.ulysses_core_attention_function is None:
+            self.distributed.cp_plan.ulysses_core_attention_function = []
+        elif isinstance(self.distributed.cp_plan.ulysses_core_attention_function, str):
+            self.distributed.cp_plan.ulysses_core_attention_function = [self.distributed.cp_plan.ulysses_core_attention_function]
+        if self.distributed.cp_plan.kv_allgather_core_attention_function is None:
+            self.distributed.cp_plan.kv_allgather_core_attention_function = []
+        elif isinstance(self.distributed.cp_plan.kv_allgather_core_attention_function, str):
+            self.distributed.cp_plan.kv_allgather_core_attention_function = [self.distributed.cp_plan.kv_allgather_core_attention_function]
 
     def validate_ep_config(self):
         ''' expert parallelize plan
@@ -509,10 +538,12 @@ def load_config_from_yaml(yaml_path):
         fsdp_plan_raw = distributed_raw.pop("fsdp_plan", None)
         tp_plan_raw = distributed_raw.pop("tp_plan", None)
         ep_plan_raw = distributed_raw.pop("ep_plan", None)
+        cp_plan_raw = distributed_raw.pop("cp_plan", None)
 
         fsdp_plan = _dict_to_dataclass(FSDPPlanConfig, fsdp_plan_raw) if fsdp_plan_raw is not None else None
         tp_plan = _dict_to_dataclass(TPPlanConfig, tp_plan_raw) if tp_plan_raw is not None else None
         ep_plan = _dict_to_dataclass(EPPlanConfig, ep_plan_raw) if ep_plan_raw is not None else None
+        cp_plan = _dict_to_dataclass(CPPlanConfig, cp_plan_raw) if cp_plan_raw is not None else None
 
         distributed_valid_fields = {f.name for f in fields(DistributedConfig)}
         extra_keys = set(distributed_raw.keys()) - distributed_valid_fields
@@ -521,7 +552,7 @@ def load_config_from_yaml(yaml_path):
         filtered_distributed_raw = {k: v for k, v in distributed_raw.items() if k in distributed_valid_fields}
 
         distributed_cfg = DistributedConfig(fsdp_plan=fsdp_plan, tp_plan=tp_plan, ep_plan=ep_plan,
-                                            **filtered_distributed_raw)
+                                            cp_plan=cp_plan, **filtered_distributed_raw)
     else:
         distributed_cfg = DistributedConfig()
 

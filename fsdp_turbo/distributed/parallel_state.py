@@ -44,8 +44,9 @@ class ParallelState(metaclass=Singleton):
     data_parallel_size: int = 1
     fully_shard_parallel_size: int = 1
     tensor_parallel_size: int = 1
-    context_parallel_size: int = 1
+    kv_allgather_parallel_size: int = 1
     ulysses_parallel_size: int = 1
+    context_data_parallel_size: int = 1
 
     expert_parallel_size: int = 1
     expert_fully_shard_parallel_size: int = 1
@@ -59,26 +60,46 @@ class ParallelState(metaclass=Singleton):
         if self.device_mesh_map is None:
             self.device_mesh_map = dict()
 
-        # create DP/CP/Ulysses/TP groups
-        mesh_dim_names = ('dp', 'fsdp', 'cp', 'ulysses', 'tp')
-        mesh_shape = (
-            self.fully_shard_parallel_size,
-            self.context_parallel_size,
-            self.ulysses_parallel_size,
-            self.tensor_parallel_size,
+        # create DP/FSDP/TP groups (cp and ulysses are separated into their own mesh)
+        self.data_parallel_size = self._create_mesh(
+            ('dp', 'fsdp', 'tp'),
+            (self.fully_shard_parallel_size, self.tensor_parallel_size),
         )
-        self.data_parallel_size = get_last_mesh_dim(mesh_shape)
-        mesh_shape = (self.data_parallel_size,) + mesh_shape
-        self.add_device_mesh_groups(mesh_dim_names, mesh_shape)
 
         # create EP_DP/EP groups
-        mesh_dim_names = ('edp', 'efsdp', 'ep')
-        mesh_shape = (self.expert_fully_shard_parallel_size, self.expert_parallel_size,)
-        self.expert_data_parallel_size = get_last_mesh_dim(mesh_shape)
-        mesh_shape = (self.expert_data_parallel_size,) + mesh_shape
-        self.add_device_mesh_groups(mesh_dim_names, mesh_shape)
+        self.expert_data_parallel_size = self._create_mesh(
+            ('edp', 'efsdp', 'ep'),
+            (self.expert_fully_shard_parallel_size, self.expert_parallel_size),
+        )
+
+        # create CDP/CP/Ulysses groups as a separate device mesh
+        self.context_data_parallel_size = self._create_mesh(
+            ('cdp', 'kvallgather', 'ulysses', 'tp'),
+            (self.kv_allgather_parallel_size, self.ulysses_parallel_size, self.tensor_parallel_size),
+        )
+
+        self.add_flatten_device_mesh(('kvallgather', 'ulysses'), 'cp')
 
         print_rank(logger.info, f'Parallel state initialized:\n{self.__str__()}')
+
+    def _create_mesh(self, mesh_dim_names, mesh_shape):
+        """Create a device mesh with an auto-computed leading dimension.
+
+        The first dimension in mesh_dim_names is computed as
+        world_size // product(mesh_shape) and prepended to mesh_shape.
+
+        Args:
+            mesh_dim_names: Tuple of mesh dimension names, e.g. ('dp', 'fsdp', 'tp').
+            mesh_shape: Tuple of sizes for all dimensions except the first,
+                        e.g. (fsdp_size, tp_size).
+
+        Returns:
+            The size of the auto-computed leading dimension.
+        """
+        first_dim_size = get_last_mesh_dim(mesh_shape)
+        full_shape = (first_dim_size,) + mesh_shape
+        self.add_device_mesh_groups(mesh_dim_names, full_shape)
+        return first_dim_size
 
     def __str__(self):
         sep = '=' * 60
@@ -141,8 +162,7 @@ class ParallelState(metaclass=Singleton):
         else:
             raise RuntimeError(f"Mesh group {mesh_name} not found.")
 
-    def add_device_mesh_groups(self, mesh_dim_names, mesh_shape):
-
+    def add_method(self, mesh_name):
         def get_methods(name):
             def is_enable_method(self):
                 return self.is_group_enable(name)
@@ -161,6 +181,14 @@ class ParallelState(metaclass=Singleton):
 
             return is_enable_method, get_group_method, get_size_method, get_rank_method, get_mesh_method
 
+        is_enable, get_group, get_size, get_rank, get_mesh = get_methods(mesh_name)
+        setattr(self, 'is_{}_enable'.format(mesh_name), types.MethodType(is_enable, self))
+        setattr(self, 'get_{}_group'.format(mesh_name), types.MethodType(get_group, self))
+        setattr(self, 'get_{}_group_size'.format(mesh_name), types.MethodType(get_size, self))
+        setattr(self, 'get_{}_rank'.format(mesh_name), types.MethodType(get_rank, self))
+        setattr(self, 'get_{}_device_mesh'.format(mesh_name), types.MethodType(get_mesh, self))
+
+    def add_device_mesh_groups(self, mesh_dim_names, mesh_shape):
         if reduce(lambda a, b: a * b, mesh_shape) != torch.distributed.get_world_size():
             raise AssertionError(f"Mesh groups {mesh_shape}({reduce(lambda a, b: a * b, mesh_shape)}) "
                                  f"!= world size({torch.distributed.get_world_size()})")
@@ -169,12 +197,13 @@ class ParallelState(metaclass=Singleton):
 
         for mesh_name in mesh_dim_names:
             self.device_mesh_map[mesh_name] = device_mesh
-            is_enable, get_group, get_size, get_rank, get_mesh = get_methods(mesh_name)
-            setattr(self, 'is_{}_enable'.format(mesh_name), types.MethodType(is_enable, self))
-            setattr(self, 'get_{}_group'.format(mesh_name), types.MethodType(get_group, self))
-            setattr(self, 'get_{}_group_size'.format(mesh_name), types.MethodType(get_size, self))
-            setattr(self, 'get_{}_rank'.format(mesh_name), types.MethodType(get_rank, self))
-            setattr(self, 'get_{}_device_mesh'.format(mesh_name), types.MethodType(get_mesh, self))
+            self.add_method(mesh_name)
+
+    def add_flatten_device_mesh(self, mesh_dim_names, new_mesh_name):
+        device_mesh = self.device_mesh_map[mesh_dim_names[0]]
+        device_mesh[tuple(mesh_dim_names)]._flatten(mesh_dim_name=new_mesh_name)
+        self.device_mesh_map[new_mesh_name] = device_mesh
+        self.add_method(new_mesh_name)
 
 
 def get_parallel_state() -> ParallelState:

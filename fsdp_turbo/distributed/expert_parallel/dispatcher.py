@@ -3,17 +3,19 @@
 import torch
 
 from torch.distributed.tensor import DTensor
+from torch.distributed._functional_collectives import all_to_all_single_autograd
 from fsdp_turbo.distributed.expert_parallel.utils import (
     fixed_router_for_debug,
     normalize_expert_args,
 )
-from fsdp_turbo.distributed.dist_ops import all_to_all, gather_along_first_dim_expert_parallel
+from fsdp_turbo.distributed.dist_ops import gather_along_first_dim_expert_parallel
 from fsdp_turbo.ops.moe import grouped_matmul, permute, unpermute
 
 
 def get_experts_forward_fn(ep_group, fused, fixed_router=False):
     def experts_forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor):
         # Ensure correct parameter order and dimensions
+        top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
         hidden_states_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
@@ -89,7 +91,7 @@ def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes
 
     hidden_states, unpermute_indices1 = permute(hidden_states, top_k_index, use_eager=not fused)
     torch.npu.current_stream().synchronize()
-    hidden_states = all_to_all(ep_group, hidden_states, output_splits.numpy(), input_split.numpy())
+    hidden_states = all_to_all_single_autograd(hidden_states, output_splits.tolist(), input_split.tolist(), ep_group)
     hidden_states, unpermute_indices2 = permute(hidden_states, global_indices, use_eager=not fused)
 
     return hidden_states, (unpermute_indices1, unpermute_indices2)
@@ -109,6 +111,6 @@ def alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, 
     unpermute_indices1, unpermute_indices2 = unpermute_indices
     input_split, output_splits = split_sizes
     hidden_states = unpermute(hidden_states, unpermute_indices2, use_eager=not fused)
-    hidden_states = all_to_all(ep_group, hidden_states, input_split.numpy(), output_splits.numpy())
+    hidden_states = all_to_all_single_autograd(hidden_states, input_split.tolist(), output_splits.tolist(), ep_group)
     hidden_states = unpermute(hidden_states, unpermute_indices1, top_k_weights, use_eager=not fused)
     return hidden_states

@@ -35,11 +35,13 @@ class DeepseekV4Trainer(BaseTrainer):
         model_config.n_routed_experts = 16
         model_config.index_topk = 16
 
-        model = DeepseekV4ForCausalLM(model_config).npu()
+        with torch.device('meta'):
+            model = DeepseekV4ForCausalLM(model_config)
         convert_model_dtype(model, self.config.model.torch_dtype)
 
         print_rank(logger.info, "> Applying FSDPTurbo parallelism...")
         model = FSDPTurbo(self.config, model)
+        model.to_empty(device='npu')
 
         # indexer grad bypass
         for name, module in model.named_modules():
