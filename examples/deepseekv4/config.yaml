@@ -24,6 +24,7 @@ optimizer:
 # --- Run Configuration ---
 run:
   seed: 42
+  deterministic: true
   max_steps: -1
   num_train_epochs: 1
   gradient_accumulation_steps: 1

@@ -64,6 +64,7 @@ class DataConfig:
 @dataclass
 class TrainRunConfig:
     seed: int = 42
+    deterministic: bool = False
     max_steps: int = -1
     num_train_epochs: int = 1
     gradient_accumulation_steps: int = 1

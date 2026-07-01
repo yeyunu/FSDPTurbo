@@ -265,7 +265,7 @@ class BaseTrainer:
     def _set_seed(self):
         """Set random seed. Override to customize seed source."""
         from fsdp_turbo.utils.random import set_seed
-        set_seed(self.config.run.seed, set_deterministic=True)
+        set_seed(self.config.run.seed, set_deterministic=self.config.run.deterministic)
 
     # ------------------------------------------------------------------
     # Component builders - override in subclasses
