@@ -21,12 +21,12 @@ class FSDPTurbo(torch.nn.Module):
         self.model = model
 
         self.parallel_state = init_parallel_state(self.config)
+        self.apply_quantization_modules()
         self.apply_tp_modules()
         self._capture_tp_info_on_mx_linear()
         self.apply_cp_modules()
         self.apply_ep_modules()
         self.apply_recompute_modules()
-        self.apply_quantization_modules()
         self.apply_chunk_batch_modules()
         self.apply_fsdp_modules()
 

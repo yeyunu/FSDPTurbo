@@ -7,6 +7,7 @@ from torch.profiler import record_function
 from torch.distributed.fsdp._fully_shard._fsdp_common import (
     TrainingState,
     compiled_autograd_enabled,
+    _from_local_no_grad,
 )
 from torch.distributed.fsdp._fully_shard._fsdp_collectives import (
     foreach_all_gather_copy_out,
@@ -34,7 +35,11 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
     - global_comm_ctx: Supports multiple communication contexts
     - Overrides wait_for_unshard and post_backward methods
     """
-    
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.reduce_scatter_reduce_op = None
+
     def wait_for_unshard(self):
         """
         Waits for preceding All-Gather operations to complete before unsharding.
@@ -47,6 +52,20 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
 
         if not self._all_gather_result:
             return  # no preceding unshard
+
+        if self.mesh_info.shard_mesh_size == 1:
+            for fsdp_param in self.fsdp_params:
+                if not hasattr(fsdp_param, '_unsharded_param'):
+                    unsharded_param = fsdp_param._sharded_local_tensor
+                    if fsdp_param.is_dtensor:
+                        unsharded_param = _from_local_no_grad(
+                            unsharded_param, fsdp_param._tp_spec
+                        )
+                    fsdp_param._unsharded_param = unsharded_param
+            self._to_unsharded()
+            self._all_gather_result = None
+            return
+
         async_op = self._all_gather_result.all_gather_work is not None
         if self._training_state == TrainingState.FORWARD:  # implicit prefetch
             for comm_ctx in self.global_comm_ctx:
@@ -162,6 +181,7 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
                 unsharded_grads,
                 self._reduce_scatter_process_group,
                 self.comm_ctx.reduce_scatter_stream,
+                self._reduce_scatter_comm,
                 self._orig_dtype,
                 self._reduce_dtype,
                 self.device,
