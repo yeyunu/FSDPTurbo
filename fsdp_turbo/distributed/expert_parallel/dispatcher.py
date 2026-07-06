@@ -10,7 +10,7 @@ from fsdp_turbo.distributed.expert_parallel.utils import (
 )
 from fsdp_turbo.distributed.dist_ops import gather_along_first_dim_expert_parallel
 from fsdp_turbo.ops.moe import grouped_matmul, permute, unpermute
-
+from fsdp_turbo.quantization.mx_formats.mx_gmm import mx_quant_group_gemm
 
 def get_experts_forward_fn(ep_group, fused, fixed_router=False):
     def experts_forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor):
@@ -34,16 +34,19 @@ def get_experts_forward_fn(ep_group, fused, fixed_router=False):
         num_global_experts = self.num_global_experts
         expert_ids_per_ep_rank = self.expert_ids_per_ep_rank
         act_limit = self.limit if hasattr(self, 'limit') else None
+        quant_config = getattr(self, '_quant_config', None) or getattr(self, 'config', None)
+        if quant_config is not None and not hasattr(quant_config, 'get_key_dtype'):
+            quant_config = None
 
         hidden_states = dispatch_mlp_combine(ep_group, fused, hidden_states, top_k_index, top_k_weights, weights, act_fn,
-                                             num_global_experts, expert_ids_per_ep_rank, act_limit)
+                                             num_global_experts, expert_ids_per_ep_rank, act_limit, quant_config)
 
         return hidden_states.view(*hidden_states_shape)
     return experts_forward
 
 
 def dispatch_mlp_combine(ep_group, fused, hidden_states, top_k_index, top_k_weights, weights, act_fn,
-                         num_global_experts, expert_ids_per_ep_rank, act_limit):
+                         num_global_experts, expert_ids_per_ep_rank, act_limit, quant_config=None):
     gate_up_weights, down_weights = weights
     # MoE preprocess to get local/global indices and AllToAll split sizes
     permute_indices, split_sizes = dispatch_preprocess(ep_group, top_k_index, num_global_experts,
@@ -54,7 +57,7 @@ def dispatch_mlp_combine(ep_group, fused, hidden_states, top_k_index, top_k_weig
     hidden_states, unpermute_indices = alltoall_dispatch(ep_group, hidden_states, top_k_index, permute_indices,
                                                          split_sizes, fused)
     hidden_states = experts_computation(hidden_states, permute_indices[0], gate_up_weights, down_weights,
-                                        act_fn, act_limit, fused)
+                                        act_fn, act_limit, fused, quant_config)
     hidden_states = alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes, fused)
     return hidden_states
 
@@ -97,13 +100,22 @@ def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes
     return hidden_states, (unpermute_indices1, unpermute_indices2)
 
 
-def experts_computation(hidden_states, split_list, gate_up_weights, down_weights, act_fn, act_limit, fused):
-    gate, up = grouped_matmul(hidden_states, split_list, gate_up_weights, use_eager=not fused).chunk(2, dim=-1)
+def experts_computation(hidden_states, split_list, gate_up_weights, down_weights, act_fn, act_limit, fused, quant_config=None):
+    if quant_config is not None:
+        group_list = torch.cumsum(split_list, dim=0)
+        gmm_fn = lambda x, w: mx_quant_group_gemm(
+            x, w, group_list, quant_config, grad_enabled=torch.is_grad_enabled()
+        )
+    else:
+        gmm_fn = lambda x, w: grouped_matmul(x, split_list, w, use_eager=not fused)
+
+    fc1 = gmm_fn(hidden_states, gate_up_weights)
+    gate, up = fc1.chunk(2, dim=-1)
     if act_limit is not None:
         gate = gate.clamp(max=act_limit)
         up = up.clamp(min=-act_limit, max=act_limit)
     act = act_fn(gate) * up
-    hidden_states = grouped_matmul(act, split_list, down_weights, use_eager=not fused)
+    hidden_states = gmm_fn(act, down_weights)
     return hidden_states
 
 

@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# 定义layer_filter等函数
 import functools
 import re
 from typing import Optional, Callable, Dict, Type
@@ -75,6 +74,29 @@ def module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
                 return True
             else:
                 return False
+
+    return False
+
+
+def moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
+    """Filter function for MoE expert modules.
+
+    Matches modules whose FQN contains "experts" and whose parent layer
+    matches the configured apply_modules patterns.
+    """
+    if "experts" not in fqn.lower():
+        return False
+
+    m = re.match(r"(.*?layers\.\d+)", fqn)
+    if m is None:
+        return False
+    prefix = m.group(1)
+
+    for pattern in config.mxfp8_apply_modules:
+        if module_name_match(pattern, prefix):
+            return True
+        else:
+            return False
 
     return False
 

@@ -53,9 +53,11 @@ def quantize_(
         config: MXFP8LinearConfig,
         filter_fn: Optional[Callable[[torch.nn.Module, str], bool]],
         device: Optional[torch.types.Device] = None,
+        handler: Optional[Callable] = None,
 ):
     filter_fn = filter_fn
-    handler = _QUANTIZE_CONFIG_HANDLER[type(config)]
+    if handler is None:
+        handler = _QUANTIZE_CONFIG_HANDLER[type(config)]
     saved_inv_freq = model.model.rotary_emb.inv_freq.detach().clone()
 
     try:

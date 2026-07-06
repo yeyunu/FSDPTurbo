@@ -54,9 +54,8 @@ class QuantBaseConfig:
     quant_format: str = "E4M3"
     block_size: int = 32
 
-    @classmethod
-    def get_key_dtype(cls, key):
-        key_format = Format.from_config_fp8(cls.quant_format)
+    def get_key_dtype(self, key):
+        key_format = Format.from_config_fp8(self.quant_format)
         config = key_format.value
         if key == 'inputs':
             return config.inputs.value.quant_type

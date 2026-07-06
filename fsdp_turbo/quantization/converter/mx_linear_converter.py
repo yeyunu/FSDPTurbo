@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #

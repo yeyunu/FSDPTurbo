@@ -9,6 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
 
 from fsdp_turbo.fsdp_turbo import FSDPTurbo
+from fsdp_turbo.quantization.cache import clear_weight_cache
 from fsdp_turbo.fsdp_turbo_config import (
     FSDPTurboConfig,
     FSDPPlanConfig,
@@ -174,7 +175,7 @@ def get_complete_custom_config():
             quantization_plan=QuantizeConfig(
                 quant_recipe="mxfp8" if ENABLE_QUANT else None,
                 quant_format="E4M3",
-                converters=["quantize.linear.mx"],
+                converters=["quantize.linear.mx", "quantize.moe.mx"],
                 quant_apply_modules=["model.layers.{*}"],
             ),
         ),
@@ -198,6 +199,7 @@ def train_step(model, batch, optimizer):
 
     loss.backward()
     optimizer.step()
+    clear_weight_cache()
     model.zero_grad()
 
     return loss
