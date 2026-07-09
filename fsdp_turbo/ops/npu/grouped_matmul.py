@@ -21,20 +21,11 @@ class GroupedMatmul(torch.autograd.Function):
         # Get weight chunks
         weight_chunks = [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
 
-        # Determine if weight matrices need to be transposed
-        # Matrix multiplication requires: last dimension of input_tensor must equal first dimension of weight matrix
-        # input_tensor.shape = [M, K], weight matrix should be [K, N] for M@K * K@N = M@N
-        weight_shape = weight_chunks[0].shape
-        input_last_dim = input_tensor.shape[-1]
-
-        if weight_shape[0] == input_last_dim:
-            # Weight matrix shape is [K, N], compatible with input matrix [M, K], no transpose needed
-            ctx.needs_transpose = False
-            weights_for_matmul = weight_chunks
-        else:
-            # Assume weight matrix needs to be transposed
-            ctx.needs_transpose = True
-            weights_for_matmul = [w.T for w in weight_chunks]
+        # Weights follow the linear-layer convention [output_dim, input_dim] per expert.
+        # Transpose to [input_dim, output_dim] so that input [M, K] @ weight.T [K, N] = output [M, N].
+        # Always transpose rather than guessing from shape, since shape-based detection is
+        # unreliable when input_dim == output_dim (square weight matrices).
+        weights_for_matmul = [w.T for w in weight_chunks]
 
         ctx.save_for_backward(input_tensor, weights)
 
@@ -48,32 +39,23 @@ class GroupedMatmul(torch.autograd.Function):
         group_list = ctx.group_list
         inp, weights = ctx.saved_tensors
         group_list_type = ctx.group_list_type
-        needs_transpose = ctx.needs_transpose
 
-        # Get weight chunks
+        # Get weight chunks (original [output_dim, input_dim] format)
         weight_chunks = [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
 
-        # Calculate input gradient: grad_output @ weight^T or grad_output @ weight
-        # If weights were transposed in forward (needs_transpose=True), use original weights
-        # If weights were not transposed in forward (needs_transpose=False), transpose weights
-        if needs_transpose:
-            weights_for_grad = weight_chunks
-        else:
-            weights_for_grad = [w.T for w in weight_chunks]
-
-        # Calculate input gradient
-        grad = torch_npu.npu_grouped_matmul([grad_output], weights_for_grad, bias=None,
+        # Calculate input gradient: grad_output [M, N] @ weight [N, K] = grad_input [M, K].
+        # Forward used transposed weights, so the original weights are used directly here.
+        grad = torch_npu.npu_grouped_matmul([grad_output], weight_chunks, bias=None,
                                             group_list=group_list, split_item=2, group_type=0,
                                             group_list_type=group_list_type)[0]
 
-        # Calculate weight gradient (K split gmm): grad_weight = inp^T @ grad_output
+        # Calculate weight gradient (K split gmm): grad_weight = inp^T @ grad_output = [K, N]
         grad_weight = torch_npu.npu_grouped_matmul([inp.T], [grad_output], bias=None,
                                                    group_list=group_list, split_item=3,
                                                    group_type=2, group_list_type=group_list_type)[0]
 
-        # Adjust weight gradient orientation
-        # When forward uses transposed weights, transpose the computed gradient back
-        grad_weight_chunks = [w.T if needs_transpose else w for w in grad_weight]
+        # Transpose to match original weight format [output_dim, input_dim]
+        grad_weight_chunks = [w.T for w in grad_weight]
 
         return grad, torch.stack(grad_weight_chunks), None, None, None
 
