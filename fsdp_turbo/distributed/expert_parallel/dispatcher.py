@@ -70,7 +70,7 @@ def dispatch_preprocess(ep_group, top_k_index, num_global_experts, expert_ids_pe
     local_experts_end_id = local_experts_start_id + num_local_experts
 
     # [B*S, K] --> [E]
-    num_local_tokens_per_expert = torch.bincount(top_k_index.view(-1), minlength=num_global_experts)
+    num_local_tokens_per_expert = torch.histc(top_k_index, bins=num_global_experts, min=0, max=num_global_experts).long()
     # [E] --> [EP*E]
     num_global_tokens_per_expert, _ = gather_along_first_dim_expert_parallel(num_local_tokens_per_expert, ep_group)
     # [EP*E] --> [EP, local_E]
@@ -103,9 +103,7 @@ def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes
 def experts_computation(hidden_states, split_list, gate_up_weights, down_weights, act_fn, act_limit, fused, quant_config=None):
     if quant_config is not None:
         group_list = torch.cumsum(split_list, dim=0)
-        gmm_fn = lambda x, w: mx_quant_group_gemm(
-            x, w, group_list, quant_config, grad_enabled=torch.is_grad_enabled()
-        )
+        gmm_fn = lambda x, w: mx_quant_group_gemm(x, w, group_list, quant_config, grad_enabled=torch.is_grad_enabled())
     else:
         gmm_fn = lambda x, w: grouped_matmul(x, split_list, w, use_eager=not fused)
 
