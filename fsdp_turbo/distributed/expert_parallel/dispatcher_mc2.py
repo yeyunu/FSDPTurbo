@@ -19,14 +19,17 @@ def get_experts_forward_mc2_fn(ep_group, fixed_router=False):
         act_limit = self.limit if hasattr(self, 'limit') else None
         num_global_experts = self.num_global_experts
 
-        hidden_states = dispatch_mlp_combine(ep_group, hidden_states, top_k_index, top_k_weights, weights, act_fn,
-                                             act_limit, num_global_experts)
+        hidden_states = dispatch_mlp_combine(
+            ep_group, hidden_states, top_k_index, top_k_weights, weights, act_fn, act_limit, num_global_experts
+        )
         return hidden_states.view(*hidden_states_shape)
 
     return experts_forward
 
 
-def dispatch_mlp_combine(ep_group, hidden_states, top_k_index, top_k_weights, weights, act_fn, act_limit, num_global_experts):
+def dispatch_mlp_combine(
+    ep_group, hidden_states, top_k_index, top_k_weights, weights, act_fn, act_limit, num_global_experts
+):
     gate_up_weights, down_weights = weights
 
     send_counts, recv_counts = dispatch_preprocess(ep_group, top_k_index, num_global_experts)
@@ -52,10 +55,13 @@ def dispatch_preprocess(ep_group, top_k_index, num_global_experts):
     local_experts_end_id = local_experts_start_id + num_local_experts
 
     # [B*S, K] --> [E]
-    num_local_tokens_per_expert = torch.histc(top_k_index, bins=num_global_experts, min=0, max=num_global_experts).long()
+    num_local_tokens_per_expert = torch.histc(
+        top_k_index, bins=num_global_experts, min=0, max=num_global_experts
+    ).long()
     # [E] --> [EP*E]
     num_global_tokens_per_expert, _ = gather_along_first_dim_expert_parallel(num_local_tokens_per_expert, ep_group)
     send_counts = num_local_tokens_per_expert
-    recv_counts = num_global_tokens_per_expert.reshape(ep_size, num_global_experts)[:,
-                  local_experts_start_id: local_experts_end_id].reshape(-1)
-    return send_counts, recv_counts
+    recv_counts = num_global_tokens_per_expert.reshape(ep_size, num_global_experts)[
+        :, local_experts_start_id:local_experts_end_id
+    ].reshape(-1)
+    return send_counts.tolist(), recv_counts.tolist()
