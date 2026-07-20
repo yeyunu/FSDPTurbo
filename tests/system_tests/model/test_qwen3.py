@@ -84,6 +84,7 @@ def get_dataloader(tokenizer, batch_size=BATCH_SIZE, max_length=MAX_LENGTH):
     """Load and tokenize the wikitext dataset, returning a DataLoader."""
     if DATASET_PARQUET_PATH:
         from datasets import Dataset
+
         files = sorted(glob.glob(f'{DATASET_PARQUET_PATH}/*.parquet'))
         if not files:
             raise FileNotFoundError(f'No parquet files in {DATASET_PARQUET_PATH}')
@@ -112,7 +113,7 @@ def get_dataloader(tokenizer, batch_size=BATCH_SIZE, max_length=MAX_LENGTH):
 def get_complete_custom_config():
     """
     Get complete FSDP configuration with all features enabled (Custom Implementation).
-    
+
     Features:
     - FSDP2 with fully sharded data parallel
     - Expert Parallel with eager dispatcher
@@ -219,10 +220,10 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
     initialization()
 
     if torch.accelerator.current_device_index() == 0:
-        print(f'\n{"="*60}')
+        print(f'\n{"=" * 60}')
         print(f'Test: {config_name}')
         print(f'Description: {description}')
-        print(f'{"="*60}\n')
+        print(f'{"=" * 60}\n')
 
     model, tokenizer = get_model_tokenizer()
     model = FSDPTurbo(config, model)
@@ -251,6 +252,7 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
         )
     else:
         from contextlib import nullcontext
+
         prof_ctx = nullcontext()
 
     with prof_ctx as prof:
@@ -275,6 +277,7 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
                 print(
                     f'[Rank {torch.accelerator.current_device_index()}] step {i} '
                     f'step time: {step_time:.4f}s '
+                    f'loss: {loss.item():.4f} '
                     f'memory: {torch.npu.memory_allocated() / 1024**3:.4f} GB '
                     f'max memory: {torch.npu.max_memory_allocated() / 1024**3:.4f} GB',
                 )
@@ -289,7 +292,7 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
 def test_qwen3():
     """
     Test Qwen3 with complete FSDP configurations.
-    
+
     This test will run the following configuration.:
     All features enabled (FSDP2, EP, TP, Recompute, Mixed Precision, Hook Module, Prefetch)
     """
@@ -305,9 +308,9 @@ def test_qwen3():
     )
 
     if torch.accelerator.current_device_index() == 0:
-        print(f'\n{"#"*60}')
-        print(f'All tests completed successfully!')
-        print(f'{"#"*60}\n')
+        print(f'\n{"#" * 60}')
+        print('All tests completed successfully!')
+        print(f'{"#" * 60}\n')
 
 
 if __name__ == '__main__':

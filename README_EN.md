@@ -14,41 +14,45 @@
 
 FSDPTurbo is a high-performance and easy-to-use distributed training acceleration library. Based on the architectural design philosophy of high cohesion and low coupling, it provides a general acceleration solution decoupled from model structures for training large-scale deep learning models. It offers state-of-the-art parallelism strategies, advanced memory optimization techniques, and quantization support to efficiently train your large models.
 
----
+***
 
 ## Key Features
 
 ### 🚀 Distributed Training
+
 - **FSDP2**: Fully Sharded Data Parallel with enhanced performance
 - **Tensor Parallelism**: Efficient model parallelism for large models
 - **Expert Parallelism**: Optimized MoE (Mixture of Experts) training
 - **Hybrid Parallelism**: Flexible combination of different parallel strategies
 
 ### 💾 Memory Optimization
+
 - **Gradient Checkpointing**: Reduce memory footprint by recomputing activations
 - **Chunked Loss Computation**: Memory-efficient loss calculation
 - **Activation Offloading**: Offload activations to CPU/NVMe
 - **Optimizer State Offloading**: Offload optimizer states to CPU/NVMe
 
 ### 🔢 Quantization Support
+
 - **MX Formats**: Support for E4M3, E5M2, and HIF8 formats
 - **FP8 Training**: Native FP8 training support
 - **Mixed Precision**: Flexible mixed precision training strategies
 
 ### 🛠️ Easy to Use
+
 - **Simple API**: Minimal code changes required
 - **Model Agnostic**: Works with various model architectures
 - **Flexible Configuration**: Customizable parallel and memory strategies
 
----
+***
 
 ## Installation
 
 ### Dependencies
 
 - Python >= 3.11
-- PyTorch >= 2.11
-- [torch_npu](https://gitee.com/ascend/pytorch) >= 2.11
+- PyTorch >= 2.9.0, < 2.12.0
+- [torch\_npu](https://gitee.com/ascend/pytorch) >= 2.9.0, < 2.12.0
 
 ### From Source
 
@@ -58,7 +62,7 @@ cd FSDPTurbo
 pip install -e .
 ```
 
----
+***
 
 ## Quick Start
 
@@ -129,7 +133,7 @@ config = FSDPTurboConfig(
 )
 ```
 
----
+***
 
 ## Architecture
 
@@ -152,7 +156,7 @@ FSDPTurbo
 └── utils/                 # Utility functions
 ```
 
----
+***
 
 # Disclaimer
 
@@ -171,7 +175,7 @@ If you do not wish for your model or dataset to be mentioned in FSDPTurbo, or wi
 
 For files involved in FSDPTurbo, if a License exists in the file directory, that License shall prevail. If no License exists in the file directory, it is licensed under the Apache 2.0 License, and the corresponding license text can be found in the FSDPTurbo root directory.
 
----
+***
 
 ## Contributing
 
@@ -183,11 +187,11 @@ We welcome contributions! Please follow these steps:
 4. Push to the branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
 
----
+***
 
 ## Support
 
 - **Issues**: [Issues](https://gitcode.com/Ascend/FSDPTurbo/issues)
 - **Documentation**: Coming soon
 
----
+***

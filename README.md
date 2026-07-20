@@ -14,7 +14,7 @@
 
 FSDPTurbo 是一个兼具高性能与易用性的分布式训练加速库，基于高内聚低耦合的架构设计理念，打造一套与模型结构解耦的通用加速方案，用于训练大规模深度学习模型。它提供了业界领先的并行策略、先进的内存优化技术和量化支持，能够高效训练用户的大模型。
 
----
+***
 
 ## 主要特性
 
@@ -44,15 +44,15 @@ FSDPTurbo 是一个兼具高性能与易用性的分布式训练加速库，基�
 - **层次化并行**：组合多种并行策略（DP × FSDP × TP × EP）
 - **模型无关**：适用于各种 Transformer 架构
 
----
+***
 
 ## 安装
 
 ### 环境要求
 
 - Python >= 3.11
-- PyTorch >= 2.11
-- [torch_npu](https://gitee.com/ascend/pytorch) >= 2.11
+- PyTorch >= 2.9.0, < 2.12.0
+- [torch\_npu](https://gitee.com/ascend/pytorch) >= 2.9.0, < 2.12.0
 
 ### 从源码安装
 
@@ -62,7 +62,7 @@ cd FSDPTurbo
 pip install -e .
 ```
 
----
+***
 
 ## 快速开始
 
@@ -136,7 +136,7 @@ config = FSDPTurboConfig(
 )
 ```
 
----
+***
 
 ## 架构
 
@@ -159,7 +159,7 @@ FSDPTurbo
 └── utils/                 # 工具函数
 ```
 
----
+***
 
 # 免责声明
 
@@ -178,7 +178,7 @@ FSDPTurbo
 
 FSDPTurbo 中涉及的文件，如文件目录下存在 License 的，以该 License 为准。如文件目录下不存在 License 的，以Apache 2.0 许可证许可，对应许可证文本可查阅 FSDPTurbo 根目录。
 
----
+***
 
 ## 贡献
 
@@ -190,11 +190,11 @@ FSDPTurbo 中涉及的文件，如文件目录下存在 License 的，以该 Lic
 4. 推送到分支 (`git push origin feature/AmazingFeature`)
 5. 提交 Pull Request
 
----
+***
 
 ## 支持
 
 - **问题反馈**：[Issues](https://gitcode.com/Ascend/FSDPTurbo/issues)
 - **文档**：即将推出
 
----
+***
