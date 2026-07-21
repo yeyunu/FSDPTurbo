@@ -18,7 +18,7 @@ echo "  FSDP2 + EP + TP + Recompute + Mixed Precision + Hook Module "
 echo ""
 
 torchrun --nproc_per_node=$NUM_GPUS_PER_NODE --nnodes=$NUM_NODES --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-    tests/system_tests/qwen3/test_qwen3.py
+    tests/system_tests/model/test_qwen3.py
 TEST_RESULT=$?
 
 echo ""

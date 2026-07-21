@@ -30,7 +30,7 @@ function clean_running_env () {
 }
 
 function run_testcase () {
-    pushd "${WORKSPACE}"/CODE
+    cd "${WORKSPACE}"/CODE
 
     for test_script in ./tests/system_tests/model/run_test*.sh; do
         if [ -f "$test_script" ]; then
@@ -43,7 +43,7 @@ function run_testcase () {
         fi
     done
 
-    popd
+    cd ..
 }
 
 function main() {
