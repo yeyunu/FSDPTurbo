@@ -11,7 +11,11 @@ Defines the prototype UX for converting a model to use mx weights
 from functools import partial
 from typing import Optional
 import torch
-import torch_npu
+
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
 from torch.distributed.tensor import DTensor
 
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
@@ -25,10 +29,10 @@ from fsdp_turbo.quantization.utils import register_quantize_module_handler
 class mx_mm(torch.autograd.Function):
     @staticmethod
     def forward(
-            ctx,
-            input_hp: torch.Tensor,
-            weight_hp: torch.Tensor,
-            mx_tensor: MXTensor,
+        ctx,
+        input_hp: torch.Tensor,
+        weight_hp: torch.Tensor,
+        mx_tensor: MXTensor,
     ):
         ctx.mx_tensor = mx_tensor
         # input @ weight_t = output
@@ -43,10 +47,14 @@ class mx_mm(torch.autograd.Function):
             ctx.weight_pq = weight_hp
 
             output = torch_npu.npu_quant_matmul(
-                input_mx.data, weight_hp._weight_fwd.t(), weight_hp._scale_fwd.transpose(0, 1),
+                input_mx.data,
+                weight_hp._weight_fwd.t(),
+                weight_hp._scale_fwd.transpose(0, 1),
                 pertoken_scale=input_mx.scale,
-                output_dtype=input_hp.dtype, scale_dtype=torch_npu.float8_e8m0fnu,
-                pertoken_scale_dtype=torch_npu.float8_e8m0fnu, group_sizes=[1, 1, 32],
+                output_dtype=input_hp.dtype,
+                scale_dtype=torch_npu.float8_e8m0fnu,
+                pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                group_sizes=[1, 1, 32],
             )
         else:
             ctx.is_post_quant = False
@@ -54,10 +62,14 @@ class mx_mm(torch.autograd.Function):
             ctx.weight_mx = weight_mx
 
             output = torch_npu.npu_quant_matmul(
-                input_mx.data, weight_mx.data.t(), weight_mx.scale.transpose(0, 1),
+                input_mx.data,
+                weight_mx.data.t(),
+                weight_mx.scale.transpose(0, 1),
                 pertoken_scale=input_mx.scale,
-                output_dtype=input_hp.dtype, scale_dtype=torch_npu.float8_e8m0fnu,
-                pertoken_scale_dtype=torch_npu.float8_e8m0fnu, group_sizes=[1, 1, 32],
+                output_dtype=input_hp.dtype,
+                scale_dtype=torch_npu.float8_e8m0fnu,
+                pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                group_sizes=[1, 1, 32],
             )
             weight_mx.data.untyped_storage().resize_(0)
             weight_mx.scale.untyped_storage().resize_(0)
@@ -87,18 +99,26 @@ class mx_mm(torch.autograd.Function):
         if ctx.is_post_quant:
             weight_pq = ctx.weight_pq
             dx = torch_npu.npu_quant_matmul(
-                grads_mx.data, weight_pq._weight_bwd, weight_pq._scale_bwd,
+                grads_mx.data,
+                weight_pq._weight_bwd,
+                weight_pq._scale_bwd,
                 pertoken_scale=grads_mx.scale,
-                output_dtype=ori_dtype, scale_dtype=torch_npu.float8_e8m0fnu,
-                pertoken_scale_dtype=torch_npu.float8_e8m0fnu, group_sizes=[1, 1, 32],
+                output_dtype=ori_dtype,
+                scale_dtype=torch_npu.float8_e8m0fnu,
+                pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                group_sizes=[1, 1, 32],
             )
         else:
             weight_mx = ctx.weight_mx
             dx = torch_npu.npu_quant_matmul(
-                grads_mx.data, weight_mx.data_t, weight_mx.scale_t,
+                grads_mx.data,
+                weight_mx.data_t,
+                weight_mx.scale_t,
                 pertoken_scale=grads_mx.scale,
-                output_dtype=ori_dtype, scale_dtype=torch_npu.float8_e8m0fnu,
-                pertoken_scale_dtype=torch_npu.float8_e8m0fnu, group_sizes=[1, 1, 32],
+                output_dtype=ori_dtype,
+                scale_dtype=torch_npu.float8_e8m0fnu,
+                pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                group_sizes=[1, 1, 32],
             )
 
         if len(grad_orig_shape) != 2:
@@ -109,18 +129,26 @@ class mx_mm(torch.autograd.Function):
 
         if ctx.is_post_quant:
             dw = torch_npu.npu_quant_matmul(
-                grads_mx.data_t.t(), input_mx.data_t, input_mx.scale_t,
+                grads_mx.data_t.t(),
+                input_mx.data_t,
+                input_mx.scale_t,
                 pertoken_scale=grads_mx.scale_t.transpose(0, 1),
-                output_dtype=ori_dtype, scale_dtype=torch_npu.float8_e8m0fnu,
-                pertoken_scale_dtype=torch_npu.float8_e8m0fnu, group_sizes=[1, 1, 32],
+                output_dtype=ori_dtype,
+                scale_dtype=torch_npu.float8_e8m0fnu,
+                pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                group_sizes=[1, 1, 32],
             )
         else:
             weight_mx = ctx.weight_mx
             dw = torch_npu.npu_quant_matmul(
-                grads_mx.data_t.t(), input_mx.data_t, input_mx.scale_t,
+                grads_mx.data_t.t(),
+                input_mx.data_t,
+                input_mx.scale_t,
                 pertoken_scale=grads_mx.scale_t.transpose(0, 1),
-                output_dtype=ori_dtype, scale_dtype=torch_npu.float8_e8m0fnu,
-                pertoken_scale_dtype=torch_npu.float8_e8m0fnu, group_sizes=[1, 1, 32],
+                output_dtype=ori_dtype,
+                scale_dtype=torch_npu.float8_e8m0fnu,
+                pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+                group_sizes=[1, 1, 32],
             )
             weight_mx.data_t.untyped_storage().resize_(0)
             weight_mx.scale_t.untyped_storage().resize_(0)
@@ -143,12 +171,8 @@ class MXLinear(torch.nn.Linear):
 
     @classmethod
     @torch.no_grad()
-    def from_float(
-            cls,
-            mod,
-            config: Optional[MXFP8LinearConfig] = None,
-            *extra_args
-    ):
+    # pylint: disable=attribute-defined-outside-init
+    def from_float(cls, mod, config: Optional[MXFP8LinearConfig] = None):
         if config is None:
             config = MXFP8LinearConfig()
 
@@ -169,11 +193,15 @@ class MXLinear(torch.nn.Linear):
             if isinstance(w, DTensor):
                 local_w = w.to_local()
                 pre_quant = PreQuantWeight(
-                    local_w, quantizer_fn, config, mod.weight.dtype,
+                    local_w,
+                    quantizer_fn,
+                    config,
+                    mod.weight.dtype,
                 )
                 new_mod.weight = torch.nn.Parameter(
                     DTensor.from_local(
-                        pre_quant, device_mesh=w.device_mesh,
+                        pre_quant,
+                        device_mesh=w.device_mesh,
                         placements=w.placements,
                     ),
                     requires_grad=w.requires_grad,
@@ -181,7 +209,10 @@ class MXLinear(torch.nn.Linear):
             else:
                 new_mod.weight = torch.nn.Parameter(
                     PreQuantWeight(
-                        w, quantizer_fn, config, mod.weight.dtype,
+                        w,
+                        quantizer_fn,
+                        config,
+                        mod.weight.dtype,
                     ),
                     requires_grad=w.requires_grad,
                 )

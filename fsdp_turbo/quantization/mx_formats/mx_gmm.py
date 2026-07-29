@@ -3,231 +3,18 @@ from functools import partial
 from typing import Optional
 
 import torch
-import torch_npu
 
+from fsdp_turbo.ops import dispatch_op
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
 from fsdp_turbo.quantization.core.pre_quant_weight import PreQuantWeight
+from fsdp_turbo.quantization.mx_formats._mx_npu_quant import (
+    dynamic_mx_quant,
+    dynamic_mx_quant_with_dual_axis,
+    swiglu,
+    weight_quant_gmm,
+)
 from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig
 from fsdp_turbo.quantization.utils import view_as_n_dim
-
-def _weight_quant_gmm(weight: torch.Tensor, dst_type, new_shape: tuple) -> tuple:
-    """Quantize weight for GMM, reshaping before quantization for per-expert handling.
-
-    The weight is reshaped to 3D [num_experts, in_dim, out_dim] before quantization
-    so that the dual-axis quantization produces correct per-expert scales.
-    """
-    original_shape = weight.shape
-    weight = weight.reshape(new_shape)
-    weight_bwd, weight_scale_bwd, weight_fwd, weight_scale_fwd = (
-        torch_npu.npu_dynamic_mx_quant_with_dual_axis(weight, dst_type=dst_type)
-    )
-    weight_fwd = weight_fwd.reshape(original_shape)
-    weight_bwd = weight_bwd.reshape(original_shape)
-    return weight_fwd, weight_scale_fwd, weight_bwd, weight_scale_bwd
-
-
-@torch._dynamo.allow_in_graph
-class _MxGroupedMatmul(torch.autograd.Function):
-    """FP8 grouped matrix multiplication with dual-axis quantization.
-
-    Handles both PostQuantWeight (pre-quantized by FSDP all-gather) and
-    regular tensors (quantized on-the-fly).
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        group_list: torch.Tensor,
-        config: MXFP8LinearConfig,
-        grad_enabled: bool,
-        group_list_type: int = 0,
-    ):
-        ctx.config = config
-        ctx.group_list_type = group_list_type
-
-        x_fp8, x_scale = torch_npu.npu_dynamic_mx_quant(
-            x, axis=-1, dst_type=config.get_key_dtype("inputs")
-        )
-        x_fp8 = view_as_n_dim(x_fp8, 2)
-
-        # Unwrap nesting: nn.Parameter → PreQuantWeight → DTensor
-        if isinstance(weight, torch.nn.Parameter):
-            weight = weight.data
-        if isinstance(weight, PreQuantWeight):
-            weight = weight._tensor
-
-        # Extract local tensor if weight is still a DTensor (e.g. EP-sharded)
-        if hasattr(weight, 'to_local'):
-            weight = weight.to_local()
-
-        ctx.weight_2d_shape = weight.shape
-
-        if weight.dtype == torch.float32:
-            weight = weight.to(torch.bfloat16)
-
-        K = x.shape[-1]
-        num_experts = len(group_list)
-
-        # Detect weight layout: [G*K, N] vs [G*N, K]
-        weight_transposed = weight.shape[0] // num_experts != K
-        ctx.weight_transposed = weight_transposed
-
-        if isinstance(weight, PostQuantWeight):
-            ctx.is_post_quant = True
-            ctx.weight_pq = weight
-            if weight_transposed:
-                weight_fwd = weight._weight_fwd.view(num_experts, -1, K).transpose(1, 2).contiguous()
-                weight_scale_fwd = weight._scale_fwd
-            else:
-                weight_fwd = weight._weight_fwd.view(num_experts, K, -1).contiguous()
-                weight_scale_fwd = weight._scale_fwd
-        else:
-            ctx.is_post_quant = False
-            if weight_transposed:
-                weight_3d = weight.view(num_experts, -1, K).transpose(1, 2)
-            else:
-                weight_3d = weight.view(num_experts, K, -1)
-            if grad_enabled:
-                weight_bwd, weight_scale_bwd, weight_fwd, weight_scale_fwd = (
-                    torch_npu.npu_dynamic_mx_quant_with_dual_axis(
-                        weight_3d, dst_type=config.get_key_dtype("weight")
-                    )
-                )
-                ctx.weight_bwd = weight_bwd
-                ctx.weight_scale_bwd = weight_scale_bwd
-            else:
-                weight_fwd, weight_scale_fwd = torch_npu.npu_dynamic_mx_quant(
-                    weight_3d, axis=-2, dst_type=config.get_key_dtype("weight")
-                )
-
-        ctx.save_for_backward(x, group_list)
-
-        output = torch_npu.npu_grouped_matmul(
-            [x_fp8],
-            [weight_fwd],
-            scale=[weight_scale_fwd],
-            per_token_scale=[x_scale],
-            group_list=group_list,
-            group_type=0,
-            output_dtype=x.dtype,
-            group_list_type=group_list_type,
-            scale_dtype=torch_npu.float8_e8m0fnu,
-            per_token_scale_dtype=torch_npu.float8_e8m0fnu,
-            split_item=3,
-        )[0]
-
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        x, group_list = ctx.saved_tensors
-        config = ctx.config
-        group_list_type = ctx.group_list_type
-        group_list_int32 = group_list.to(torch.int32)
-        total_tokens = group_list[-1].item()
-
-        grad_fp8, grad_scale = torch_npu.npu_dynamic_mx_quant(
-            grad_output, axis=-1, dst_type=config.get_key_dtype("grads")
-        )
-
-        if ctx.is_post_quant:
-            num_experts = len(group_list)
-            K = x.shape[-1]
-            if ctx.weight_transposed:
-                weight_bwd = ctx.weight_pq._weight_bwd.view(num_experts, -1, K).contiguous()
-                weight_scale_bwd = ctx.weight_pq._scale_bwd.transpose(1, 2).contiguous()
-            else:
-                weight_bwd = ctx.weight_pq._weight_bwd.view(num_experts, K, -1).transpose(1, 2).contiguous()
-                weight_scale_bwd = ctx.weight_pq._scale_bwd.transpose(1, 2).contiguous()
-
-            dx = torch_npu.npu_grouped_matmul(
-                [grad_fp8],
-                [weight_bwd],
-                scale=[weight_scale_bwd],
-                per_token_scale=[grad_scale],
-                group_list=group_list,
-                group_type=0,
-                output_dtype=grad_output.dtype,
-                group_list_type=group_list_type,
-                scale_dtype=torch_npu.float8_e8m0fnu,
-                per_token_scale_dtype=torch_npu.float8_e8m0fnu,
-                split_item=3,
-            )[0]
-
-            if total_tokens == 0:
-                dw = torch.zeros(ctx.weight_2d_shape, dtype=x.dtype, device=x.device)
-            else:
-                x_q, x_q_scale = torch_npu.npu_grouped_dynamic_mx_quant(
-                    x, group_list_int32, round_mode="rint",
-                    dst_type=config.get_key_dtype("inputs"), blocksize=32,
-                )
-                grad_q, grad_q_scale = torch_npu.npu_grouped_dynamic_mx_quant(
-                    grad_output, group_list_int32, round_mode="rint",
-                    dst_type=config.get_key_dtype("grads"), blocksize=32,
-                )
-                dw = torch_npu.npu_grouped_matmul(
-                    [x_q.t()],
-                    [grad_q],
-                    scale=[grad_q_scale],
-                    per_token_scale=[x_q_scale.transpose(0, 1)],
-                    group_list=group_list,
-                    group_type=2,
-                    output_dtype=x.dtype,
-                    group_list_type=group_list_type,
-                    scale_dtype=torch_npu.float8_e8m0fnu,
-                    per_token_scale_dtype=torch_npu.float8_e8m0fnu,
-                    split_item=3,
-                )[0]
-        else:
-            weight_bwd = ctx.weight_bwd.transpose(1, 2).contiguous()
-            weight_scale_bwd = ctx.weight_scale_bwd.transpose(1, 2).contiguous()
-
-            dx = torch_npu.npu_grouped_matmul(
-                [grad_fp8],
-                [weight_bwd],
-                scale=[weight_scale_bwd],
-                per_token_scale=[grad_scale],
-                group_list=group_list,
-                group_type=0,
-                output_dtype=grad_output.dtype,
-                group_list_type=group_list_type,
-                scale_dtype=torch_npu.float8_e8m0fnu,
-                per_token_scale_dtype=torch_npu.float8_e8m0fnu,
-                split_item=3,
-            )[0]
-
-            if total_tokens == 0:
-                dw = torch.zeros(ctx.weight_2d_shape, dtype=x.dtype, device=x.device)
-            else:
-                x_q, x_q_scale = torch_npu.npu_grouped_dynamic_mx_quant(
-                    x, group_list_int32, round_mode="rint",
-                    dst_type=config.get_key_dtype("inputs"), blocksize=32,
-                )
-                grad_q, grad_q_scale = torch_npu.npu_grouped_dynamic_mx_quant(
-                    grad_output, group_list_int32, round_mode="rint",
-                    dst_type=config.get_key_dtype("grads"), blocksize=32,
-                )
-                dw = torch_npu.npu_grouped_matmul(
-                    [x_q.t()],
-                    [grad_q],
-                    scale=[grad_q_scale],
-                    per_token_scale=[x_q_scale.transpose(0, 1)],
-                    group_list=group_list,
-                    group_type=2,
-                    output_dtype=x.dtype,
-                    group_list_type=group_list_type,
-                    scale_dtype=torch_npu.float8_e8m0fnu,
-                    per_token_scale_dtype=torch_npu.float8_e8m0fnu,
-                    split_item=3,
-                )[0]
-
-        if ctx.weight_transposed:
-            dw = dw.transpose(1, 2).reshape(ctx.weight_2d_shape)
-        else:
-            dw = dw.reshape(ctx.weight_2d_shape)
-        return dx, dw, None, None, None, None
 
 
 def mx_quant_group_gemm(
@@ -242,16 +29,79 @@ def mx_quant_group_gemm(
 
     Args:
         x: Input tensor [total_tokens, in_features]
-        weight: Weight tensor, either PostQuantWeight or regular tensor.
+        weight: Weight tensor (PostQuantWeight, PreQuantWeight, nn.Parameter,
+                or plain tensor).
         group_list: Cumulative token counts per group [num_groups].
         config: MXFP8 quantization configuration.
-        grad_enabled: Whether gradients are enabled (training vs inference).
-        group_list_type: Type of group list (0=cumsum, 1=counts).
-
-    Returns:
-        Output tensor [total_tokens, out_features].
+        grad_enabled: Whether gradients are enabled.
+        group_list_type: 0=cumsum, 1=counts.
     """
-    return _MxGroupedMatmul.apply(x, weight, group_list, config, grad_enabled, group_list_type)
+    x_fp8, x_scale = dynamic_mx_quant(x, axis=-1, dst_type=config.get_key_dtype("inputs"))
+    x_fp8 = view_as_n_dim(x_fp8, 2)
+
+    weight_unwrapped = weight
+    if isinstance(weight_unwrapped, torch.nn.Parameter):
+        weight_unwrapped = weight_unwrapped.data
+    if isinstance(weight_unwrapped, PreQuantWeight):
+        weight_unwrapped = weight_unwrapped._tensor
+    if hasattr(weight_unwrapped, 'to_local'):
+        weight_unwrapped = weight_unwrapped.to_local()
+
+    is_post_quant = isinstance(weight_unwrapped, PostQuantWeight)
+
+    weight_2d_shape = weight_unwrapped.shape
+    if weight_unwrapped.dtype == torch.float32:
+        weight_unwrapped = weight_unwrapped.to(torch.bfloat16)
+
+    K = x.shape[-1]
+    num_experts = len(group_list)
+    weight_transposed = weight_unwrapped.shape[0] // num_experts != K
+
+    if is_post_quant:
+        pq = weight_unwrapped
+        if weight_transposed:
+            weight_fwd = pq._weight_fwd.view(num_experts, -1, K).transpose(1, 2).contiguous()
+            weight_bwd = pq._weight_bwd.view(num_experts, -1, K).contiguous()
+        else:
+            weight_fwd = pq._weight_fwd.view(num_experts, K, -1).contiguous()
+            weight_bwd = pq._weight_bwd.view(num_experts, K, -1).transpose(1, 2).contiguous()
+        weight_scale_fwd = pq._scale_fwd
+        weight_scale_bwd = pq._scale_bwd.transpose(1, 2).contiguous()
+    else:
+        if weight_transposed:
+            weight_3d = weight_unwrapped.view(num_experts, -1, K).transpose(1, 2).contiguous()
+        else:
+            weight_3d = weight_unwrapped.view(num_experts, K, -1).contiguous()
+
+        if grad_enabled:
+            weight_bwd_raw, weight_scale_bwd_raw, weight_fwd, weight_scale_fwd = dynamic_mx_quant_with_dual_axis(
+                weight_3d, dst_type=config.get_key_dtype("weight")
+            )
+            weight_bwd = weight_bwd_raw.transpose(1, 2).contiguous()
+            weight_scale_bwd = weight_scale_bwd_raw.transpose(1, 2).contiguous()
+        else:
+            weight_fwd, weight_scale_fwd = dynamic_mx_quant(weight_3d, axis=-2, dst_type=config.get_key_dtype("weight"))
+            weight_bwd = torch.empty(0, device=weight_unwrapped.device)
+            weight_scale_bwd = torch.empty(0, device=weight_unwrapped.device)
+
+    return dispatch_op(
+        'mx_grouped_matmul',
+        x,
+        weight,
+        x_fp8,
+        x_scale,
+        weight_fwd,
+        weight_scale_fwd,
+        weight_bwd,
+        weight_scale_bwd,
+        weight_2d_shape,
+        weight_transposed,
+        config.get_key_dtype("grads"),
+        config.get_key_dtype("inputs"),
+        x.dtype,
+        group_list,
+        group_list_type,
+    )
 
 
 def _mx_gmm_transform(module: torch.nn.Module, config: MXFP8LinearConfig):
@@ -283,6 +133,9 @@ class MXFP8GMM(torch.nn.Module):
         self.hidden_dim = hidden_size
         self.intermediate_size = moe_intermediate_size
         self.act_fn = act_fn
+        self.gate_up_proj = None
+        self.down_proj = None
+        self._name = None
 
     @property
     def num_global_experts(self):
@@ -313,12 +166,8 @@ class MXFP8GMM(torch.nn.Module):
         """
         from fsdp_turbo.ops.moe import permute, unpermute
 
-        permuted_hidden_states, row_ids_map = permute(
-            hidden_states, selected_experts.to(torch.int32)
-        )
-        tokens_per_expert = torch.histc(
-            selected_experts.float(), bins=self.num_experts, min=0, max=self.num_experts
-        )
+        permuted_hidden_states, row_ids_map = permute(hidden_states, selected_experts.to(torch.int32))
+        tokens_per_expert = torch.histc(selected_experts.float(), bins=self.num_experts, min=0, max=self.num_experts)
         group_list = torch.cumsum(tokens_per_expert, dim=0).to(torch.int64)
 
         quant_config = getattr(self, '_quant_config', None) or self.config
@@ -331,7 +180,7 @@ class MXFP8GMM(torch.nn.Module):
             grad_enabled=torch.is_grad_enabled(),
         )
 
-        fc1_activation = torch_npu.npu_swiglu(fc1_output, dim=-1)
+        fc1_activation = swiglu(fc1_output, dim=-1)
 
         fc2_out = mx_quant_group_gemm(
             x=fc1_activation,
@@ -354,16 +203,8 @@ class MXFP8GMM(torch.nn.Module):
         Returns:
             Expert output before AllToAll combine.
         """
-        gate_up_proj = (
-            self.gate_up_proj.to_local()
-            if hasattr(self.gate_up_proj, 'to_local')
-            else self.gate_up_proj
-        )
-        down_proj = (
-            self.down_proj.to_local()
-            if hasattr(self.down_proj, 'to_local')
-            else self.down_proj
-        )
+        gate_up_proj = self.gate_up_proj.to_local() if hasattr(self.gate_up_proj, 'to_local') else self.gate_up_proj
+        down_proj = self.down_proj.to_local() if hasattr(self.down_proj, 'to_local') else self.down_proj
 
         if isinstance(tokens_per_expert, list):
             group_list = torch.tensor(tokens_per_expert, device=hidden_states.device, dtype=torch.int64)
@@ -382,7 +223,7 @@ class MXFP8GMM(torch.nn.Module):
             grad_enabled=torch.is_grad_enabled(),
         )
 
-        fc1_activation = torch_npu.npu_swiglu(fc1_output, dim=-1)
+        fc1_activation = swiglu(fc1_output, dim=-1)
 
         fc2_out = mx_quant_group_gemm(
             x=fc1_activation,
@@ -452,7 +293,7 @@ class MXFP8GMM(torch.nn.Module):
             weight_dtype = config.get_key_dtype('weight')
 
             gate_up_quantizer = partial(
-                _weight_quant_gmm,
+                weight_quant_gmm,
                 dst_type=weight_dtype,
                 new_shape=(-1, hidden_dim, intermediate_size * 2),
             )
@@ -468,7 +309,7 @@ class MXFP8GMM(torch.nn.Module):
             )
 
             down_quantizer = partial(
-                _weight_quant_gmm,
+                weight_quant_gmm,
                 dst_type=weight_dtype,
                 new_shape=(-1, intermediate_size, hidden_dim),
             )

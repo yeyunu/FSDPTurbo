@@ -3,7 +3,11 @@ import os
 import time
 
 import torch
-import torch_npu
+
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset

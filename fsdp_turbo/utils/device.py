@@ -3,7 +3,6 @@ import sys
 import types
 
 import torch
-import torch_npu
 
 
 def accelerator_getattr(module, fallback_module):
@@ -34,6 +33,7 @@ def set_accelerator_compatible():
     try:
         import torch_npu  # noqa: F401
         from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
         fallback_module = torch.npu
         backend = "hccl"
     except ImportError:

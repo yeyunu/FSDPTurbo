@@ -1,16 +1,19 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import torch
-import torch_npu
+import torch.nn.functional as F
 import triton
 import triton.language as tl
-import torch.nn.functional as F
-import triton.language.extra.cann.extension as extension
+from triton.language.extra.cann import extension
 
 
 @triton.jit
 def _hc_split_sinkhorn_kernel_part1(
-    mixes_ptr, hc_scale_ptr, hc_base_ptr,
-    pre_ptr, post_ptr, comb_ptr,
+    mixes_ptr,
+    hc_scale_ptr,
+    hc_base_ptr,
+    pre_ptr,
+    post_ptr,
+    comb_ptr,
     batch_seq_size,
     eps: tl.constexpr,
     feat_dim: tl.constexpr,
@@ -36,42 +39,21 @@ def _hc_split_sinkhorn_kernel_part1(
     base_post = tl.load(hc_base_ptr + hc_mult + ar4)
     base_comb = tl.load(hc_base_ptr + 2 * hc_mult + arange_val)
 
-    mixes_pre = tl.load(
-        mixes_ptr + pid_feat_off + ar4[None, :],
-        mask=pid_mask[:, None],
-        other=0.0
-    )
-    mixes_post = tl.load(
-        mixes_ptr + pid_feat_off + (hc_mult + ar4)[None, :],
-        mask=pid_mask[:, None],
-        other=0.0
-    )
+    mixes_pre = tl.load(mixes_ptr + pid_feat_off + ar4[None, :], mask=pid_mask[:, None], other=0.0)
+    mixes_post = tl.load(mixes_ptr + pid_feat_off + (hc_mult + ar4)[None, :], mask=pid_mask[:, None], other=0.0)
     mixes_comb = tl.load(
-        mixes_ptr + pid_feat_off[:, :, None] + (2 * hc_mult + arange_val)[None, :],
-        mask=pid_mask[:, None, None]
+        mixes_ptr + pid_feat_off[:, :, None] + (2 * hc_mult + arange_val)[None, :], mask=pid_mask[:, None, None]
     )
 
     pre = tl.sigmoid(mixes_pre * scale_pre + base_pre[None, :]) + eps
-    tl.store(
-        pre_ptr + pid_hc_off + ar4[None, :],
-        pre,
-        mask=pid_mask[:, None]
-    )
+    tl.store(pre_ptr + pid_hc_off + ar4[None, :], pre, mask=pid_mask[:, None])
 
     post = 2.0 * tl.sigmoid(mixes_post * scale_post + base_post[None, :])
-    tl.store(
-        post_ptr + pid_hc_off + ar4[None, :],
-        post,
-        mask=pid_mask[:, None]
-    )
+    tl.store(post_ptr + pid_hc_off + ar4[None, :], post, mask=pid_mask[:, None])
 
     comb = mixes_comb * scale_comb + base_comb[None, :, :]
     comb_flat = tl.reshape(comb, (group, hc_mult * hc_mult))
-    tl.store(
-        comb_ptr + pid_comb_off + arange_val[None, :],
-        comb_flat,
-        mask=pid_mask[:, None]
-    )
+    tl.store(comb_ptr + pid_comb_off + arange_val[None, :], comb_flat, mask=pid_mask[:, None])
 
 
 @triton.jit
@@ -83,7 +65,7 @@ def _hc_split_sinkhorn_kernel_part2(
     sinkhorn_iters: tl.constexpr,
     eps: tl.constexpr,
     group: tl.constexpr,
-    BLOCK_ALIGN: tl.constexpr = 8
+    BLOCK_ALIGN: tl.constexpr = 8,
 ):
     lin = tl.arange(0, hc_mult * BLOCK_ALIGN)
 
@@ -93,10 +75,7 @@ def _hc_split_sinkhorn_kernel_part2(
 
     pid_comb_off = pids[:, None] * (hc_mult * BLOCK_ALIGN)
 
-    comb = tl.load(
-        comb_tmp_ptr + pid_comb_off + lin[None, :],
-        mask=pid_mask[:, None]
-    )
+    comb = tl.load(comb_tmp_ptr + pid_comb_off + lin[None, :], mask=pid_mask[:, None])
     comb = comb.reshape(group, hc_mult, BLOCK_ALIGN)
 
     row_max = tl.max(comb, axis=2)
@@ -110,11 +89,7 @@ def _hc_split_sinkhorn_kernel_part2(
         comb = comb / (col_sum[:, None, :] + eps)
 
     comb_flat = tl.reshape(comb, (group, hc_mult * BLOCK_ALIGN))
-    tl.store(
-        comb_ptr + pid_comb_off + lin[None, :],
-        comb_flat,
-        mask=pid_mask[:, None]
-    )
+    tl.store(comb_ptr + pid_comb_off + lin[None, :], comb_flat, mask=pid_mask[:, None])
 
 
 def hc_split_sinkhorn(
@@ -123,7 +98,7 @@ def hc_split_sinkhorn(
     hc_base: torch.Tensor,
     hc_mult: int = 4,
     sinkhorn_iters: int = 20,
-    eps: float = 1e-6
+    eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     origin_dtype = mixes.dtype
     mixes = mixes.to(dtype=torch.float32)
@@ -144,11 +119,17 @@ def hc_split_sinkhorn(
     group_part2 = 32
 
     _hc_split_sinkhorn_kernel_part1[(triton.cdiv(batch_seq_size, group_part1),)](
-        mixes_flat, hc_scale, hc_base,
-        pre_flat, post_flat, comb_tmp,
+        mixes_flat,
+        hc_scale,
+        hc_base,
+        pre_flat,
+        post_flat,
+        comb_tmp,
         batch_seq_size,
-        eps, feat_dim, hc_mult,
-        group_part1
+        eps,
+        feat_dim,
+        hc_mult,
+        group_part1,
     )
 
     comb_tmp_padded = F.pad(comb_tmp, pad=(0, BLOCK_ALIGN - hc_mult), mode="constant", value=float('-inf'))
@@ -157,8 +138,11 @@ def hc_split_sinkhorn(
     _hc_split_sinkhorn_kernel_part2[(triton.cdiv(batch_seq_size, group_part2),)](
         comb_tmp_padded,
         comb_flat_padded,
-        batch_seq_size, hc_mult, sinkhorn_iters,
-        eps, group_part2,
+        batch_seq_size,
+        hc_mult,
+        sinkhorn_iters,
+        eps,
+        group_part2,
         BLOCK_ALIGN=BLOCK_ALIGN,
     )
 
@@ -202,7 +186,9 @@ def hc_split_sinkhorn_backward_kernel_part1(
 
     pre_slice = tl.load(mixes_ptr + pid_feat_off + ar4[None, :], mask=pid_mask[:, None], other=0.0)
     post_slice = tl.load(mixes_ptr + pid_feat_off + (hc_mult + ar4)[None, :], mask=pid_mask[:, None], other=0.0)
-    comb_slice = tl.load(mixes_ptr + pid_feat_off + (2 * hc_mult + arange_val)[None, :], mask=pid_mask[:, None], other=0.0)
+    comb_slice = tl.load(
+        mixes_ptr + pid_feat_off + (2 * hc_mult + arange_val)[None, :], mask=pid_mask[:, None], other=0.0
+    )
 
     base_pre = tl.load(hc_base_ptr + ar4)
     base_post = tl.load(hc_base_ptr + hc_mult + ar4)
@@ -227,9 +213,7 @@ def hc_split_sinkhorn_backward_kernel_part1(
     grad_post_input = grad_post * 2.0 * sigmoid_deriv_post
 
     tl.store(
-        grad_mixes_ptr + pid_feat_off + (hc_mult + ar4)[None, :],
-        grad_post_input * scale_post,
-        mask=pid_mask[:, None]
+        grad_mixes_ptr + pid_feat_off + (hc_mult + ar4)[None, :], grad_post_input * scale_post, mask=pid_mask[:, None]
     )
 
     tl.atomic_add(grad_hc_scale_ptr + 1, tl.sum(grad_post_input * post_slice))
@@ -354,7 +338,7 @@ def hc_split_sinkhorn_backward_kernel_part2(
     tl.store(
         grad_mixes_ptr + pid_feat_off + arange_val[None, :],
         grad_comb_slice_flat.reshape(group, hc_mult * BLOCK_ALIGN),
-        mask=pid_mask[:, None]
+        mask=pid_mask[:, None],
     )
 
     tmp_res = d_comb_init * comb_slice
@@ -412,11 +396,11 @@ def hc_split_sinkhorn_backward(
         grad_hc_base,
         batch_seq_size,
         hc_mult=hc_mult,
-        group=group_part1
+        group=group_part1,
     )
 
     mixes_flat = mixes.view(-1, (2 + hc_mult) * hc_mult)
-    mixes_slice = mixes_flat[:, 2 * hc_mult:].view(-1, hc_mult, hc_mult)
+    mixes_slice = mixes_flat[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult)
     mixes_pad = F.pad(mixes_slice, (0, BLOCK_ALIGN - hc_mult), mode="constant", value=0.0)
 
     grad_mixes_pad = torch.zeros(
@@ -424,14 +408,10 @@ def hc_split_sinkhorn_backward(
         dtype=grad_mixes.dtype,
         device=grad_mixes.device,
     )
-    grad_hc_base_pad = torch.zeros(
-        (hc_mult, BLOCK_ALIGN), dtype=grad_hc_base.dtype, device=grad_hc_base.device
-    )
+    grad_hc_base_pad = torch.zeros((hc_mult, BLOCK_ALIGN), dtype=grad_hc_base.dtype, device=grad_hc_base.device)
 
     grad_comb_flat = grad_comb.reshape(-1, hc_mult, hc_mult)
-    grad_comb_flat_pad = F.pad(
-        grad_comb_flat, (0, BLOCK_ALIGN - hc_mult), mode="constant", value=0.0
-    )
+    grad_comb_flat_pad = F.pad(grad_comb_flat, (0, BLOCK_ALIGN - hc_mult), mode="constant", value=0.0)
     comb_tmp_padded = F.pad(comb_tmp, pad=(0, BLOCK_ALIGN - hc_mult), mode="constant", value=float('-inf'))
 
     hc_split_sinkhorn_backward_kernel_part2[(triton.cdiv(batch_seq_size, group_part2),)](
@@ -447,14 +427,14 @@ def hc_split_sinkhorn_backward(
         sinkhorn_iters,
         eps,
         BLOCK_ALIGN=BLOCK_ALIGN,
-        group=group_part2
+        group=group_part2,
     )
 
     grad_mixes_slice = grad_mixes_pad[:, :, :hc_mult].reshape(b, s, hc_mult * hc_mult)
     grad_hc_base_slice = grad_hc_base_pad[:, :hc_mult].reshape(hc_mult * hc_mult)
 
-    grad_mixes[:, :, 2 * hc_mult:] = grad_mixes_slice
-    grad_hc_base[2 * hc_mult:] = grad_hc_base_slice
+    grad_mixes[:, :, 2 * hc_mult :] = grad_mixes_slice
+    grad_hc_base[2 * hc_mult :] = grad_hc_base_slice
 
     grad_mixes = grad_mixes.to(dtype=origin_dtype)
     grad_hc_scale = grad_hc_scale.to(dtype=origin_dtype)

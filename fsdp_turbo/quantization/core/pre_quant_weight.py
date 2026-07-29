@@ -1,3 +1,4 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 import logging
 from typing import Any, Optional, Tuple, Callable
@@ -5,12 +6,13 @@ import warnings
 
 import torch
 
-logger = logging.getLogger(__name__)
 import torch.utils._pytree as pytree
 from torch.distributed.tensor import DTensor
 
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
 from fsdp_turbo.quantization.cache import cached_weight_quant
+
+logger = logging.getLogger(__name__)
 
 
 def _get_module_fsdp_state(module):
@@ -30,13 +32,14 @@ def _get_module_fsdp_state(module):
                     closest_parent_fsdp_mod = fsdp_mod
                     min_nodes_in_parent = len(all_submodules)
         if closest_parent_fsdp_mod is None:
-            raise RuntimeError(
-                "Module is not FSDP-wrapped and does not have any FSDP-wrapped parent modules."
-            )
+            raise RuntimeError("Module is not FSDP-wrapped and does not have any FSDP-wrapped parent modules.")
         fsdp_state = closest_parent_fsdp_mod._get_fsdp_state()
         module._cached_parent_fsdp_state = fsdp_state
     return fsdp_state
 
+
+_npu_dtype_cast = getattr(getattr(torch.ops, "npu", None), "_npu_dtype_cast", None)
+_npu_ops = {_npu_dtype_cast.default} if _npu_dtype_cast is not None else set()
 
 _ops_to_preserve_subclass = {
     torch.ops.aten.empty_like.default,
@@ -50,24 +53,21 @@ _ops_to_preserve_subclass = {
     torch.ops.aten.split.Tensor,
     torch.ops.aten.clone.default,
     torch.ops.aten.expand.default,
-    torch.ops.npu._npu_dtype_cast.default,
-}
+} | _npu_ops
 
 
 class PreQuantWeight(torch.Tensor):
-
     @staticmethod
     def __new__(
-            cls,
-            tensor: torch.Tensor,
-            quantizer: Callable,
-            config: Optional[Any] = None,
-            dtype: Optional[torch.dtype] = None,
-            name: Optional[str] = None,
-            **kwargs,
+        cls,
+        tensor: torch.Tensor,
+        quantizer: Callable,
+        config: Optional[Any] = None,
+        dtype: Optional[torch.dtype] = None,
+        name: Optional[str] = None,
+        **kwargs,
     ):
-        if "_tensor" in kwargs:
-            tensor = kwargs["_tensor"]
+        tensor = kwargs.get("_tensor", tensor)
 
         if tensor is None:
             return torch.Tensor._make_wrapper_subclass(cls, torch.Size([0]))
@@ -84,13 +84,13 @@ class PreQuantWeight(torch.Tensor):
         )
 
     def __init__(
-            self,
-            tensor: torch.Tensor,
-            quantizer: Callable[[torch.Tensor], Any],
-            config: Optional[Any] = None,
-            dtype: Optional[torch.dtype] = None,
-            name: Optional[str] = None,
-            **kwargs,
+        self,
+        tensor: torch.Tensor,
+        quantizer: Callable[[torch.Tensor], Any],
+        config: Optional[Any] = None,
+        dtype: Optional[torch.dtype] = None,
+        name: Optional[str] = None,
+        **kwargs,
     ):
         self._tensor = tensor.contiguous()
         self.config = config
@@ -123,9 +123,7 @@ class PreQuantWeight(torch.Tensor):
                 quantizer = t._quantizer
             return t._tensor
 
-        args, kwargs = pytree.tree_map_only(
-            PreQuantWeight, unwrap, (args, kwargs or {})
-        )
+        args, kwargs = pytree.tree_map_only(PreQuantWeight, unwrap, (args, kwargs or {}))
         out = func(*args, **kwargs)
         if func not in _ops_to_preserve_subclass:
             warnings.warn(
@@ -172,9 +170,7 @@ class PreQuantWeight(torch.Tensor):
         if not hp_tensor.is_contiguous():
             hp_tensor = hp_tensor.contiguous()
 
-        weight_fwd, scale_fwd, weight_bwd, scale_bwd = cached_weight_quant(
-            hp_tensor, self._quantizer
-        )
+        weight_fwd, scale_fwd, weight_bwd, scale_bwd = cached_weight_quant(hp_tensor, self._quantizer)
 
         world_size = mesh.size() if mesh is not None else 1
 
@@ -195,19 +191,21 @@ class PreQuantWeight(torch.Tensor):
             bwd_usage = is_backward_pass
         else:
             fwd_usage = bwd_usage = True
-            sharded_tensors = (weight_fwd, weight_bwd) if world_size == 1 else (weight_fwd, scale_fwd, weight_bwd, scale_bwd)
+            sharded_tensors = (
+                (weight_fwd, weight_bwd) if world_size == 1 else (weight_fwd, scale_fwd, weight_bwd, scale_bwd)
+            )
 
         metadata = (fwd_usage, bwd_usage, scale_fwd, scale_bwd)
 
         return sharded_tensors, metadata
 
     def fsdp_post_all_gather(
-            self,
-            all_gather_outputs: Tuple[torch.Tensor, ...],
-            metadata: Any,
-            param_dtype: torch.dtype,
-            *,
-            out: Optional[torch.Tensor] = None,
+        self,
+        all_gather_outputs: Tuple[torch.Tensor, ...],
+        metadata: Any,
+        param_dtype: torch.dtype,
+        *,
+        out: Optional[torch.Tensor] = None,
     ):
         fwd_usage, bwd_usage, local_scale_fwd, local_scale_bwd = metadata
 

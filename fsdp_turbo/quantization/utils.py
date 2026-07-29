@@ -6,10 +6,9 @@
 
 import functools
 import re
-from typing import Optional, Callable, Dict, Type
+from typing import Callable, Dict, Type
 import torch
-import torch.nn as nn
-import torch_npu
+from torch import nn
 
 from fsdp_turbo.quantization.mxfp8_config import QuantBaseConfig
 from fsdp_turbo.utils.str_match import module_name_match
@@ -31,13 +30,13 @@ def register_quantize_module_handler(config_type):
 
 class TensorWithTranspose:
     def __init__(
-            self,
-            fp8_dtype: torch.dtype,
-            data: torch.Tensor,
-            scale: torch.Tensor,
-            data_t: torch.Tensor,
-            scale_t: torch.Tensor,
-            dtype: torch.dtype = torch.float32,
+        self,
+        fp8_dtype: torch.dtype,
+        data: torch.Tensor,
+        scale: torch.Tensor,
+        data_t: torch.Tensor,
+        scale_t: torch.Tensor,
+        dtype: torch.dtype = torch.float32,
     ):
         self.fp8_dtype = fp8_dtype
         self.data = data
@@ -70,10 +69,7 @@ def module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
         m = re.match(r"(.*?layers\.\d+)", fqn)
         if m is not None:
             prefix = m.group(1)
-            if module_name_match(pattern, prefix):
-                return True
-            else:
-                return False
+            return module_name_match(pattern, prefix)
 
     return False
 
@@ -93,10 +89,7 @@ def moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
     prefix = m.group(1)
 
     for pattern in config.mxfp8_apply_modules:
-        if module_name_match(pattern, prefix):
-            return True
-        else:
-            return False
+        return module_name_match(pattern, prefix)
 
     return False
 
@@ -105,5 +98,5 @@ def view_as_n_dim(input_tensor, dim=2):
     if dim < 2:
         raise AssertionError("dim should be greater than or equal to 2")
     if len(input_tensor.shape) != dim:
-        return input_tensor.view(-1, *input_tensor.shape[-dim + 1:])
+        return input_tensor.view(-1, *input_tensor.shape[-dim + 1 :])
     return input_tensor

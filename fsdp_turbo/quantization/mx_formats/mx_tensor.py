@@ -1,6 +1,10 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import torch
-import torch_npu
+
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
 
 from fsdp_turbo.quantization.utils import TensorWithTranspose, view_as_n_dim
 

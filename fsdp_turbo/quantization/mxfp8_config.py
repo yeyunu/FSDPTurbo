@@ -4,7 +4,14 @@ from enum import Enum
 from typing import Optional, NamedTuple
 
 import torch
-import torch_npu
+
+try:
+    import torch_npu
+
+    _HIFLOAT8 = torch_npu.hifloat8
+except ImportError:
+    torch_npu = None
+    _HIFLOAT8 = None
 
 from fsdp_turbo.fsdp_turbo_config import QuantizeConfig
 
@@ -19,7 +26,11 @@ class FP8Format:
     @property
     def quant_type(self):
         if self.dtype is None:
-            return torch_npu.hifloat8
+            if _HIFLOAT8 is None:
+                raise ImportError(
+                    "torch_npu.hifloat8 is not available. HIF8 format requires Ascend NPU with torch_npu installed."
+                )
+            return _HIFLOAT8
         return self.dtype
 
 
@@ -38,11 +49,7 @@ class _FormatConfig(NamedTuple):
 class Format(Enum):
     E4M3 = _FormatConfig()
     HYBRID = _FormatConfig(grads=FormatEnum.E5M2)
-    HIF8 = _FormatConfig(
-        inputs=FormatEnum.HIF8,
-        weight=FormatEnum.HIF8,
-        grads=FormatEnum.HIF8
-    )
+    HIF8 = _FormatConfig(inputs=FormatEnum.HIF8, weight=FormatEnum.HIF8, grads=FormatEnum.HIF8)
 
     @classmethod
     def from_config_fp8(cls, key: str):
@@ -72,6 +79,7 @@ class MXFP8LinearConfig(QuantBaseConfig):
     mxfp8_ignored_modules: list[str] = field(default_factory=list)
     mxfp8_apply_modules: list[str] = field(default_factory=list)
     converter: str = "quantize.linear.mx"
+
 
 def get_mxfp8linear_config(quant_config: QuantizeConfig):
     return MXFP8LinearConfig(
