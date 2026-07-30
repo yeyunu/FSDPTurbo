@@ -4,8 +4,7 @@ from typing import Set, List, Any, Optional
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import MixedPrecisionPolicy
-
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy
 from fsdp_turbo.fsdp_turbo_config import FSDPPlanConfig
 from fsdp_turbo.distributed.fine_grained_fully_shard import get_fsdp_strategy
 from fsdp_turbo.utils.log import print_rank
@@ -21,10 +20,12 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, 
     fsdp_modules = get_fsdp_modules(model, fsdp_plan, ignored_modules)
     hook_modules = get_fsdp_hook_modules(model, fsdp_plan)
     mp_policy = get_mixprecision_policy(fsdp_plan)
+    offload_policy = get_offload_policy(fsdp_plan)
     config = {
         'mesh': fsdp_mesh,
         'ignored_params': ignored_params,
         'mp_policy': mp_policy,
+        'offload_policy': offload_policy,
     }
 
     strategy = get_fsdp_strategy(fsdp_plan.fsdp_implementation)
@@ -34,7 +35,7 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, 
         module_config = config.copy()
         module_config.update(plan)
         hook_module = find_hook_module(module, hook_modules)
-        fully_shard_fn(module, hook_module=hook_module, **config)
+        fully_shard_fn(module, hook_module=hook_module, **module_config)
     fully_shard_fn(model, **config)
     set_modules_to_prefetch(model, fsdp_modules, fsdp_plan)
     return model
@@ -50,7 +51,7 @@ def set_modules_to_prefetch(model: torch.nn.Module, fsdp_modules: list[torch.nn.
     if fsdp_plan.num_to_forward_prefetch > 0:
         for i, layer in enumerate(wrapped_modules_in_order):
             j_end = min(len(wrapped_modules_in_order), i + 1 + fsdp_plan.num_to_forward_prefetch)
-            layers_to_prefetch = wrapped_modules_in_order[i + 1:j_end]
+            layers_to_prefetch = wrapped_modules_in_order[i + 1 : j_end]
             if layers_to_prefetch:
                 layer.set_modules_to_forward_prefetch(layers_to_prefetch)
 
@@ -58,7 +59,7 @@ def set_modules_to_prefetch(model: torch.nn.Module, fsdp_modules: list[torch.nn.
         rev_wrapped_modules_in_order = list(reversed(wrapped_modules_in_order))
         for i, layer in enumerate(rev_wrapped_modules_in_order):
             j_end = min(len(rev_wrapped_modules_in_order), i + 1 + fsdp_plan.num_to_backward_prefetch)
-            layers_to_prefetch = rev_wrapped_modules_in_order[i + 1:j_end]
+            layers_to_prefetch = rev_wrapped_modules_in_order[i + 1 : j_end]
             if layers_to_prefetch:
                 layer.set_modules_to_backward_prefetch(layers_to_prefetch)
 
@@ -73,8 +74,15 @@ def get_mixprecision_policy(fsdp_plan: FSDPPlanConfig):
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
         output_dtype=output_dtype,
-        cast_forward_inputs=fsdp_plan.cast_forward_inputs
+        cast_forward_inputs=fsdp_plan.cast_forward_inputs,
     )
+
+
+def get_offload_policy(fsdp_plan: FSDPPlanConfig):
+    """Construct the CPUOffloadPolicy object, or OffloadPolicy() to disable offloading."""
+    if not fsdp_plan.cpu_offload:
+        return OffloadPolicy()
+    return CPUOffloadPolicy(pin_memory=fsdp_plan.pin_memory)
 
 
 def get_fsdp_modules(model: torch.nn.Module, fsdp_plan: FSDPPlanConfig, ignored_modules: Set[str]) -> dict[Any, Any]:
@@ -131,8 +139,9 @@ def get_fsdp_hook_modules(model: torch.nn.Module, fsdp_plan: FSDPPlanConfig) -> 
     return fsdp_hook_modules
 
 
-def find_hook_module(target_module: torch.nn.Module, hook_module_list: List[torch.nn.Module]) -> Optional[
-    torch.nn.Module]:
+def find_hook_module(
+    target_module: torch.nn.Module, hook_module_list: List[torch.nn.Module]
+) -> Optional[torch.nn.Module]:
     for hook_module in hook_module_list:
         for _, sub_mod in hook_module.named_modules():
             if sub_mod is target_module:

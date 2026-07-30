@@ -93,6 +93,10 @@ class FSDPPlanConfig:
     output_dtype: Optional[str] = None
     cast_forward_inputs: bool = True
 
+    # offload_policy settings
+    cpu_offload: bool = False
+    pin_memory: bool = True
+
     # prefetch settings
     num_to_forward_prefetch: Optional[int] = 0
     num_to_backward_prefetch: Optional[int] = 0
@@ -186,6 +190,7 @@ class ChunkBatchPlanConfig:
             chunk_arg_indexs=[0]
             chunk_kwarg_names=["hidden_states", "attention_mask"]
     """
+
     chunk_mbs: int = 1
     # Module-name patterns to patch, for example "model.layers.{*}".
     apply_modules: List[str] = None
@@ -205,6 +210,7 @@ class MemoryConfig:
     backward. ``chunk_batch`` reduces per-module forward/backward peaks by
     splitting the batch dimension into smaller micro batches.
     """
+
     recompute: bool = False
     recompute_plan: List[str] = None
     chunk_batch: bool = False
@@ -238,7 +244,7 @@ class FSDPTurboConfig:
         self.validate_fsdp_config()
 
     def validate_fsdp_config(self):
-        ''' fully shard plan
+        '''fully shard plan
         config = FSDPTurboConfig(
             distributed=DistributedConfig(
                 fsdp_plan=FSDPPlanConfig(
@@ -250,7 +256,9 @@ class FSDPTurboConfig:
             )
         )
         '''
-        self.distributed.fsdp_plan = FSDPPlanConfig() if self.distributed.fsdp_plan is None else self.distributed.fsdp_plan
+        self.distributed.fsdp_plan = (
+            FSDPPlanConfig() if self.distributed.fsdp_plan is None else self.distributed.fsdp_plan
+        )
         if self.distributed.fully_shard_parallel_size > 1:
             if self.distributed.expert_parallel_size > 1:
                 self.distributed.fsdp_plan.ignored_modules.extend(self.distributed.ep_plan.apply_modules)
@@ -258,10 +266,11 @@ class FSDPTurboConfig:
                 self.distributed.fsdp_plan.ignored_modules.extend(self.distributed.tp_plan.colwise_parallel)
                 self.distributed.fsdp_plan.ignored_modules.extend(self.distributed.tp_plan.rowwise_parallel)
             self.distributed.fsdp_plan.ignored_modules = list(
-                set(self.distributed.fsdp_plan.ignored_modules))  # remove duplicates
+                set(self.distributed.fsdp_plan.ignored_modules)
+            )  # remove duplicates
 
     def validate_tp_config(self):
-        ''' tensor parallelize plan
+        '''tensor parallelize plan
 
         config = FSDPTurboConfig(
             distributed=DistributedConfig(
@@ -273,12 +282,18 @@ class FSDPTurboConfig:
         )
         '''
         self.distributed.tp_plan = TPPlanConfig() if self.distributed.tp_plan is None else self.distributed.tp_plan
-        self.distributed.tp_plan.colwise_parallel = [] if self.distributed.tp_plan.colwise_parallel is None else self.distributed.tp_plan.colwise_parallel
-        self.distributed.tp_plan.rowwise_parallel = [] if self.distributed.tp_plan.rowwise_parallel is None else self.distributed.tp_plan.rowwise_parallel
-        self.distributed.tp_plan.sequence_parallel = [] if self.distributed.tp_plan.sequence_parallel is None else self.distributed.tp_plan.sequence_parallel
+        self.distributed.tp_plan.colwise_parallel = (
+            [] if self.distributed.tp_plan.colwise_parallel is None else self.distributed.tp_plan.colwise_parallel
+        )
+        self.distributed.tp_plan.rowwise_parallel = (
+            [] if self.distributed.tp_plan.rowwise_parallel is None else self.distributed.tp_plan.rowwise_parallel
+        )
+        self.distributed.tp_plan.sequence_parallel = (
+            [] if self.distributed.tp_plan.sequence_parallel is None else self.distributed.tp_plan.sequence_parallel
+        )
 
     def validate_cp_config(self):
-        ''' context parallelize plan (Ulysses)
+        '''context parallelize plan (Ulysses)
 
         config = FSDPTurboConfig(
             distributed=DistributedConfig(
@@ -294,14 +309,18 @@ class FSDPTurboConfig:
         if self.distributed.cp_plan.ulysses_core_attention_function is None:
             self.distributed.cp_plan.ulysses_core_attention_function = []
         elif isinstance(self.distributed.cp_plan.ulysses_core_attention_function, str):
-            self.distributed.cp_plan.ulysses_core_attention_function = [self.distributed.cp_plan.ulysses_core_attention_function]
+            self.distributed.cp_plan.ulysses_core_attention_function = [
+                self.distributed.cp_plan.ulysses_core_attention_function
+            ]
         if self.distributed.cp_plan.kv_allgather_core_attention_function is None:
             self.distributed.cp_plan.kv_allgather_core_attention_function = []
         elif isinstance(self.distributed.cp_plan.kv_allgather_core_attention_function, str):
-            self.distributed.cp_plan.kv_allgather_core_attention_function = [self.distributed.cp_plan.kv_allgather_core_attention_function]
+            self.distributed.cp_plan.kv_allgather_core_attention_function = [
+                self.distributed.cp_plan.kv_allgather_core_attention_function
+            ]
 
     def validate_ep_config(self):
-        ''' expert parallelize plan
+        '''expert parallelize plan
 
         config = FSDPTurboConfig(
             distributed=DistributedConfig(
@@ -312,9 +331,16 @@ class FSDPTurboConfig:
             )
         )
         '''
-        self.distributed.ep_plan = EPPlanConfig(apply_modules=[],
-                                                dispatcher='eager') if self.distributed.ep_plan is None else self.distributed.ep_plan
-        self.distributed.ep_plan._gradient_divide_factor = self.distributed.expert_parallel_size * self.distributed.expert_fully_shard_parallel_size * self.distributed.expert_data_parallel_size
+        self.distributed.ep_plan = (
+            EPPlanConfig(apply_modules=[], dispatcher='eager')
+            if self.distributed.ep_plan is None
+            else self.distributed.ep_plan
+        )
+        self.distributed.ep_plan._gradient_divide_factor = (
+            self.distributed.expert_parallel_size
+            * self.distributed.expert_fully_shard_parallel_size
+            * self.distributed.expert_data_parallel_size
+        )
         if self.distributed.ep_plan.apply_efsdp_modules is None:
             self.distributed.ep_plan.apply_efsdp_modules = []
             for ep_module in self.distributed.ep_plan.apply_modules:
@@ -333,12 +359,24 @@ class FSDPTurboConfig:
         """
         if not self.memory.chunk_batch:
             return
-        self.memory.chunk_batch_plan = ChunkBatchPlanConfig() if self.memory.chunk_batch_plan is None else self.memory.chunk_batch_plan
+        self.memory.chunk_batch_plan = (
+            ChunkBatchPlanConfig() if self.memory.chunk_batch_plan is None else self.memory.chunk_batch_plan
+        )
         if self.memory.chunk_batch_plan.chunk_mbs <= 0:
             raise ValueError("chunk_mbs must be positive.")
-        self.memory.chunk_batch_plan.apply_modules = [] if self.memory.chunk_batch_plan.apply_modules is None else self.memory.chunk_batch_plan.apply_modules
-        self.memory.chunk_batch_plan.chunk_arg_indexs = [] if self.memory.chunk_batch_plan.chunk_arg_indexs is None else self.memory.chunk_batch_plan.chunk_arg_indexs
-        self.memory.chunk_batch_plan.chunk_kwarg_names = [] if self.memory.chunk_batch_plan.chunk_kwarg_names is None else self.memory.chunk_batch_plan.chunk_kwarg_names
+        self.memory.chunk_batch_plan.apply_modules = (
+            [] if self.memory.chunk_batch_plan.apply_modules is None else self.memory.chunk_batch_plan.apply_modules
+        )
+        self.memory.chunk_batch_plan.chunk_arg_indexs = (
+            []
+            if self.memory.chunk_batch_plan.chunk_arg_indexs is None
+            else self.memory.chunk_batch_plan.chunk_arg_indexs
+        )
+        self.memory.chunk_batch_plan.chunk_kwarg_names = (
+            []
+            if self.memory.chunk_batch_plan.chunk_kwarg_names is None
+            else self.memory.chunk_batch_plan.chunk_kwarg_names
+        )
         if not self.memory.chunk_batch_plan.apply_modules:
             raise ValueError("chunk_batch_plan.apply_modules must not be empty when chunk_batch is enabled.")
         if not self.memory.chunk_batch_plan.chunk_arg_indexs and not self.memory.chunk_batch_plan.chunk_kwarg_names:
@@ -347,7 +385,9 @@ class FSDPTurboConfig:
             )
 
     def validate_quantization_config(self):
-        self.quantization.quantization_plan = QuantizeConfig() if self.quantization.quantization_plan is None else self.quantization.quantization_plan
+        self.quantization.quantization_plan = (
+            QuantizeConfig() if self.quantization.quantization_plan is None else self.quantization.quantization_plan
+        )
 
     def __str__(self):
         import dataclasses as dc
@@ -430,7 +470,7 @@ def _coerce_value(value, field_type):
 
     origin = getattr(field_type, "__origin__", None)
     if origin is Union:
-        args = [a for a in field_type.__args__ if a is not type(None)]
+        args = [a for a in field_type.__args__ if a is not type(None)]  # pylint: disable=unidiomatic-typecheck
         if args:
             field_type = args[0]
 
@@ -438,21 +478,21 @@ def _coerce_value(value, field_type):
         try:
             return float(value)
         except (ValueError, TypeError):
-            logger.warning(f"Cannot convert '{value}' to float, keeping as str")
+            logger.warning("Cannot convert '%s' to float, keeping as str", value)
             return value
 
     if field_type is int:
         try:
             return int(value)
         except (ValueError, TypeError):
-            logger.warning(f"Cannot convert '{value}' to int, keeping as str")
+            logger.warning("Cannot convert '%s' to int, keeping as str", value)
             return value
 
     if field_type is torch.dtype:
         try:
             return get_dtype(value)
         except (ValueError, TypeError) as e:
-            logger.warning(f"Cannot convert '{value}' to torch.dtype: {e}, keeping as str")
+            logger.warning("Cannot convert '%s' to torch.dtype: %s, keeping as str", value, e)
             return value
 
     return value
@@ -464,18 +504,19 @@ def _dict_to_dataclass(cls, data):
     if not isinstance(data, dict):
         return data
     import dataclasses as dc
+
     field_types = {f.name: f.type for f in dc.fields(cls)}
     kwargs = {}
     for key, value in data.items():
         if key not in field_types:
-            logger.warning(f"Ignoring unknown config key '{key}' for {cls.__name__}")
+            logger.warning("Ignoring unknown config key '%s' for %s", key, cls.__name__)
             continue
         ft = field_types[key]
         origin = getattr(ft, "__origin__", None)
         optional_dataclass = None
         if origin is Union:
             for arg in ft.__args__:
-                if arg is not type(None) and dc.is_dataclass(arg):
+                if arg is not type(None) and dc.is_dataclass(arg):  # pylint: disable=unidiomatic-typecheck
                     optional_dataclass = arg
                     break
         if dc.is_dataclass(ft) and isinstance(value, dict):
@@ -506,12 +547,14 @@ def load_config_from_yaml(yaml_path):
     checkpoint_raw = raw.pop("checkpoint", None)
 
     model_cfg = _dict_to_dataclass(ModelConfig, model_raw) if model_raw is not None else ModelConfig()
-    optimizer_cfg = _dict_to_dataclass(OptimizerConfig,
-                                       optimizer_raw) if optimizer_raw is not None else OptimizerConfig()
+    optimizer_cfg = (
+        _dict_to_dataclass(OptimizerConfig, optimizer_raw) if optimizer_raw is not None else OptimizerConfig()
+    )
     data_cfg = _dict_to_dataclass(DataConfig, data_raw) if data_raw is not None else DataConfig()
     run_cfg = _dict_to_dataclass(TrainRunConfig, run_raw) if run_raw is not None else TrainRunConfig()
-    checkpoint_cfg = _dict_to_dataclass(CheckpointConfig,
-                                        checkpoint_raw) if checkpoint_raw is not None else CheckpointConfig()
+    checkpoint_cfg = (
+        _dict_to_dataclass(CheckpointConfig, checkpoint_raw) if checkpoint_raw is not None else CheckpointConfig()
+    )
 
     # Extract distributed sub-config
     distributed_raw = raw.pop("distributed", None)
@@ -530,11 +573,12 @@ def load_config_from_yaml(yaml_path):
         distributed_valid_fields = {f.name for f in fields(DistributedConfig)}
         extra_keys = set(distributed_raw.keys()) - distributed_valid_fields
         if extra_keys:
-            logger.warning(f"Ignoring unknown distributed config keys: {extra_keys}")
+            logger.warning("Ignoring unknown distributed config keys: %s", extra_keys)
         filtered_distributed_raw = {k: v for k, v in distributed_raw.items() if k in distributed_valid_fields}
 
-        distributed_cfg = DistributedConfig(fsdp_plan=fsdp_plan, tp_plan=tp_plan, ep_plan=ep_plan,
-                                            cp_plan=cp_plan, **filtered_distributed_raw)
+        distributed_cfg = DistributedConfig(
+            fsdp_plan=fsdp_plan, tp_plan=tp_plan, ep_plan=ep_plan, cp_plan=cp_plan, **filtered_distributed_raw
+        )
     else:
         distributed_cfg = DistributedConfig()
 
@@ -549,8 +593,9 @@ def load_config_from_yaml(yaml_path):
     quantization_raw = raw.pop("quantization", None)
     if quantization_raw is not None:
         quantization_plan_raw = quantization_raw.pop("quantization_plan", None)
-        quantization_plan = _dict_to_dataclass(QuantizeConfig,
-                                               quantization_plan_raw) if quantization_plan_raw is not None else None
+        quantization_plan = (
+            _dict_to_dataclass(QuantizeConfig, quantization_plan_raw) if quantization_plan_raw is not None else None
+        )
         quantization_cfg = QuantizationConfig(quantization_plan=quantization_plan)
     else:
         quantization_cfg = QuantizationConfig()
@@ -558,7 +603,7 @@ def load_config_from_yaml(yaml_path):
     valid_fields = {f.name for f in fields(FSDPTurboConfig)}
     extra_keys = set(raw.keys()) - valid_fields
     if extra_keys:
-        logger.warning(f"Ignoring unknown top-level config keys: {extra_keys}")
+        logger.warning("Ignoring unknown top-level config keys: %s", extra_keys)
     filtered_raw = {k: v for k, v in raw.items() if k in valid_fields}
 
     return FSDPTurboConfig(
