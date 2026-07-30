@@ -55,3 +55,23 @@ def set_accelerator_compatible():
     sys.modules['torch.accelerator'] = accelerator_module
 
     return backend
+
+
+def get_accelerator_name():
+    """Return the name of the detected accelerator backend.
+
+    Detects the available accelerator by attempting to import ``torch_npu``:
+    - If ``torch_npu`` is importable, returns ``"npu"``.
+    - Otherwise, returns ``"cuda"``.
+
+    Returns:
+        str: ``"npu"`` for Huawei Ascend (via torch_npu), or ``"cuda"`` for NVIDIA GPU.
+    """
+    try:
+        import torch_npu  # noqa: F401
+
+        return "npu"
+    except ImportError:
+        if torch.cuda.is_available():
+            return "cuda"
+        raise RuntimeError("No available accelerator (NPU/CUDA).")

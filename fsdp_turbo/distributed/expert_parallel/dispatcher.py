@@ -122,7 +122,6 @@ def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes
     input_split, output_splits = split_sizes
 
     hidden_states, unpermute_indices1 = permute(hidden_states, top_k_index, use_eager=not fused)
-    torch.npu.current_stream().synchronize()
     hidden_states = all_to_all_single_autograd(hidden_states, output_splits.tolist(), input_split.tolist(), ep_group)
     hidden_states, unpermute_indices2 = permute(hidden_states, global_indices, use_eager=not fused)
 

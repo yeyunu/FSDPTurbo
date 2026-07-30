@@ -10,6 +10,7 @@ from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.utils.log import print_rank
+from fsdp_turbo.utils.device import get_accelerator_name
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,10 @@ class ParallelState(metaclass=Singleton):
 
     def __str__(self):
         sep = '=' * 60
-        lines = [sep, f'{"Parallel State":^60}', sep,
+        lines = [
+            sep,
+            f'{"Parallel State":^60}',
+            sep,
             f'  {"Mesh":<10} {"Enabled":<10} {"Group Size":<12} {"Rank":<8} Device Mesh',
             '-' * 60,
         ]
@@ -190,10 +194,14 @@ class ParallelState(metaclass=Singleton):
 
     def add_device_mesh_groups(self, mesh_dim_names, mesh_shape):
         if reduce(lambda a, b: a * b, mesh_shape) != torch.distributed.get_world_size():
-            raise AssertionError(f"Mesh groups {mesh_shape}({reduce(lambda a, b: a * b, mesh_shape)}) "
-                                 f"!= world size({torch.distributed.get_world_size()})")
+            raise AssertionError(
+                f"Mesh groups {mesh_shape}({reduce(lambda a, b: a * b, mesh_shape)}) "
+                f"!= world size({torch.distributed.get_world_size()})"
+            )
 
-        device_mesh = init_device_mesh(device_type='npu', mesh_shape=mesh_shape, mesh_dim_names=mesh_dim_names)
+        device_mesh = init_device_mesh(
+            device_type=get_accelerator_name(), mesh_shape=mesh_shape, mesh_dim_names=mesh_dim_names
+        )
 
         for mesh_name in mesh_dim_names:
             self.device_mesh_map[mesh_name] = device_mesh
