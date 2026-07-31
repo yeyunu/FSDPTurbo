@@ -65,12 +65,11 @@ class AllToAllGroupedMatmul(torch.autograd.Function):
             send_counts,
             mm_x=shared_output_grad,
             mm_weight=shared_weight,
-            trans_gmm_weight=True,
         )
 
         weights_grad = torch_npu.npu_grouped_matmul(
-            [permute_output.T],
-            [output_grad],
+            [output_grad.T],
+            [permute_output],
             bias=None,
             group_list=group_list,
             split_item=3,
