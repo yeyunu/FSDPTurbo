@@ -35,15 +35,16 @@ def expert_fully_shard_modules(
     strategy = get_fsdp_strategy(fsdp_plan.fsdp_implementation)
     fully_shard_fn = strategy.get_unified_fully_shard_fn()
 
+    gradient_divide_factor = ep_plan.gradient_divide_factor
     for experts in efsdp_modules:
         hook_module = find_hook_module(experts, efsdp_hook_modules)
         if isinstance(experts, torch.nn.ModuleList):
             for expert in experts:
                 fully_shard_fn(expert, hook_module=hook_module, **config)
-                set_gradient_divide_factor(expert, ep_plan._gradient_divide_factor)
+                set_gradient_divide_factor(expert, gradient_divide_factor)
         else:
             fully_shard_fn(experts, hook_module=hook_module, **config)
-            set_gradient_divide_factor(experts, ep_plan._gradient_divide_factor)
+            set_gradient_divide_factor(experts, gradient_divide_factor)
 
     return model
 

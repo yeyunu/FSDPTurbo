@@ -2,13 +2,14 @@
 import torch
 
 from fsdp_turbo.distributed.expert_parallel.expert_fully_shard_parallel import expert_fully_shard_modules
-from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import \
-    fully_shard_parallel_modules
+from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import fully_shard_parallel_modules
 from fsdp_turbo.distributed.parallel_state import init_parallel_state
 from fsdp_turbo.distributed.tensor_parallel.tensor_parallel import tensor_parallel_modules
 from fsdp_turbo.memory.chunk_batch.chunk_batch import chunk_batch_modules
 from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_context_parallel import ulysses_context_parallelize_modules
-from fsdp_turbo.distributed.context_parallel.kv_allgather.kv_allgather_context_parallel import kv_allgather_context_parallelize_modules
+from fsdp_turbo.distributed.context_parallel.kv_allgather.kv_allgather_context_parallel import (
+    kv_allgather_context_parallelize_modules,
+)
 from fsdp_turbo.memory.recompute.recompute import recompute_modules
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.distributed.expert_parallel.expert_parallel import expert_parallelize_modules
@@ -16,7 +17,7 @@ from fsdp_turbo.distributed.expert_parallel.expert_parallel import expert_parall
 
 class FSDPTurbo(torch.nn.Module):
     def __init__(self, config: FSDPTurboConfig, model: torch.nn.Module):
-        super(FSDPTurbo, self).__init__()
+        super().__init__()
         self.config = config
         self.model = model
 
@@ -31,12 +32,22 @@ class FSDPTurbo(torch.nn.Module):
         self.apply_fsdp_modules()
 
     def apply_fsdp_modules(self):
-        self.model = fully_shard_parallel_modules(self.model, self.parallel_state.get_fsdp_device_mesh(), self.config.distributed.fsdp_plan)
+        # Use 2D (dp, fsdp) mesh so FSDP2 treats dense params as HSDP and
+        # all-reduces gradients across the dp (replicate) dim.  Using the 1D
+        # fsdp mesh skips the dp all-reduce, yielding wrong gradients when the
+        # fsdp domain is not filled (data_parallel_size > 1).
+        # The gradient divide factor is derived in the config validation
+        # (from the launcher-provided WORLD_SIZE), so it is simply read here.
+        self.model = fully_shard_parallel_modules(
+            self.model, self.parallel_state.get_device_mesh('dp_fsdp'), self.config.distributed.fsdp_plan
+        )
 
     def apply_tp_modules(self):
         if self.config.distributed.tensor_parallel_size == 1:
             return
-        self.model = tensor_parallel_modules(self.model, self.parallel_state.get_tp_device_mesh(), self.config.distributed.tp_plan)
+        self.model = tensor_parallel_modules(
+            self.model, self.parallel_state.get_tp_device_mesh(), self.config.distributed.tp_plan
+        )
 
     def apply_cp_modules(self):
         cp_plan = self.config.distributed.cp_plan
@@ -49,7 +60,7 @@ class FSDPTurbo(torch.nn.Module):
                 self.parallel_state.get_kvallgather_group(),
                 cp_plan,
             )
-        
+
         # Ulysses context parallelism
         if self.config.distributed.ulysses_parallel_size > 1 and cp_plan.ulysses_core_attention_function:
             self.model = ulysses_context_parallelize_modules(
@@ -58,13 +69,14 @@ class FSDPTurbo(torch.nn.Module):
                 cp_plan,
             )
 
-
     def apply_ep_modules(self):
         if self.config.distributed.expert_parallel_size > 1:
-            self.model = expert_parallelize_modules(self.model, self.parallel_state.get_ep_device_mesh(), self.config.distributed.ep_plan)
+            self.model = expert_parallelize_modules(
+                self.model, self.parallel_state.get_ep_device_mesh(), self.config.distributed.ep_plan
+            )
             self.model = expert_fully_shard_modules(
                 self.model,
-                self.parallel_state.get_efsdp_device_mesh(),
+                self.parallel_state.get_device_mesh('edp_efsdp'),
                 self.config.distributed.ep_plan,
                 self.config.distributed.fsdp_plan,
             )
@@ -80,6 +92,7 @@ class FSDPTurbo(torch.nn.Module):
         from fsdp_turbo.quantization.mx_formats.mx_linear import MXLinear
         from torch.distributed.tensor import Shard, Partial
         from fsdp_turbo.utils.str_match import module_name_match
+
         tp_mesh = self.parallel_state.get_device_mesh('tp')
         colwise = self.config.distributed.tp_plan.colwise_parallel or []
         rowwise = self.config.distributed.tp_plan.rowwise_parallel or []
@@ -113,7 +126,7 @@ class FSDPTurbo(torch.nn.Module):
             model_converters = build_model_converter(self.config.quantization.quantization_plan)
             model_converters.convert(self.model)
         except Exception as e:
-            raise RuntimeError(f"Failed to convert quantization plan") from e
+            raise RuntimeError("Failed to convert quantization plan") from e
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)

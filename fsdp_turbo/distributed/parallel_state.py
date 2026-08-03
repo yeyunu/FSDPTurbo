@@ -79,7 +79,9 @@ class ParallelState(metaclass=Singleton):
             (self.kv_allgather_parallel_size, self.ulysses_parallel_size, self.tensor_parallel_size),
         )
 
-        self.add_flatten_device_mesh(('kvallgather', 'ulysses'), 'cp')
+        self.add_sub_device_mesh(('kvallgather', 'ulysses'), 'cp')
+        self.add_sub_device_mesh(('dp', 'fsdp'), 'dp_fsdp', flatten=False)
+        self.add_sub_device_mesh(('edp', 'efsdp'), 'edp_efsdp', flatten=False)
 
         print_rank(logger.info, f'Parallel state initialized:\n{self.__str__()}')
 
@@ -116,7 +118,7 @@ class ParallelState(metaclass=Singleton):
             size = self.get_group_size(name)
             rank = self.get_rank(name)
             mesh = self.get_device_mesh(name)
-            lines.append(f'  {name:<10} {str(enable):<10} {size:<12} {rank:<8} {mesh}')
+            lines.append(f'  {name:<10} {str(enable):<10} {str(size):<12} {str(rank):<8} {mesh}')
         lines.append(sep)
         return '\n'.join(lines)
 
@@ -138,31 +140,63 @@ class ParallelState(metaclass=Singleton):
 
     def is_group_enable(self, mesh_name: str) -> bool:
         if mesh_name in self.device_mesh_map:
-            return self.get_group_size(mesh_name) > 1
+            # Enabled if any dimension is replicated (> 1).
+            return any(size > 1 for size in self.get_group_size(mesh_name))
         else:
             return False
 
     def get_group(self, mesh_name: str):
+        """Return the process groups of a registered mesh.
+
+        Always returns a list.  For meshes registered under their own
+        dimension name (e.g. 'tp', 'cp') a single-element list with the
+        corresponding 1D group is returned.  For sub-meshes that keep their
+        original dimensions (e.g. the 2D 'dp_fsdp'/'edp_efsdp' mesh) one
+        group per dimension is returned, i.e. the group the current rank
+        belongs to along each dimension (dp group, fsdp group, ...).
+        """
         if mesh_name in self.device_mesh_map:
-            return self.device_mesh_map[mesh_name].get_group(mesh_name)
+            mesh = self.device_mesh_map[mesh_name]
+            if mesh_name in mesh.mesh_dim_names:
+                return [mesh.get_group(mesh_name)]
+            return [mesh.get_group(dim) for dim in mesh.mesh_dim_names]
         else:
             raise RuntimeError(f"Mesh group {mesh_name} not found.")
 
     def get_group_size(self, mesh_name: str):
+        """Return the group sizes of a registered mesh (always a list).
+
+        Mirrors ``get_group``: one size per dimension for sub-meshes, a
+        single-element list for meshes registered under their own name.
+        """
         if mesh_name in self.device_mesh_map:
-            return torch.distributed.get_world_size(self.device_mesh_map[mesh_name].get_group(mesh_name))
+            mesh = self.device_mesh_map[mesh_name]
+            if mesh_name in mesh.mesh_dim_names:
+                return [torch.distributed.get_world_size(mesh.get_group(mesh_name))]
+            return [mesh.size(dim) for dim in range(mesh.ndim)]
         else:
             raise RuntimeError(f"Mesh group {mesh_name} not found.")
 
     def get_rank(self, mesh_name: str):
+        """Return the local ranks of a registered mesh (always a list).
+
+        Mirrors ``get_group``: one rank per dimension for sub-meshes, a
+        single-element list for meshes registered under their own name.
+        """
         if mesh_name in self.device_mesh_map:
-            return self.device_mesh_map[mesh_name].get_local_rank(mesh_name)
+            mesh = self.device_mesh_map[mesh_name]
+            if mesh_name in mesh.mesh_dim_names:
+                return [mesh.get_local_rank(mesh_name)]
+            return [mesh.get_local_rank(dim) for dim in range(mesh.ndim)]
         else:
             raise RuntimeError(f"Mesh group {mesh_name} not found.")
 
     def get_device_mesh(self, mesh_name: str):
         if mesh_name in self.device_mesh_map:
-            return self.device_mesh_map[mesh_name][mesh_name]
+            mesh = self.device_mesh_map[mesh_name]
+            if mesh_name in mesh.mesh_dim_names:
+                return mesh[mesh_name]
+            return mesh
         else:
             raise RuntimeError(f"Mesh group {mesh_name} not found.")
 
@@ -207,10 +241,27 @@ class ParallelState(metaclass=Singleton):
             self.device_mesh_map[mesh_name] = device_mesh
             self.add_method(mesh_name)
 
-    def add_flatten_device_mesh(self, mesh_dim_names, new_mesh_name):
+    def add_sub_device_mesh(self, mesh_dim_names, new_mesh_name, flatten=True):
+        """Register a mesh extracted from an existing device mesh.
+
+        Args:
+            mesh_dim_names: Dimensions of the parent mesh to extract, e.g.
+                ('kvallgather', 'ulysses') or ('edp', 'efsdp').
+            new_mesh_name: Name to register the extracted mesh under.
+            flatten: If True (default), flatten the extracted sub-mesh into a
+                1D mesh and register it on the parent mesh, e.g. the 'cp'
+                all-reduce group. If False, register the sub-mesh as-is and
+                keep its dimensions, e.g. the 2D 'edp_efsdp' mesh for HSDP.
+        """
         device_mesh = self.device_mesh_map[mesh_dim_names[0]]
-        device_mesh[tuple(mesh_dim_names)]._flatten(mesh_dim_name=new_mesh_name)
-        self.device_mesh_map[new_mesh_name] = device_mesh
+        if flatten:
+            # _flatten returns a new 1D DeviceMesh; it does not modify the
+            # parent mesh, so the returned mesh must be stored instead.
+            self.device_mesh_map[new_mesh_name] = device_mesh[tuple(mesh_dim_names)]._flatten(
+                mesh_dim_name=new_mesh_name
+            )
+        else:
+            self.device_mesh_map[new_mesh_name] = device_mesh[tuple(mesh_dim_names)]
         self.add_method(new_mesh_name)
 
 

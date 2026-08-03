@@ -32,7 +32,9 @@ def get_recompute_modules(modules, plan):
 
 def recompute_wrapper(function):
     def wrapper(*args, **kwargs):
-        kwargs['past_key_values'] = None  # transformers kv cache must be set None, or model use_cache=False
+        # transformers kv cache must be set None, or model use_cache=False
+        if 'past_key_values' in kwargs:
+            kwargs['past_key_values'] = None
         return checkpoint(function, *args, use_reentrant=False, **kwargs)
 
     return wrapper
