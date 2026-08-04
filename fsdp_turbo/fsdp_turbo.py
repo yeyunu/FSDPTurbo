@@ -13,6 +13,7 @@ from fsdp_turbo.distributed.context_parallel.kv_allgather.kv_allgather_context_p
 from fsdp_turbo.memory.recompute.recompute import recompute_modules
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.distributed.expert_parallel.expert_parallel import expert_parallelize_modules
+from fsdp_turbo.utils.patch import apply_module_patches
 
 
 class FSDPTurbo(torch.nn.Module):
@@ -26,6 +27,7 @@ class FSDPTurbo(torch.nn.Module):
         self.apply_tp_modules()
         self._capture_tp_info_on_mx_linear()
         self.apply_cp_modules()
+        self.apply_module_patches()
         self.apply_ep_modules()
         self.apply_recompute_modules()
         self.apply_chunk_batch_modules()
@@ -80,6 +82,19 @@ class FSDPTurbo(torch.nn.Module):
                 self.config.distributed.ep_plan,
                 self.config.distributed.fsdp_plan,
             )
+
+    def apply_module_patches(self):
+        """Apply configured replacements before FSDP wraps the model.
+
+        Each configured target must match either a module-level callable or at
+        least one module in ``self.model.named_modules()``. Failing early keeps
+        a misspelled or architecture-specific target from silently disabling a
+        required patch.
+        """
+        for spec in self.config.module_patches:
+            self.model, matched = apply_module_patches(self.model, spec)
+            if not matched:
+                raise RuntimeError(f"Configured module patch did not match the model: target={spec['target']!r}.")
 
     def apply_recompute_modules(self):
         if not self.config.memory.recompute:

@@ -243,12 +243,14 @@ class FSDPTurboConfig:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
+    module_patches: List[Dict[str, Any]] = field(default_factory=list)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
 
     def __post_init__(self):
         self.validate_tp_config()
         self.validate_cp_config()
+        self.validate_module_patches()
         self.validate_ep_config()
         self.validate_recompute_config()
         self.validate_chunk_batch_config()
@@ -370,6 +372,40 @@ class FSDPTurboConfig:
                 if ep_module.endswith('.experts'):
                     self.distributed.ep_plan.apply_efsdp_modules.append(ep_module.removesuffix('.experts'))
 
+    def validate_module_patches(self):
+        """Validate the namespace-neutral module patch configuration.
+
+        Each entry describes exactly one dotted ``target`` and one callable
+        ``replacement``. Callable objects are accepted for direct Python API
+        use; YAML normally supplies dotted replacement paths.
+        """
+        if self.module_patches is None:
+            self.module_patches = []
+        elif isinstance(self.module_patches, dict):
+            self.module_patches = [self.module_patches]
+        elif not isinstance(self.module_patches, list):
+            raise ValueError("module_patches must be a mapping or a list of mappings.")
+        for patch in self.module_patches:
+            if not isinstance(patch, dict):
+                raise ValueError("module_patches entries must be mappings.")
+            target = patch.get("target")
+            replacement = patch.get("replacement")
+            if not isinstance(target, str) or not target:
+                raise ValueError("module_patches entries must set target.")
+            if replacement is None:
+                raise ValueError("module_patches entries must set replacement.")
+            target_parts = str(target).split(".")
+            if len(target_parts) < 2 or any(not part for part in target_parts):
+                raise ValueError("module_patches target must use a dotted module.member or module.Class.member path.")
+            if isinstance(replacement, str):
+                replacement_parts = replacement.split(".")
+                if ":" in replacement:
+                    raise ValueError("module_patches replacement must use a dotted callable path, not a colon path.")
+                if len(replacement_parts) < 2 or any(not part for part in replacement_parts):
+                    raise ValueError("module_patches replacement must use a dotted callable path.")
+            elif not callable(replacement):
+                raise ValueError("module_patches replacement must be callable or a dotted callable path.")
+
     def validate_recompute_config(self):
         self.memory.recompute_plan = [] if self.memory.recompute_plan is None else self.memory.recompute_plan
 
@@ -482,6 +518,10 @@ class FSDPTurboConfig:
         for section_name, section_obj in sections:
             lines.append(f"  [{section_name}]")
             lines.extend(_format_dataclass(section_obj, indent=4))
+            lines.append("")
+        if self.module_patches:
+            lines.append("  [Module_patches]")
+            lines.append(f"    module_patches ---- {self.module_patches!r}")
             lines.append("")
         lines.append(sep)
         return "\n".join(lines)
