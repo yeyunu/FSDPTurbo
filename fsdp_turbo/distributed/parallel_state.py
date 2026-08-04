@@ -141,52 +141,57 @@ class ParallelState(metaclass=Singleton):
     def is_group_enable(self, mesh_name: str) -> bool:
         if mesh_name in self.device_mesh_map:
             # Enabled if any dimension is replicated (> 1).
-            return any(size > 1 for size in self.get_group_size(mesh_name))
+            sizes = self.get_group_size(mesh_name)
+            if isinstance(sizes, (list, tuple)):
+                return any(size > 1 for size in sizes)
+            return sizes > 1
         else:
             return False
 
     def get_group(self, mesh_name: str):
-        """Return the process groups of a registered mesh.
+        """Return the process group(s) of a registered mesh.
 
-        Always returns a list.  For meshes registered under their own
-        dimension name (e.g. 'tp', 'cp') a single-element list with the
-        corresponding 1D group is returned.  For sub-meshes that keep their
-        original dimensions (e.g. the 2D 'dp_fsdp'/'edp_efsdp' mesh) one
-        group per dimension is returned, i.e. the group the current rank
-        belongs to along each dimension (dp group, fsdp group, ...).
+        For meshes registered under their own dimension name (e.g. 'tp',
+        'cp') a single ProcessGroup is returned.  For sub-meshes that keep
+        their original dimensions (e.g. the 2D 'dp_fsdp'/'edp_efsdp' mesh)
+        one group per dimension is returned in a list, i.e. the group the
+        current rank belongs to along each dimension (dp group, fsdp group,
+        ...).
         """
         if mesh_name in self.device_mesh_map:
             mesh = self.device_mesh_map[mesh_name]
             if mesh_name in mesh.mesh_dim_names:
-                return [mesh.get_group(mesh_name)]
+                return mesh.get_group(mesh_name)
             return [mesh.get_group(dim) for dim in mesh.mesh_dim_names]
         else:
             raise RuntimeError(f"Mesh group {mesh_name} not found.")
 
     def get_group_size(self, mesh_name: str):
-        """Return the group sizes of a registered mesh (always a list).
+        """Return the group size(s) of a registered mesh.
 
-        Mirrors ``get_group``: one size per dimension for sub-meshes, a
-        single-element list for meshes registered under their own name.
+        Mirrors ``get_group``: a single int for meshes registered under
+        their own name, a list of ints (one per dimension) for multi-dim
+        sub-meshes.
         """
         if mesh_name in self.device_mesh_map:
             mesh = self.device_mesh_map[mesh_name]
             if mesh_name in mesh.mesh_dim_names:
-                return [torch.distributed.get_world_size(mesh.get_group(mesh_name))]
+                return torch.distributed.get_world_size(mesh.get_group(mesh_name))
             return [mesh.size(dim) for dim in range(mesh.ndim)]
         else:
             raise RuntimeError(f"Mesh group {mesh_name} not found.")
 
     def get_rank(self, mesh_name: str):
-        """Return the local ranks of a registered mesh (always a list).
+        """Return the local rank(s) of a registered mesh.
 
-        Mirrors ``get_group``: one rank per dimension for sub-meshes, a
-        single-element list for meshes registered under their own name.
+        Mirrors ``get_group``: a single int for meshes registered under
+        their own name, a list of ints (one per dimension) for multi-dim
+        sub-meshes.
         """
         if mesh_name in self.device_mesh_map:
             mesh = self.device_mesh_map[mesh_name]
             if mesh_name in mesh.mesh_dim_names:
-                return [mesh.get_local_rank(mesh_name)]
+                return mesh.get_local_rank(mesh_name)
             return [mesh.get_local_rank(dim) for dim in range(mesh.ndim)]
         else:
             raise RuntimeError(f"Mesh group {mesh_name} not found.")
