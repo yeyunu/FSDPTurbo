@@ -32,6 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 npu = ["torch_npu"]
+gpu = ["transformer-engine"]
 
 [project.urls]
 Homepage = "https://gitcode.com/Ascend/FSDPTurbo"
