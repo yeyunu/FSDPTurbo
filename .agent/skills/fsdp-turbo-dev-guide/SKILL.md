@@ -71,7 +71,7 @@ from torch_npu.contrib import transfer_to_npu  # 禁止
 
 1. 在 `ops/cpu/` 提供等价的 CPU 实现，作为其他设备的兜底方案；
 2. 在 `ops/npu/`（或 `ops/cuda/`）提供加速实现；
-3. 调用方通过 `get_op` / `dispatch_op` 按当前设备类型分发，**禁止**直接调用底层库函数。
+3. 调用方通过 `ops/` 层的**语义化包装函数**调用（如 `ops/moe.py` 的 `grouped_matmul`、`ops/quantize.py` 的 `dynamic_mx_quant`，包装函数内部走 `get_op` / `dispatch_op` 按设备分发），**禁止**在业务代码中直接散落 `dispatch_op('op_name', ...)` 调用，也**禁止**直接调用底层库函数。包装函数按领域组织：MoE 相关放 `ops/moe.py`，量化相关放 `ops/quantize.py`，新增量化算子包装一律写入 `ops/quantize.py`。
 
 `get_op` 在目标设备实现缺失时会自动回落到 CPU 实现并告警一次（见 [registry.py](fsdp_turbo/ops/registry.py) 的 fallback 逻辑）。
 
@@ -93,10 +93,13 @@ def rms_norm_npu(x, weight, eps):
     ...  # NPU 融合算子实现
 ```
 
-调用示例：
+调用示例（语义化包装，见 `ops/moe.py` / `ops/quantize.py`）：
 ```python
-from fsdp_turbo.ops.registry import dispatch_op
-out = dispatch_op('rms_norm', x, weight, eps=eps)
+from fsdp_turbo.ops.quantize import dynamic_mx_quant
+from fsdp_turbo.ops.moe import grouped_matmul
+
+data_fp8, scale_bytes = dynamic_mx_quant(x, axis=-1, dst_type=torch.float8_e4m3fn)
+out = grouped_matmul(x, split_list, weights)
 ```
 
 参考已有实现：[ops/__init__.py](fsdp_turbo/ops/__init__.py) 会按需导入 `ops.npu`，并在导入失败时静默跳过。
@@ -214,7 +217,7 @@ tmp1 = compute()               # 无意义命名
 
 1. [ ] 没有任何 `torch.cuda.*` / `torch.npu.*` 直接调用，统一 `torch.accelerator`；
 2. [ ] `torch_npu` 仅出现在 `ops/npu/`（及 `utils/device.py` 的启动注入）；
-3. [ ] 新算子已 `@register_op` 注册，且有 `ops/cpu/` 兜底实现，调用方走 `dispatch_op`；
+3. [ ] 新算子已 `@register_op` 注册，且有 `ops/cpu/` 兜底实现，调用方走 `ops/` 语义化包装（无散落 `dispatch_op` 直调）；
 4. [ ] 非 `training/` 模块未跨业务模块依赖（仅可依赖 `ops/`、`utils/`、标准库、`torch`）；
 5. [ ] 新配置字段已在 `FSDPTurboConfig.__post_init__` 校验，运行期只读；
 6. [ ] 无 `print`，日志均走 `print_rank` / `log_warning_once`；

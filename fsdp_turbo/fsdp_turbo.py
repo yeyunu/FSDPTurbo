@@ -105,6 +105,7 @@ class FSDPTurbo(torch.nn.Module):
         if self.config.distributed.tensor_parallel_size <= 1:
             return
         from fsdp_turbo.quantization.mx_formats.mx_linear import MXLinear
+        from fsdp_turbo.quantization.qat.w8a16.w8a16_linear import W8A16Linear
         from torch.distributed.tensor import Shard, Partial
         from fsdp_turbo.utils.str_match import module_name_match
 
@@ -112,7 +113,7 @@ class FSDPTurbo(torch.nn.Module):
         colwise = self.config.distributed.tp_plan.colwise_parallel or []
         rowwise = self.config.distributed.tp_plan.rowwise_parallel or []
         for name, mod in self.model.named_modules():
-            if not isinstance(mod, MXLinear):
+            if not isinstance(mod, (MXLinear, W8A16Linear)):
                 continue
             if any(module_name_match(p, name) for p in colwise):
                 mod._tp_mesh = tp_mesh

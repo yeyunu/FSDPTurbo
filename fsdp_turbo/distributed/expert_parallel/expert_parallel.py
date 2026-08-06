@@ -6,7 +6,7 @@ from typing import Callable
 
 import torch
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import Shard, DTensor, Replicate, distribute_tensor, distribute_module
+from torch.distributed.tensor import Shard, DTensor, Replicate, distribute_module
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from fsdp_turbo.distributed.expert_parallel.dispatcher import get_experts_forward_fn
@@ -31,14 +31,17 @@ def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, pl
         module.num_global_experts = len(module) if not hasattr(module, 'num_experts') else module.num_experts
         if module.num_global_experts % ep_size != 0:
             raise AssertionError(
-                f'Number of experts({module.num_global_experts}) is not divisible by ep size({ep_size}).')
+                f'Number of experts({module.num_global_experts}) is not divisible by ep size({ep_size}).'
+            )
         module.num_local_experts = module.num_global_experts // ep_size
         local_expert_indices_offset = ep_rank * module.num_local_experts
         module.local_expert_indices = [local_expert_indices_offset + i for i in range(module.num_local_experts)]
         if module.num_local_experts > 1:
             module.expert_ids_per_ep_rank = torch.tensor(
-                [i % module.num_local_experts for i in range(module.num_global_experts)], dtype=torch.int32,
-                device=torch.accelerator.current_device_index())
+                [i % module.num_local_experts for i in range(module.num_global_experts)],
+                dtype=torch.int32,
+                device=torch.accelerator.current_device_index(),
+            )
 
         # distribute experts weights
         distribute_experts_module(module, ep_mesh)
@@ -67,7 +70,7 @@ def prepare_distribute_input_fn(module, inputs, device_mesh):
         if not isinstance(input_tensor, DTensor):
             input_tensor = DTensor.from_local(input_tensor, device_mesh, (Replicate(),), run_check=False)
             inputs[idx] = input_tensor
-    return *inputs,
+    return (*inputs,)
 
 
 def prepare_distribute_output_fn(module, outputs, device_mesh):
@@ -87,8 +90,11 @@ def distribute_expert_weight(module_name, module, ep_mesh):
 
 
 def distribute_experts_module(module: torch.nn.Module, ep_mesh: DeviceMesh):
-    return distribute_module(module=module, device_mesh=ep_mesh, partition_fn=distribute_expert_weight,)
-                             # input_fn=prepare_distribute_input_fn, output_fn=prepare_distribute_output_fn)
+    return distribute_module(
+        module=module,
+        device_mesh=ep_mesh,
+        partition_fn=distribute_expert_weight,
+    )
 
 
 def get_dispatcher_fn(dispatcher, ep_group, fixed_router=False):

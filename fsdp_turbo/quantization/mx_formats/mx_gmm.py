@@ -4,17 +4,36 @@ from typing import Optional
 
 import torch
 
-from fsdp_turbo.ops import dispatch_op
-from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
-from fsdp_turbo.quantization.core.pre_quant_weight import PreQuantWeight
-from fsdp_turbo.quantization.mx_formats._mx_npu_quant import (
+from fsdp_turbo.ops.quantize import (
     dynamic_mx_quant,
     dynamic_mx_quant_with_dual_axis,
+    mx_grouped_matmul,
     swiglu,
-    weight_quant_gmm,
 )
+from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
+from fsdp_turbo.quantization.core.pre_quant_weight import PreQuantWeight
 from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig
 from fsdp_turbo.quantization.utils import view_as_n_dim
+
+
+def weight_quant_gmm(weight: torch.Tensor, dst_type, new_shape: tuple) -> tuple:
+    """Quantize weight for GMM, reshaping before quantization.
+
+    The weight is reshaped to 3D [num_experts, in_dim, out_dim] before
+    quantization so that dual-axis quantization produces correct per-expert
+    scales.
+
+    Returns:
+        (weight_fwd, weight_scale_fwd, weight_bwd, weight_scale_bwd)
+    """
+    original_shape = weight.shape
+    weight = weight.reshape(new_shape)
+    weight_bwd, weight_scale_bwd, weight_fwd, weight_scale_fwd = dynamic_mx_quant_with_dual_axis(
+        weight, dst_type=dst_type
+    )
+    weight_fwd = weight_fwd.reshape(original_shape)
+    weight_bwd = weight_bwd.reshape(original_shape)
+    return weight_fwd, weight_scale_fwd, weight_bwd, weight_scale_bwd
 
 
 def mx_quant_group_gemm(
@@ -84,8 +103,7 @@ def mx_quant_group_gemm(
             weight_bwd = torch.empty(0, device=weight_unwrapped.device)
             weight_scale_bwd = torch.empty(0, device=weight_unwrapped.device)
 
-    return dispatch_op(
-        'mx_grouped_matmul',
+    return mx_grouped_matmul(
         x,
         weight,
         x_fp8,

@@ -10,8 +10,10 @@ from typing import Callable, Dict, Type
 import torch
 from torch import nn
 
+from fsdp_turbo.ops.moe import grouped_matmul
 from fsdp_turbo.quantization.mxfp8_config import QuantBaseConfig
 from fsdp_turbo.utils.str_match import module_name_match
+
 
 _QUANTIZE_CONFIG_HANDLER: Dict[
     Type[QuantBaseConfig],
@@ -51,47 +53,77 @@ class TensorWithTranspose:
         return self.data, self.scale
 
 
-def module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
-    def ignored_modules(fqn: str, config: QuantBaseConfig):
-        for pattern in config.mxfp8_ignored_modules:
-            if module_name_match(pattern, fqn):
-                return True
-        return False
-
-    if not isinstance(mod, nn.Linear):
-        return False
-
-    ignored_modules_flag = ignored_modules(fqn, config)
-    if ignored_modules_flag:
-        return False
-
-    for pattern in config.mxfp8_apply_modules:
-        m = re.match(r"(.*?layers\.\d+)", fqn)
-        if m is not None:
-            prefix = m.group(1)
-            return module_name_match(pattern, prefix)
-
-    return False
-
-
-def moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
-    """Filter function for MoE expert modules.
-
-    Matches modules whose FQN contains "experts" and whose parent layer
-    matches the configured apply_modules patterns.
+def _apply_modules_match(fqn: str, config, apply_attr: str, ignored_attr: str = "") -> bool:
+    """Return True if *fqn* matches any pattern in ``config.<apply_attr>``
+    and does not match any in ``config.<ignored_attr>``.
     """
-    if "experts" not in fqn.lower():
-        return False
-
+    if ignored_attr:
+        for pattern in getattr(config, ignored_attr, []):
+            if module_name_match(pattern, fqn):
+                return False
     m = re.match(r"(.*?layers\.\d+)", fqn)
     if m is None:
         return False
     prefix = m.group(1)
+    return any(module_name_match(pattern, prefix) for pattern in getattr(config, apply_attr, []))
 
-    for pattern in config.mxfp8_apply_modules:
-        return module_name_match(pattern, prefix)
 
-    return False
+def quant_grouped_gemm(x, weight, split_list, config, grad_enabled=True):
+    """Quantization-aware grouped matmul, dispatched by config type.
+
+    split_list: per-expert token counts. W8A16Config -> fake quant +
+    grouped_matmul; other configs -> mx_quant_group_gemm.
+    """
+    from fsdp_turbo.quantization.qat.w8a16.w8a16_config import W8A16Config
+    from fsdp_turbo.quantization.qat.w8a16.w8a16_gmm import reshape_for_gmm
+    from fsdp_turbo.quantization.qat.w8a16.w8a16_linear import W8A16FakeQuantization
+    from fsdp_turbo.quantization.mx_formats.mx_gmm import mx_quant_group_gemm as mx_gemm
+
+    if isinstance(config, W8A16Config):
+        num_experts = split_list.size(0) if isinstance(split_list, torch.Tensor) else len(split_list)
+        weight_q = W8A16FakeQuantization.apply(weight)
+        weight_3d = reshape_for_gmm(weight_q, num_experts)
+        return grouped_matmul(x, split_list, weight_3d)
+
+    group_list = torch.cumsum(split_list, dim=0)
+    return mx_gemm(x, weight, group_list, config, grad_enabled=grad_enabled)
+
+
+def resolve_expert_weights(module):
+    """Resolve an MoE module's expert weights to local tensors.
+
+    Unwraps nn.Module weights and DTensors (expert-parallel distribution);
+    shared by the MX and W8A16 EP compute functions.
+    """
+    gate_up = module.gate_up_proj
+    down = module.down_proj
+    if isinstance(gate_up, torch.nn.Module):
+        gate_up = gate_up.weight
+    if isinstance(down, torch.nn.Module):
+        down = down.weight
+    gate_up = gate_up.to_local() if hasattr(gate_up, 'to_local') else gate_up
+    down = down.to_local() if hasattr(down, 'to_local') else down
+    return gate_up, down
+
+
+def module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
+    return isinstance(mod, nn.Linear) and _apply_modules_match(
+        fqn, config, 'mxfp8_apply_modules', 'mxfp8_ignored_modules'
+    )
+
+
+def w8a16_module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
+    return isinstance(mod, nn.Linear) and _apply_modules_match(
+        fqn, config, 'w8a16_apply_modules', 'w8a16_ignored_modules'
+    )
+
+
+def moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
+    return "experts" in fqn.lower() and _apply_modules_match(fqn, config, 'mxfp8_apply_modules')
+
+
+def w8a16_moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
+    return "experts" in fqn.lower() and _apply_modules_match(fqn, config, 'w8a16_apply_modules')
 
 
 def view_as_n_dim(input_tensor, dim=2):

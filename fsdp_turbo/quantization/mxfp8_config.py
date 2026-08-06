@@ -5,15 +5,18 @@ from typing import Optional, NamedTuple
 
 import torch
 
-try:
-    import torch_npu
-
-    _HIFLOAT8 = torch_npu.hifloat8
-except ImportError:
-    torch_npu = None
-    _HIFLOAT8 = None
-
 from fsdp_turbo.fsdp_turbo_config import QuantizeConfig
+
+
+def _load_hifloat8():
+    try:
+        from fsdp_turbo.ops.npu.mx_quant import get_hifloat8_dtype
+    except ImportError:
+        return None
+    return get_hifloat8_dtype()
+
+
+_HIFLOAT8 = _load_hifloat8()
 
 
 class FP8Format:

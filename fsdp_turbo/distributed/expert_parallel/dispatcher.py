@@ -10,7 +10,7 @@ from fsdp_turbo.distributed.expert_parallel.utils import (
 )
 from fsdp_turbo.distributed.dist_ops import gather_along_first_dim_expert_parallel
 from fsdp_turbo.ops.moe import grouped_matmul, permute, unpermute
-from fsdp_turbo.quantization.mx_formats.mx_gmm import mx_quant_group_gemm
+from fsdp_turbo.quantization.utils import quant_grouped_gemm
 
 
 def get_experts_forward_fn(ep_group, fused, fixed_router=False):
@@ -19,18 +19,13 @@ def get_experts_forward_fn(ep_group, fused, fixed_router=False):
         top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
         hidden_states_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
-        top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
         if fixed_router:
             top_k_index, top_k_weights = fixed_router_for_debug(top_k_index, top_k_weights, self.num_global_experts)
 
         gate_up_proj = self.gate_up_proj.to_local() if isinstance(self.gate_up_proj, DTensor) else self.gate_up_proj
         down_proj = self.down_proj.to_local() if isinstance(self.down_proj, DTensor) else self.down_proj
-
-        weights = (gate_up_proj, down_proj)
-        act_fn = self.act_fn
-        num_global_experts = self.num_global_experts
-        expert_ids_per_ep_rank = self.expert_ids_per_ep_rank
         act_limit = self.limit if hasattr(self, 'limit') else None
+
         quant_config = getattr(self, '_quant_config', None) or getattr(self, 'config', None)
         if quant_config is not None and not hasattr(quant_config, 'get_key_dtype'):
             quant_config = None
@@ -41,14 +36,13 @@ def get_experts_forward_fn(ep_group, fused, fixed_router=False):
             hidden_states,
             top_k_index,
             top_k_weights,
-            weights,
-            act_fn,
-            num_global_experts,
-            expert_ids_per_ep_rank,
+            (gate_up_proj, down_proj),
+            self.act_fn,
+            self.num_global_experts,
+            self.expert_ids_per_ep_rank,
             act_limit,
             quant_config,
         )
-
         return hidden_states.view(*hidden_states_shape)
 
     return experts_forward
@@ -131,15 +125,10 @@ def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes
 def experts_computation(
     hidden_states, split_list, gate_up_weights, down_weights, act_fn, act_limit, fused, quant_config=None
 ):
-    if quant_config is not None:
-        group_list = torch.cumsum(split_list, dim=0)
-
-        def gmm_fn(x, w):
-            return mx_quant_group_gemm(x, w, group_list, quant_config, grad_enabled=torch.is_grad_enabled())
-    else:
-
-        def gmm_fn(x, w):
-            return grouped_matmul(x, split_list, w, use_eager=not fused)
+    def gmm_fn(x, w):
+        if quant_config is not None:
+            return quant_grouped_gemm(x, w, split_list, quant_config, grad_enabled=torch.is_grad_enabled())
+        return grouped_matmul(x, split_list, w, use_eager=not fused)
 
     fc1 = gmm_fn(hidden_states, gate_up_weights)
     gate, up = fc1.chunk(2, dim=-1)

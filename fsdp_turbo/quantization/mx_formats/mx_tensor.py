@@ -1,11 +1,7 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import torch
 
-try:
-    import torch_npu
-except ImportError:
-    torch_npu = None
-
+from fsdp_turbo.ops.quantize import dynamic_mx_quant_with_dual_axis
 from fsdp_turbo.quantization.utils import TensorWithTranspose, view_as_n_dim
 
 
@@ -21,8 +17,9 @@ class MXTensor:
             data_hf = data_hf.to_local()
         except (AttributeError, TypeError):
             pass
-        if not data_hf.is_npu:
-            data_hf = data_hf.npu()
+        accelerator = torch.accelerator.current_accelerator()
+        if accelerator is not None and data_hf.device != accelerator:
+            data_hf = data_hf.to(accelerator)
         ori_dtype = data_hf.dtype
 
         if data_hf.dtype == torch.float32:
@@ -31,7 +28,7 @@ class MXTensor:
         self.fp8_format_dtype = self.config.get_key_dtype(key)
         tensor_2d = view_as_n_dim(data_hf)
 
-        col_data, col_scale, row_data, row_scale = torch_npu.npu_dynamic_mx_quant_with_dual_axis(
+        col_data, col_scale, row_data, row_scale = dynamic_mx_quant_with_dual_axis(
             tensor_2d, dst_type=self.fp8_format_dtype
         )
 
