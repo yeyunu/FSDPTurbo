@@ -110,13 +110,6 @@ class FSDPPlanConfig:
     # 'native': Use PyTorch native FSDP implementation (default)
     fsdp_implementation: Literal['custom', 'native'] = 'native'
 
-    # Gradient divide factor for HSDP. Applied at reduce-scatter time so that
-    # the subsequent all-reduce over the dp (replicate) dim yields the correct
-    # mean across both dp and fsdp ranks. When unset (None) it is computed in
-    # the config validation from the launcher-provided WORLD_SIZE (dp =
-    # world_size // (fsdp * tp)). Users may override it explicitly.
-    gradient_divide_factor: Optional[float] = None
-
 
 @dataclass
 class TPPlanConfig:
@@ -140,10 +133,8 @@ class EPPlanConfig:
     dispatcher: Union[Literal["eager", "fused", "mc2", "domino"], Callable] = None
     fixed_router: bool = False
     apply_efsdp_modules: List[str] = None
-    # Gradient divide factor for expert HSDP, analogous to
-    # ``FSDPPlanConfig.gradient_divide_factor``. When unset (None) it is
-    # computed in the config validation from the launcher-provided WORLD_SIZE
-    # (edp = world_size // (efsdp * ep)).
+    # Gradient divide factor for expert HSDP. When unset (None) it is
+    # computed in the config validation as ep * edp * efsdp.
     gradient_divide_factor: Optional[float] = None
 
 
@@ -273,13 +264,6 @@ class FSDPTurboConfig:
         self.distributed.fsdp_plan = (
             FSDPPlanConfig() if self.distributed.fsdp_plan is None else self.distributed.fsdp_plan
         )
-        if self.distributed.fsdp_plan.gradient_divide_factor is None:
-            # Derive the real dp size from the launcher-provided world size:
-            # dp = world_size // (fsdp * tp). torchrun sets WORLD_SIZE
-            # automatically; fall back to 1 for non-distributed runs.
-            world_size = int(os.environ.get('WORLD_SIZE', '1'))
-            dp = world_size // (self.distributed.fully_shard_parallel_size * self.distributed.tensor_parallel_size)
-            self.distributed.fsdp_plan.gradient_divide_factor = self.distributed.fully_shard_parallel_size * dp
         if self.distributed.fully_shard_parallel_size > 1:
             if self.distributed.expert_parallel_size > 1:
                 self.distributed.fsdp_plan.ignored_modules.extend(self.distributed.ep_plan.apply_modules)
@@ -358,14 +342,15 @@ class FSDPTurboConfig:
             else self.distributed.ep_plan
         )
         if self.distributed.ep_plan.gradient_divide_factor is None:
-            # Derive the real edp size from the launcher-provided world size:
-            # edp = world_size // (efsdp * ep). torchrun sets WORLD_SIZE
-            # automatically; fall back to 1 for non-distributed runs.
+            # Divide across all expert mesh dims (edp * efsdp * ep). torchrun
+            # sets WORLD_SIZE; fall back to 1 for non-distributed runs.
             world_size = int(os.environ.get('WORLD_SIZE', '1'))
             edp = world_size // (
                 self.distributed.expert_fully_shard_parallel_size * self.distributed.expert_parallel_size
             )
-            self.distributed.ep_plan.gradient_divide_factor = self.distributed.expert_fully_shard_parallel_size * edp
+            self.distributed.ep_plan.gradient_divide_factor = (
+                self.distributed.expert_parallel_size * self.distributed.expert_fully_shard_parallel_size * edp
+            )
         if self.distributed.ep_plan.apply_efsdp_modules is None:
             self.distributed.ep_plan.apply_efsdp_modules = []
             for ep_module in self.distributed.ep_plan.apply_modules:

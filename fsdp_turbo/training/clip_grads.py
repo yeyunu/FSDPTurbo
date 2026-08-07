@@ -4,7 +4,7 @@
 
 This module provides decoupled, FSDP-aware gradient norm operations:
 - ``compute_grad_norm``: Compute the total gradient norm (L2 or L-inf) without clipping.
-- ``clip_grad_by_norm``: Clip gradients in-place given a pre-computed total norm.
+``edp_efsdp``).
 - ``clip_grad_norm``: Compute the gradient norm and clip in one call.
 
 DTensor (``torch.distributed.tensor.DTensor``) gradients are handled
@@ -21,14 +21,18 @@ from torch import inf
 try:
     from torch.distributed._tensor import DTensor
     from torch.distributed.tensor.placement_types import Shard
+
     _HAS_DTENSOR = True
 except ImportError:
     _HAS_DTENSOR = False
+
+from fsdp_turbo.distributed.parallel_state import get_parallel_state
 
 
 # ------------------------------------------------------------------
 # DTensor helpers
 # ------------------------------------------------------------------
+
 
 def _to_local_if_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     """Return the local shard if *tensor* is a DTensor, else return as-is."""
@@ -67,13 +71,12 @@ def _get_dp_group_if_dtensor(
         if isinstance(placement, Shard):
             group = mesh.get_group(dim_idx)
             if current_group is not None:
-                assert current_group == group, (
-                    f"Inconsistent data-parallel groups: {current_group} vs {group}"
-                )
+                assert current_group == group, f"Inconsistent data-parallel groups: {current_group} vs {group}"
             return group
 
     # All placements are Replicate -- no sharding, no group needed.
     return current_group
+
 
 def compute_grad_norm(
     parameters: Union[list, torch.Tensor],
@@ -106,10 +109,13 @@ def compute_grad_norm(
 
     # Collect local gradient shards, inferring the DP group from DTensors.
     grads = []
-    dp_group = group
+    fsdp_group = None
+    parallel = get_parallel_state()
+    dp_group = parallel.get_dp_group()
+
     for p in parameters:
         if p.grad is not None:
-            dp_group = _get_dp_group_if_dtensor(p.grad, group)
+            fsdp_group = _get_dp_group_if_dtensor(p.grad, group)
             grads.append(_to_local_if_dtensor(p.grad).detach().float())
 
     if not grads:
@@ -118,9 +124,11 @@ def compute_grad_norm(
     norm_type = float(norm_type)
 
     if norm_type == inf:
-        # Compute local max, then all-reduce MAX across the group.
+        # Compute local max, then all-reduce MAX across fsdp and dp groups.
         local_max = max(g.abs().max() for g in grads)
         total_norm = torch.tensor([local_max], dtype=torch.float, device=grads[0].device)
+        if fsdp_group is not None:
+            torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=fsdp_group)
         if dp_group is not None:
             torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=dp_group)
         return total_norm.item()
@@ -132,6 +140,9 @@ def compute_grad_norm(
         local_sum = sum(g.norm(norm_type).item() ** norm_type for g in grads)
 
     total_norm = torch.tensor([local_sum], dtype=torch.float, device=grads[0].device)
+
+    if fsdp_group is not None:
+        torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=fsdp_group)
     if dp_group is not None:
         torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_group)
 

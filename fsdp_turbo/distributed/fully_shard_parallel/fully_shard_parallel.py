@@ -31,17 +31,12 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, 
     strategy = get_fsdp_strategy(fsdp_plan.fsdp_implementation)
     fully_shard_fn = strategy.get_unified_fully_shard_fn()
 
-    gradient_divide_factor = fsdp_plan.gradient_divide_factor
     for module, plan in fsdp_modules.items():
         module_config = config.copy()
         module_config.update(plan)
         hook_module = find_hook_module(module, hook_modules)
         fully_shard_fn(module, hook_module=hook_module, **module_config)
-        if gradient_divide_factor is not None:
-            set_gradient_divide_factor(module, gradient_divide_factor)
     fully_shard_fn(model, **config)
-    if gradient_divide_factor is not None:
-        set_gradient_divide_factor(model, gradient_divide_factor)
     set_modules_to_prefetch(model, fsdp_modules, fsdp_plan)
     return model
 
@@ -164,19 +159,3 @@ def get_ignored_modules(model: torch.nn.Module, fsdp_plan: FSDPPlanConfig):
                 ignored_modules.add(name)
                 ignored_params.update(list(module.parameters(recurse=True)))
     return ignored_modules, ignored_params
-
-
-def set_gradient_divide_factor(module, factor):
-    """Apply gradient divide factor to an FSDP-wrapped module.
-
-    PyTorch >=2.9 exposes ``set_gradient_divide_factor`` (affects both
-    reduce-scatter and all-reduce); earlier versions only expose
-    ``set_reduce_scatter_divide_factor`` (reduce-scatter only).  For HSDP
-    the factor is applied at reduce-scatter time, and the subsequent
-    all-reduce is a plain sum -- so dividing by ``dp_size * fsdp_size``
-    at reduce-scatter yields the correct mean across both dims.
-    """
-    if hasattr(module, 'set_gradient_divide_factor'):
-        module.set_gradient_divide_factor(factor)
-    else:
-        module.set_reduce_scatter_divide_factor(factor)

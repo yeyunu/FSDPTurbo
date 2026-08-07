@@ -38,8 +38,6 @@ class FSDPTurbo(torch.nn.Module):
         # all-reduces gradients across the dp (replicate) dim.  Using the 1D
         # fsdp mesh skips the dp all-reduce, yielding wrong gradients when the
         # fsdp domain is not filled (data_parallel_size > 1).
-        # The gradient divide factor is derived in the config validation
-        # (from the launcher-provided WORLD_SIZE), so it is simply read here.
         self.model = fully_shard_parallel_modules(
             self.model, self.parallel_state.get_device_mesh('dp_fsdp'), self.config.distributed.fsdp_plan
         )
