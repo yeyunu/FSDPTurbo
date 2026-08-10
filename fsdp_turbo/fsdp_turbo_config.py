@@ -355,7 +355,7 @@ class FSDPTurboConfig:
             self.distributed.ep_plan.apply_efsdp_modules = []
             for ep_module in self.distributed.ep_plan.apply_modules:
                 if ep_module.endswith('.experts'):
-                    self.distributed.ep_plan.apply_efsdp_modules.append(ep_module.removesuffix('.experts'))
+                    self.distributed.ep_plan.apply_efsdp_modules.append(ep_module)
 
     def validate_module_patches(self):
         """Validate the namespace-neutral module patch configuration.

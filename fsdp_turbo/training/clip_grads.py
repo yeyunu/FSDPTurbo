@@ -26,8 +26,6 @@ try:
 except ImportError:
     _HAS_DTENSOR = False
 
-from fsdp_turbo.distributed.parallel_state import get_parallel_state
-
 
 # ------------------------------------------------------------------
 # DTensor helpers
@@ -110,8 +108,6 @@ def compute_grad_norm(
     # Collect local gradient shards, inferring the DP group from DTensors.
     grads = []
     fsdp_group = None
-    parallel = get_parallel_state()
-    dp_group = parallel.get_dp_group()
 
     for p in parameters:
         if p.grad is not None:
@@ -129,8 +125,6 @@ def compute_grad_norm(
         total_norm = torch.tensor([local_max], dtype=torch.float, device=grads[0].device)
         if fsdp_group is not None:
             torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=fsdp_group)
-        if dp_group is not None:
-            torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.MAX, group=dp_group)
         return total_norm.item()
 
     # General p-norm: sum of local ||grad||^p, then all-reduce SUM, then take ^(1/p).
@@ -146,9 +140,6 @@ def compute_grad_norm(
 
     if fsdp_group is not None:
         torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=fsdp_group)
-    if dp_group is not None:
-        torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=dp_group)
-
     return total_norm.item() ** (1.0 / norm_type)
 
 

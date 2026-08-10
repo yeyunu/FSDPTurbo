@@ -105,7 +105,7 @@ distributed:
       - model.layers.{*}.mlp.experts
     dispatcher: "fused"
     apply_efsdp_modules:
-      - model.layers.{*}.mlp
+      - model.layers.{*}.mlp.experts
 
   cp_plan:
     ulysses_core_attention_function: "transformers.models.deepseek_v4.modeling_deepseek_v4.eager_attention_forward"
