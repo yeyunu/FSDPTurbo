@@ -134,12 +134,15 @@ def compute_grad_norm(
         return total_norm.item()
 
     # General p-norm: sum of local ||grad||^p, then all-reduce SUM, then take ^(1/p).
+    local_sum = torch.zeros((), dtype=torch.float, device=grads[0].device)
     if norm_type == 2.0:
-        local_sum = sum(g.norm().item() ** 2 for g in grads)
+        for g in grads:
+            local_sum += g.norm() ** 2
     else:
-        local_sum = sum(g.norm(norm_type).item() ** norm_type for g in grads)
+        for g in grads:
+            local_sum += g.norm(norm_type) ** norm_type
 
-    total_norm = torch.tensor([local_sum], dtype=torch.float, device=grads[0].device)
+    total_norm = local_sum.unsqueeze(0)
 
     if fsdp_group is not None:
         torch.distributed.all_reduce(total_norm, op=torch.distributed.ReduceOp.SUM, group=fsdp_group)

@@ -57,7 +57,11 @@ class ParallelState(metaclass=Singleton):
 
     def __post_init__(self):
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='hccl')
+            from fsdp_turbo.utils.device import set_accelerator_compatible
+
+            device_backend = set_accelerator_compatible()  # 'hccl' | 'nccl'
+            device = get_accelerator_name()  # 'npu' | 'cuda'
+            torch.distributed.init_process_group(backend=f"cpu:gloo,{device}:{device_backend}")
         if self.device_mesh_map is None:
             self.device_mesh_map = dict()
 
