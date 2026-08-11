@@ -1,0 +1,168 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+import sys
+import types
+import unittest
+from unittest import mock
+
+import torch
+
+from fsdp_turbo.distributed.context_parallel.batch import split_sequence_batch
+from fsdp_turbo.distributed.context_parallel.patch import (
+    CP_PATCHES_ATTR,
+    apply_cp_loss_patches,
+    apply_function_patch_specs,
+)
+from fsdp_turbo.fsdp_turbo_config import CPPlanConfig, DistributedConfig, FSDPTurboConfig
+
+
+class ContextParallelConfigTests(unittest.TestCase):
+    def test_function_patch_specs_are_normalized(self):
+        config = FSDPTurboConfig(
+            distributed=DistributedConfig(
+                ulysses_parallel_size=2,
+                cp_plan=CPPlanConfig(
+                    ulysses_function_patches={
+                        "target_functions": "package.module.attention",
+                        "type": "full_attention",
+                    },
+                    kv_allgather_function_patches={
+                        "target_functions": "package.module.kv_attention",
+                        "type": "full_attention",
+                    },
+                    loss_function_patches={
+                        "target_functions": "package.module.loss",
+                        "type": "causal_lm_loss",
+                    },
+                ),
+            )
+        )
+        self.assertEqual(
+            config.distributed.cp_plan.ulysses_function_patches,
+            [
+                {
+                    "target_functions": ["package.module.attention"],
+                    "type": "full_attention",
+                }
+            ],
+        )
+        self.assertEqual(
+            config.distributed.cp_plan.loss_function_patches,
+            [
+                {
+                    "target_functions": ["package.module.loss"],
+                    "type": "causal_lm_loss",
+                }
+            ],
+        )
+        self.assertEqual(
+            config.distributed.cp_plan.kv_allgather_function_patches,
+            [
+                {
+                    "target_functions": ["package.module.kv_attention"],
+                    "type": "full_attention",
+                }
+            ],
+        )
+
+    def test_enabled_cp_requires_axis_patch_specs(self):
+        cases = (
+            ("ulysses_function_patches", DistributedConfig(ulysses_parallel_size=2)),
+            ("kv_allgather_function_patches", DistributedConfig(kv_allgather_parallel_size=2)),
+        )
+        for field_name, distributed in cases:
+            with self.subTest(field_name=field_name), self.assertRaisesRegex(ValueError, field_name):
+                FSDPTurboConfig(distributed=distributed)
+
+
+class ContextParallelBatchTests(unittest.TestCase):
+    @mock.patch("torch.distributed.get_rank", return_value=2)
+    @mock.patch("torch.distributed.get_world_size", return_value=4)
+    def test_sequence_batch_split_builds_position_ids_and_keeps_labels(self, _world_size, _rank):
+        batch = {
+            "input_ids": torch.arange(7).view(1, 7),
+            "attention_mask": torch.ones(1, 7, dtype=torch.long),
+            "labels": torch.arange(7).view(1, 7),
+        }
+        output = split_sequence_batch(
+            batch,
+            object(),
+            sequence_keys=("input_ids", "attention_mask"),
+            build_position_ids=True,
+        )
+        torch.testing.assert_close(output["input_ids"], torch.tensor([[4, 5]]))
+        torch.testing.assert_close(output["position_ids"], torch.tensor([[4, 5]]))
+        torch.testing.assert_close(output["labels"], batch["labels"])
+
+
+class ContextParallelPatchTests(unittest.TestCase):
+    module_name = "_fsdp_turbo_cp_patch_target"
+
+    def setUp(self):
+        self.module = types.ModuleType(self.module_name)
+        self.trace = []
+
+        def causal_loss(logits, labels, vocab_size, **kwargs):
+            del labels, vocab_size, kwargs
+            return logits.sum()
+
+        def attention(value):
+            self.trace.append("attention")
+            return value + 1
+
+        self.module.causal_loss = causal_loss
+        self.module.attention = attention
+        sys.modules[self.module_name] = self.module
+
+    def tearDown(self):
+        sys.modules.pop(self.module_name, None)
+
+    def test_loss_patch_is_idempotent(self):
+        target = f"{self.module_name}.causal_loss"
+        specs = [{"target_functions": [target], "type": "causal_lm_loss"}]
+
+        apply_cp_loss_patches(specs, object())
+        first = getattr(self.module, "causal_loss")
+        apply_cp_loss_patches(specs, object())
+
+        self.assertIs(getattr(self.module, "causal_loss"), first)
+        self.assertEqual(getattr(first, CP_PATCHES_ATTR), ("CP:causal_lm_loss",))
+        self.assertFalse(hasattr(first.__wrapped__, CP_PATCHES_ATTR))
+
+    def test_kv_then_ulysses_attention_patches_execute_in_filo_order(self):
+        target = f"{self.module_name}.attention"
+        specs = [{"target_functions": [target], "type": "full_attention"}]
+
+        def patch_factory(label):
+            def factory(original, _group):
+                def wrapped(*args, **kwargs):
+                    self.trace.append(f"{label}:before")
+                    output = original(*args, **kwargs)
+                    self.trace.append(f"{label}:after")
+                    return output
+
+                return wrapped
+
+            return factory
+
+        apply_function_patch_specs(
+            specs,
+            object(),
+            {"full_attention": patch_factory("kv")},
+            label="KVAllGather",
+        )
+        apply_function_patch_specs(
+            specs,
+            object(),
+            {"full_attention": patch_factory("ulysses")},
+            label="Ulysses",
+        )
+
+        self.assertEqual(getattr(self.module, "attention")(1), 2)
+        self.assertEqual(
+            self.trace,
+            ["ulysses:before", "kv:before", "attention", "kv:after", "ulysses:after"],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

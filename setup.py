@@ -20,6 +20,7 @@ setup(
         "pyyaml>=6.0",
         "transformers>=5.0.0",
         "datasets>=2.14.0",
+        "pillow>=9.0.0",
     ],
     extras_require={
         "npu": [

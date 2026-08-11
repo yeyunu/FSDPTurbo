@@ -10,6 +10,7 @@ from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_context_parallel im
 from fsdp_turbo.distributed.context_parallel.kv_allgather.kv_allgather_context_parallel import (
     kv_allgather_context_parallelize_modules,
 )
+from fsdp_turbo.distributed.context_parallel.patch import apply_cp_loss_patches
 from fsdp_turbo.memory.recompute.recompute import recompute_modules
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.distributed.expert_parallel.expert_parallel import expert_parallelize_modules
@@ -51,23 +52,24 @@ class FSDPTurbo(torch.nn.Module):
 
     def apply_cp_modules(self):
         cp_plan = self.config.distributed.cp_plan
-        if cp_plan is None:
-            return
-        # KV all-gather context parallelism
-        if self.config.distributed.kv_allgather_parallel_size > 1 and cp_plan.kv_allgather_core_attention_function:
+        if self.parallel_state.get_kvallgather_group_size() > 1:
             self.model = kv_allgather_context_parallelize_modules(
                 self.model,
                 self.parallel_state.get_kvallgather_group(),
                 cp_plan,
             )
 
-        # Ulysses context parallelism
-        if self.config.distributed.ulysses_parallel_size > 1 and cp_plan.ulysses_core_attention_function:
+        if self.parallel_state.get_ulysses_group_size() > 1:
             self.model = ulysses_context_parallelize_modules(
                 self.model,
                 self.parallel_state.get_ulysses_group(),
                 cp_plan,
             )
+
+        # Attention wrappers compose on their own axes. A causal-LM loss must
+        # instead see the complete KV x Ulysses domain and is installed once.
+        if self.parallel_state.get_cp_group_size() > 1:
+            apply_cp_loss_patches(cp_plan.loss_function_patches, self.parallel_state.get_cp_group())
 
     def apply_ep_modules(self):
         if self.config.distributed.expert_parallel_size > 1:

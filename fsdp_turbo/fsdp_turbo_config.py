@@ -60,6 +60,9 @@ class DataConfig:
     num_workers: int = 0
     pin_memory: bool = True
     shuffle: bool = True
+    is_multimodal: bool = False
+    image_column: str = "images"
+    conversation_column: str = "messages"
 
 
 @dataclass
@@ -120,11 +123,9 @@ class TPPlanConfig:
 
 @dataclass
 class CPPlanConfig:
-    ulysses_core_attention_function: Union[str, List[str]] = None
-    ulysses_attention_type: Union[Literal["default", "with_compressor", "GDN"], Callable] = "default"
-    ulysses_attn_output_transposed: bool = False
-    kv_allgather_core_attention_function: Union[str, List[str]] = None
-    kv_allgather_attention_type: Union[Literal["default", "with_compressor"], Callable] = "default"
+    ulysses_function_patches: List[Dict[str, Any]] = field(default_factory=list)
+    kv_allgather_function_patches: List[Dict[str, Any]] = field(default_factory=list)
+    loss_function_patches: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -298,31 +299,44 @@ class FSDPTurboConfig:
         )
 
     def validate_cp_config(self):
-        '''context parallelize plan (Ulysses)
-
-        config = FSDPTurboConfig(
-            distributed=DistributedConfig(
-                kv_allgather_parallel_size=2,
-                ulysses_parallel_size=2,
-                cp_plan=CPPlanConfig(
-                    ulysses_core_attention_function='transformers.models.deepseek_v4.modeling_deepseek_v4.eager_attention_forward'
-                )
-            )
-        )
-        '''
         self.distributed.cp_plan = CPPlanConfig() if self.distributed.cp_plan is None else self.distributed.cp_plan
-        if self.distributed.cp_plan.ulysses_core_attention_function is None:
-            self.distributed.cp_plan.ulysses_core_attention_function = []
-        elif isinstance(self.distributed.cp_plan.ulysses_core_attention_function, str):
-            self.distributed.cp_plan.ulysses_core_attention_function = [
-                self.distributed.cp_plan.ulysses_core_attention_function
-            ]
-        if self.distributed.cp_plan.kv_allgather_core_attention_function is None:
-            self.distributed.cp_plan.kv_allgather_core_attention_function = []
-        elif isinstance(self.distributed.cp_plan.kv_allgather_core_attention_function, str):
-            self.distributed.cp_plan.kv_allgather_core_attention_function = [
-                self.distributed.cp_plan.kv_allgather_core_attention_function
-            ]
+        for field_name in ("ulysses_function_patches", "kv_allgather_function_patches", "loss_function_patches"):
+            patches = getattr(self.distributed.cp_plan, field_name)
+            if patches is None:
+                patches = []
+            elif isinstance(patches, dict):
+                patches = [patches]
+            elif not isinstance(patches, list):
+                raise ValueError(f"distributed.cp_plan.{field_name} must be a mapping or list of mappings.")
+
+            normalized = []
+            for patch in patches:
+                if not isinstance(patch, dict):
+                    raise ValueError(f"distributed.cp_plan.{field_name} entries must be mappings.")
+                targets = patch.get("target_functions")
+                if isinstance(targets, str):
+                    targets = [targets]
+                if not isinstance(targets, list) or not targets:
+                    raise ValueError(f"distributed.cp_plan.{field_name} entries must set target_functions.")
+                if any(not isinstance(target, str) or ":" in target or "." not in target for target in targets):
+                    raise ValueError(
+                        f"distributed.cp_plan.{field_name} target_functions must use dotted callable paths."
+                    )
+                patch_type = patch.get("type")
+                if not isinstance(patch_type, str) or not patch_type:
+                    raise ValueError(f"distributed.cp_plan.{field_name} entries must set type.")
+                normalized.append({**patch, "target_functions": targets})
+            setattr(self.distributed.cp_plan, field_name, normalized)
+
+        if self.distributed.ulysses_parallel_size > 1 and not self.distributed.cp_plan.ulysses_function_patches:
+            raise ValueError("distributed.cp_plan.ulysses_function_patches must be set when Ulysses CP is enabled.")
+        if (
+            self.distributed.kv_allgather_parallel_size > 1
+            and not self.distributed.cp_plan.kv_allgather_function_patches
+        ):
+            raise ValueError(
+                "distributed.cp_plan.kv_allgather_function_patches must be set when KV-AllGather CP is enabled."
+            )
 
     def validate_ep_config(self):
         '''expert parallelize plan

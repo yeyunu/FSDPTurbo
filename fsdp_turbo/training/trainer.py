@@ -1,5 +1,6 @@
 import os
 import logging
+from collections.abc import Mapping
 from typing import Optional
 
 import torch
@@ -22,6 +23,7 @@ class BaseTrainer:
     Attributes:
         model: The training model (after parallelism wrapping).
         tokenizer: The tokenizer instance.
+        processor: The multimodal processor, when configured.
         optimizer: The optimizer instance.
         lr_scheduler: The learning rate scheduler.
         data_manager: The data loader / manager.
@@ -32,6 +34,7 @@ class BaseTrainer:
         self.config = config
         self.model = None
         self.tokenizer = None
+        self.processor = None
         self.optimizer = None
         self.lr_scheduler = None
         self.dataloader = None
@@ -58,7 +61,7 @@ class BaseTrainer:
 
     def train(self, resume_from_checkpoint: Optional[str] = None):
         """Main training loop."""
-        print_rank(logger.info, "\n"+ str(self.config))
+        print_rank(logger.info, "\n" + str(self.config))
 
         self._prepare_training(resume_from_checkpoint)
         max_steps = self._resolve_max_steps()
@@ -74,8 +77,11 @@ class BaseTrainer:
             if self._consumed_samples > 0 and samples_per_epoch > 0:
                 start_epoch = self._consumed_samples // samples_per_epoch
                 skip_batches = (self._consumed_samples % samples_per_epoch) // self.config.data.batch_size
-                print_rank(logger.info, f"  Resuming from consumed_samples={self._consumed_samples}: "
-                                        f"start_epoch={start_epoch}, skip_batches={skip_batches}")
+                print_rank(
+                    logger.info,
+                    f"  Resuming from consumed_samples={self._consumed_samples}: "
+                    f"start_epoch={start_epoch}, skip_batches={skip_batches}",
+                )
             else:
                 start_epoch = 0
                 skip_batches = 0
@@ -83,8 +89,11 @@ class BaseTrainer:
             for epoch in range(self.config.run.num_train_epochs):
                 print_rank(logger.info, f"  Epoch {epoch + 1}/{self.config.run.num_train_epochs}")
                 # Set epoch on DistributedSampler for proper shuffling across epochs.
-                if self.dataloader is not None and hasattr(self.dataloader, "sampler") \
-                        and hasattr(self.dataloader.sampler, "set_epoch"):
+                if (
+                    self.dataloader is not None
+                    and hasattr(self.dataloader, "sampler")
+                    and hasattr(self.dataloader.sampler, "set_epoch")
+                ):
                     self.dataloader.sampler.set_epoch(epoch)
 
                 # Skip epochs and batches we already consumed.
@@ -102,8 +111,7 @@ class BaseTrainer:
 
                     # Track how many samples have been processed.
                     if isinstance(batch, dict):
-                        batch_size = next((v.shape[0] for v in batch.values()
-                                          if isinstance(v, torch.Tensor)), 1)
+                        batch_size = next((v.shape[0] for v in batch.values() if isinstance(v, torch.Tensor)), 1)
                     elif isinstance(batch, (list, tuple)):
                         batch_size = batch[0].shape[0] if isinstance(batch[0], torch.Tensor) else 1
                     else:
@@ -209,6 +217,7 @@ class BaseTrainer:
             None.
         """
         from fsdp_turbo.distributed.parallel_state import get_parallel_state
+
         parallel_state = get_parallel_state()
 
         cp_enabled = parallel_state.is_cp_enable()
@@ -241,6 +250,7 @@ class BaseTrainer:
             return
 
         from fsdp_turbo.utils.device import set_accelerator_compatible
+
         backend = set_accelerator_compatible()
         set_log_level("INFO")
 
@@ -252,9 +262,7 @@ class BaseTrainer:
 
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        torch.distributed.init_process_group(
-            backend=backend, rank=rank, world_size=world_size
-        )
+        torch.distributed.init_process_group(backend=backend, rank=rank, world_size=world_size)
 
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.accelerator.set_device_index(local_rank)
@@ -265,6 +273,7 @@ class BaseTrainer:
     def _set_seed(self):
         """Set random seed. Override to customize seed source."""
         from fsdp_turbo.utils.random import set_seed
+
         set_seed(self.config.run.seed, set_deterministic=self.config.run.deterministic)
 
     # ------------------------------------------------------------------
@@ -273,12 +282,31 @@ class BaseTrainer:
 
     def build_tokenizer(self):
         """Build tokenizer using TokenizerFactory."""
+        if getattr(self.config.data, "is_multimodal", False):
+            if self.processor is None:
+                self.processor = self.build_processor()
+            if self.processor is not None and hasattr(self.processor, "tokenizer"):
+                return self.processor.tokenizer
         if not self.config.model.tokenizer_name_or_path:
             print_rank(logger.warning, "tokenizer_name_or_path is empty, skipping tokenizer build.")
             return None
         from fsdp_turbo.training.factories import TokenizerFactory
+
         print_rank(logger.info, "> Building Tokenizer...")
         return TokenizerFactory.create(self.config.model.tokenizer_name_or_path)
+
+    def build_processor(self):
+        """Build a multimodal processor from the configured model path."""
+        if not getattr(self.config.data, "is_multimodal", False):
+            return None
+        source = self.config.model.tokenizer_name_or_path or self.config.model.model_name_or_path
+        if not source:
+            print_rank(logger.warning, "No model path configured, skipping processor build.")
+            return None
+        from transformers import AutoProcessor
+
+        print_rank(logger.info, "> Building Processor...")
+        return AutoProcessor.from_pretrained(source)
 
     def build_model(self):
         """Build model using ModelFactory."""
@@ -286,6 +314,7 @@ class BaseTrainer:
             print_rank(logger.warning, "model_name_or_path is empty, skipping model build.")
             return None
         from fsdp_turbo.training.factories import ModelFactory
+
         print_rank(logger.info, "> Building Model...")
         return ModelFactory.create(
             self.config.model.model_name_or_path,
@@ -299,6 +328,7 @@ class BaseTrainer:
             return None
         print_rank(logger.info, "> Building Optimizer...")
         from fsdp_turbo.training.factories import OptimizerFactory
+
         print(self.config.optimizer.lr, type(self.config.optimizer.lr))
         return OptimizerFactory.create(
             self.config.optimizer.optimizer_type,
@@ -316,6 +346,7 @@ class BaseTrainer:
             return None
         print_rank(logger.info, "> Building LR Scheduler...")
         from fsdp_turbo.training.factories import SchedulerFactory
+
         max_steps = self._resolve_max_steps()
         return SchedulerFactory.create(
             self.config.optimizer.lr_scheduler_type,
@@ -327,7 +358,8 @@ class BaseTrainer:
     def build_dataloader(self):
         """Build dataloader from HuggingFace datasets."""
         from fsdp_turbo.training.dataloader import build_dataloader
-        return build_dataloader(self.config.data, tokenizer=self.tokenizer)
+
+        return build_dataloader(self.config.data, tokenizer=self.tokenizer, processor=self.processor)
 
     def build_checkpointer(self):
         """Build checkpoint manager."""
@@ -349,6 +381,7 @@ class BaseTrainer:
 
     def _create_profiler(self):
         from fsdp_turbo.training.profiler import create_profiler
+
         return create_profiler(self.config.run.profile)
 
     def _resolve_max_steps(self):
@@ -363,35 +396,46 @@ class BaseTrainer:
         return 100000
 
     def prepare_batch(self, batch):
-        """Move batch to device and optionally split along sequence dim for context parallelism."""
+        """Move a batch to device and shard model inputs over the full CP group."""
         batch = self._move_batch_to_device(batch)
-        batch = self._split_batch_for_kv_allgather(batch)
-        batch = self._split_batch_for_ulysses(batch)
-        return batch
+        return self._split_batch_for_context_parallel(batch)
 
     def _move_batch_to_device(self, batch):
         device = torch.accelerator.current_accelerator()
-        if isinstance(batch, dict):
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+        if isinstance(batch, Mapping):
+            batch = {
+                key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in batch.items()
+            }
         return batch
 
-    def _split_batch_for_ulysses(self, batch):
-        """Split batch tensors along the sequence dimension for Ulysses context parallelism."""
-        if self.config.distributed.ulysses_parallel_size <= 1:
-            return batch
-        from fsdp_turbo.distributed.context_parallel.ulysses.utils import ulysses_split_batch_data
-        from fsdp_turbo.distributed.parallel_state import get_parallel_state
-        parallel_state = get_parallel_state()
-        return ulysses_split_batch_data(batch, parallel_state.get_ulysses_group())
+    def _is_vlm_model(self):
+        """Return whether the model architecture contains a vision tower."""
+        model = self.model
+        visited = set()
+        while model is not None and id(model) not in visited:
+            visited.add(id(model))
+            model_config = getattr(model, "config", None)
+            if model_config is not None and hasattr(model_config, "vision_config"):
+                return getattr(model_config, "vision_config", None) is not None
+            model = getattr(model, "model", None) or getattr(model, "module", None)
+        return False
 
-    def _split_batch_for_kv_allgather(self, batch):
-        """Split batch tensors along the sequence dimension for KV all-gather context parallelism."""
-        if self.config.distributed.kv_allgather_parallel_size <= 1:
+    def _split_batch_for_context_parallel(self, batch):
+        """Split once over flattened KV-AllGather x Ulysses ranks."""
+        parallel_state = self.model.parallel_state
+        if parallel_state.get_cp_group_size() <= 1:
             return batch
-        from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import kv_allgather_split_batch_data
-        from fsdp_turbo.distributed.parallel_state import get_parallel_state
-        parallel_state = get_parallel_state()
-        return kv_allgather_split_batch_data(batch, parallel_state.get_kvallgather_group())
+        if self._is_vlm_model():
+            return batch
+
+        from fsdp_turbo.distributed.context_parallel.batch import split_sequence_batch
+
+        return split_sequence_batch(
+            batch,
+            group=parallel_state.get_cp_group(),
+            sequence_keys=("input_ids", "attention_mask", "mm_token_type_ids"),
+            build_position_ids=True,
+        )
 
     def _clip_grad_norm(self):
         """Clip gradient norm and return the total norm before clipping.
@@ -401,6 +445,7 @@ class BaseTrainer:
         Returns the gradient norm before clipping for monitoring.
         """
         from fsdp_turbo.training.clip_grads import clip_grad_norm
+
         return clip_grad_norm(
             self.model,
             max_norm=self.config.optimizer.clip_grad,
@@ -411,6 +456,7 @@ class BaseTrainer:
     def _compute_grad_norm(self):
         """Compute the total gradient norm without clipping."""
         from fsdp_turbo.training.clip_grads import compute_grad_norm
+
         return compute_grad_norm(
             list(self.model.parameters()),
             norm_type=self.config.optimizer.clip_grad_norm_type,
@@ -430,15 +476,22 @@ class BaseTrainer:
     def _save_checkpoint(self):
         if self._ckpt_manager is not None and hasattr(self._ckpt_manager, "save"):
             self._ckpt_manager.save(
-                self.model, self.optimizer, self.lr_scheduler, self._global_step,
-                data_cfg=self.config.data, dataloader=self.dataloader,
+                self.model,
+                self.optimizer,
+                self.lr_scheduler,
+                self._global_step,
+                data_cfg=self.config.data,
+                dataloader=self.dataloader,
                 consumed_samples=self._consumed_samples,
             )
 
     def _load_checkpoint(self, checkpoint_path):
         if self._ckpt_manager is not None and hasattr(self._ckpt_manager, "load"):
             ckpt_info = self._ckpt_manager.load(
-                checkpoint_path, self.model, self.optimizer, self.lr_scheduler,
+                checkpoint_path,
+                self.model,
+                self.optimizer,
+                self.lr_scheduler,
                 strict=self.config.checkpoint.strict,
             )
             # Restore global_step only if the dataset hasn't changed.
@@ -446,13 +499,17 @@ class BaseTrainer:
             current_fp = None
             if self.config is not None and self.config.data is not None:
                 from fsdp_turbo.training.checkpoint import dataset_fingerprint
+
                 current_fp = dataset_fingerprint(self.config.data)
 
             if saved_fp and saved_fp == current_fp:
                 self._global_step = ckpt_info.get("global_step", 0)
                 self._consumed_samples = ckpt_info.get("consumed_samples", 0)
-                print_rank(logger.info, f"Restored global_step to {self._global_step}, "
-                                        f"consumed_samples to {self._consumed_samples} (dataset unchanged)")
+                print_rank(
+                    logger.info,
+                    f"Restored global_step to {self._global_step}, "
+                    f"consumed_samples to {self._consumed_samples} (dataset unchanged)",
+                )
             else:
                 self._global_step = 0
                 self._consumed_samples = 0
