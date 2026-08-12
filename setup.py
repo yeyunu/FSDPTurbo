@@ -18,13 +18,15 @@ setup(
     install_requires=[
         "torch>=2.4.0",
         "pyyaml>=6.0",
-        "transformers>=5.0.0",
+        "transformers>=5.2.0",
         "datasets>=2.14.0",
         "pillow>=9.0.0",
     ],
     extras_require={
         "npu": [
             "torch_npu",
+            "fla-core",
+            "flash-linear-attention",
         ],
     },
     classifiers=[
