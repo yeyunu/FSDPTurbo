@@ -90,7 +90,7 @@ RUN ARCH=$(uname -m) && \
     if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then \
         source /usr/local/Ascend/nnal/atb/set_env.sh; \
     fi && \
-    pip install torch==${TORCH_VERSION} torch_npu==${TORCH_NPU_VERSION} && \
+    pip install torch==${TORCH_VERSION} torch_npu==${TORCH_NPU_VERSION} torchvision==0.25.0 && \
     pip install pyyaml>=6.0 transformers>=5.2.0 datasets>=2.14.0 pillow>=9.0.0 && \
     pip install fla-core flash-linear-attention && \
     rm -rf /tmp/* /var/tmp/* && \
