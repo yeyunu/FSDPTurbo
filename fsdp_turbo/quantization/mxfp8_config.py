@@ -79,6 +79,7 @@ class QuantBaseConfig:
 class MXFP8LinearConfig(QuantBaseConfig):
     enable_fsdp_low_precision_all_gather: bool = True
     fsdp_low_precision_all_gather_mode: str = "on-demand"
+    fsdp_world_size: int = 1
     mxfp8_ignored_modules: list[str] = field(default_factory=list)
     mxfp8_apply_modules: list[str] = field(default_factory=list)
     converter: str = "quantize.linear.mx"
@@ -92,4 +93,5 @@ def get_mxfp8linear_config(quant_config: QuantizeConfig):
         mxfp8_apply_modules=quant_config.quant_apply_modules or [],
         enable_fsdp_low_precision_all_gather=quant_config.enable_fsdp_low_precision_all_gather,
         fsdp_low_precision_all_gather_mode=quant_config.fsdp_low_precision_all_gather_mode,
+        fsdp_world_size=quant_config.fsdp_world_size,
     )

@@ -4,22 +4,22 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Callable, Optional, Tuple, Any
+from typing import Callable, Optional
 
 import torch
-import torch.nn as nn
+from torch import nn
 from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig
 from fsdp_turbo.quantization.utils import _QUANTIZE_CONFIG_HANDLER
 
 
-def _replace_with_custom_fn_if_matches_filter(
-        model,
-        config,
-        replacement_fn,
-        filter_fn,
-        cur_fqn="",
-        device=None,
-        *args,
+def _replace_with_custom_fn_if_matches_filter(  # pylint: disable=keyword-arg-before-vararg
+    model,
+    config,
+    replacement_fn,
+    filter_fn,
+    cur_fqn="",
+    device=None,
+    *args,
 ) -> None:
     if filter_fn(model, cur_fqn[:-1], config):
         name = cur_fqn[:-1]
@@ -48,17 +48,29 @@ def _replace_with_custom_fn_if_matches_filter(
         return model
 
 
+def _find_rotary_emb(model: nn.Module) -> Optional[nn.Module]:
+    candidates = [
+        (name, module) for name, module in model.named_modules() if 'inv_freq' in dict(module.named_buffers())
+    ]
+    if not candidates:
+        return None
+    for name, module in candidates:
+        if 'visual' not in name:
+            return module
+    return candidates[0][1]
+
+
 def quantize_(
-        model: nn.Module,
-        config: MXFP8LinearConfig,
-        filter_fn: Optional[Callable[[torch.nn.Module, str], bool]],
-        device: Optional[torch.types.Device] = None,
-        handler: Optional[Callable] = None,
+    model: nn.Module,
+    config: MXFP8LinearConfig,
+    filter_fn: Optional[Callable[[torch.nn.Module, str], bool]],
+    device: Optional[torch.types.Device] = None,
+    handler: Optional[Callable] = None,
 ):
-    filter_fn = filter_fn
     if handler is None:
         handler = _QUANTIZE_CONFIG_HANDLER[type(config)]
-    saved_inv_freq = model.model.rotary_emb.inv_freq.detach().clone()
+    rotary_emb = _find_rotary_emb(model)
+    saved_inv_freq = rotary_emb.inv_freq.detach().clone() if rotary_emb is not None else None
 
     try:
         _replace_with_custom_fn_if_matches_filter(
@@ -71,4 +83,6 @@ def quantize_(
     except Exception as e:
         raise RuntimeError("Failed to replace model") from e
 
-    model.model.rotary_emb.inv_freq = saved_inv_freq
+    if rotary_emb is not None:
+        rotary_emb = _find_rotary_emb(model) or rotary_emb
+        rotary_emb.inv_freq = saved_inv_freq

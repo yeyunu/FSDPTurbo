@@ -168,15 +168,27 @@ class MXLinear(torch.nn.Linear):
             new_mod.bias = mod.bias
             new_mod.config = config
 
+            w = new_mod.weight
+            if isinstance(w, DTensor):
+                local_w = w.to_local()
+            else:
+                local_w = w
+
+            if local_w.size(0) % config.fsdp_world_size != 0:
+                mod.__class__ = MXLinear
+                mod.config = config
+                mod._mx_tensor = None
+                mod._tp_mesh = None
+                mod._tp_output_placements = None
+                return mod
+
             weight_dtype = config.get_key_dtype('weight')
             quantizer_fn = partial(
                 dynamic_mx_quant_with_dual_axis,
                 dst_type=weight_dtype,
             )
 
-            w = new_mod.weight
             if isinstance(w, DTensor):
-                local_w = w.to_local()
                 pre_quant = PreQuantWeight(
                     local_w,
                     quantizer_fn,

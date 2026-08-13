@@ -149,6 +149,7 @@ class QuantizeConfig:
     converters: List[str] = None
     enable_fsdp_low_precision_all_gather: bool = True
     fsdp_low_precision_all_gather_mode: str = "on-demand"
+    fsdp_world_size: int = 1
     quant_gmm: bool = False
     gemm_gradient_accumulation_fusion: bool = False
     extra_args: Dict[str, Any] = field(default_factory=dict)  # for future extensibility
@@ -446,6 +447,7 @@ class FSDPTurboConfig:
         self.quantization.quantization_plan = (
             QuantizeConfig() if self.quantization.quantization_plan is None else self.quantization.quantization_plan
         )
+        self.quantization.quantization_plan.fsdp_world_size = self.distributed.fully_shard_parallel_size
 
     def __str__(self):
         import dataclasses as dc
