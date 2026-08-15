@@ -190,6 +190,9 @@ class BaseTrainer:
         """Execute a single training step: forward + backward."""
         outputs = self.model(**batch)
         loss = outputs.loss
+        if loss is None:
+            raise RuntimeError("Model did not return a loss. Make sure the batch contains labels.")
+        loss = loss / self.config.run.gradient_accumulation_steps
         loss.backward()
         aux_loss = outputs.aux_loss if hasattr(outputs, 'aux_loss') else None
         return loss, aux_loss

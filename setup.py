@@ -17,6 +17,7 @@ setup(
     python_requires=">=3.10",
     install_requires=[
         "torch>=2.4.0",
+        "torchvision",
         "pyyaml>=6.0",
         "transformers>=5.2.0",
         "datasets>=2.14.0",

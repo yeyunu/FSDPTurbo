@@ -110,11 +110,6 @@ def get_ulysses_attention_fn(fn: Callable, group: dist.ProcessGroup):
     def wrapper(  # pylint: disable=keyword-arg-before-vararg
         module, query, key, value, attention_mask=None, *args, **kwargs
     ):
-        num_groups = int(module.config.num_attention_heads / module.config.num_key_value_heads)
-        if num_groups > 1:
-            key = torch.repeat_interleave(key, dim=1, repeats=num_groups)
-            value = torch.repeat_interleave(value, dim=1, repeats=num_groups)
-
         def attention_fn(q, k, v, *inner_args, **inner_kwargs):
             return fn(module, q, k, v, *inner_args, **inner_kwargs)
 

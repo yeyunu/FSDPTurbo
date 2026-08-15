@@ -76,3 +76,17 @@ def ulysses_all_to_all(
     if scatter_before_gather:
         return output_swapped.contiguous()
     return output_swapped.transpose(scatter_dim, gather_dim).contiguous()
+
+
+def get_ulysses_context():
+    from fsdp_turbo.distributed.parallel_state import get_parallel_state
+
+    parallel_state = get_parallel_state()
+    ulysses_size = parallel_state.get_ulysses_group_size()
+    if ulysses_size <= 1:
+        return None, 0, 1
+    return (
+        parallel_state.get_ulysses_group(),
+        parallel_state.get_ulysses_rank(),
+        ulysses_size,
+    )

@@ -18,6 +18,8 @@ class ModelConfig:
     model_name_or_path: str = ""
     tokenizer_name_or_path: str = ""
     torch_dtype: torch.dtype = torch.bfloat16
+    # Optional demo/debug knob for building a shallower language model.
+    num_hidden_layers: Optional[int] = None
 
 
 @dataclass

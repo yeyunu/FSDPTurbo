@@ -1,0 +1,134 @@
+# ============================================================
+# Qwen3.5-27B Dense Training Configuration
+# ============================================================
+
+# --- Model Configuration ---
+model:
+  model_name_or_path: "Qwen/Qwen3.5-27B"
+  tokenizer_name_or_path: "Qwen/Qwen3.5-27B"
+  torch_dtype: "bf16"
+
+# --- Optimizer Configuration ---
+optimizer:
+  optimizer_type: "AdamW"
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1e-8
+  lr: 3.0e-4
+  warmup_ratio: 0.03
+  lr_scheduler_type: "CosineAnnealingLR"
+  min_lr: 3.0e-5
+  clip_grad: 1.0
+  clip_grad_norm_type: 2.0
+
+# --- Run Configuration ---
+run:
+  seed: 42
+  max_steps: -1
+  num_train_epochs: 1
+  gradient_accumulation_steps: 1
+  logging_steps: 1
+  profile:
+    enabled: false
+    wait_steps: 0
+    warmup_steps: 0
+    active_steps: 10
+    repeat: 1
+    skip_first: 0
+    output_dir: "./profile"
+    record_shapes: false
+    profile_memory: false
+    with_stack: false
+
+# --- Checkpoint Configuration ---
+checkpoint:
+  output_dir: "./output/qwen3_5_27b"
+  save_steps: 500
+  strict: true
+  save_optim: true
+  load_optim: true
+  resume_from_checkpoint: null
+
+# --- Data Configuration ---
+data:
+  dataset_path: "./data/multimodal_data.json"
+  dataset_config: null
+  text_column: "text"
+  image_column: "images"
+  conversation_column: "messages"
+  split: "train"
+  batch_size: 1
+  max_seq_length: 2048
+  num_workers: 8
+  pin_memory: true
+  shuffle: false
+  is_multimodal: true
+
+# --- Distributed Configuration ---
+distributed:
+  fully_shard_parallel_size: 8
+  tensor_parallel_size: 1
+  ulysses_parallel_size: 2
+
+  # --- FSDP Plan ---
+  fsdp_plan:
+    ignored_modules: []
+    apply_modules:
+      model.visual.blocks.{*}:
+        {}
+      model.visual.patch_embed:
+        {}
+      model.visual.pos_embed:
+        {}
+      model.language_model.layers.{*}:
+        {}
+      model.language_model.embed_tokens:
+        {}
+      lm_head:
+        {}
+    param_dtype: "bf16"
+    reduce_dtype: "fp32"
+    output_dtype: "bf16"
+    cast_forward_inputs: true
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+    hook_modules:
+      - model.language_model.layers.{*}
+    fsdp_implementation: "native"
+
+  # --- Tensor Parallel Plan ---
+  tp_plan:
+    colwise_parallel: ['*.q_proj', '*.k_proj', '*.v_proj']
+    rowwise_parallel: ['*.o_proj']
+    sequence_parallel: []
+
+  # --- Context Parallel Plan ---
+  cp_plan:
+    ulysses_function_patches:
+      - target_functions:
+          - transformers.models.qwen3_5.modeling_qwen3_5.eager_attention_forward
+        type: full_attention
+      - target_functions:
+          - transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5GatedDeltaNet.forward
+        type: gated_delta_net
+    loss_function_patches:
+      - target_functions:
+          - transformers.loss.loss_utils.ForCausalLMLoss
+        type: causal_lm_loss
+
+# --- Module Patch Plan ---
+module_patches:
+  - target: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5Model.forward
+    replacement: fsdp_turbo.models.qwen.qwen3_5.qwen3_5_model_forward     # enable for ulysses cp for now
+
+# --- Memory Configuration ---
+memory:
+  recompute: true
+  recompute_plan:
+    - model.language_model.layers.{*}
+    - model.visual.blocks.{*}
+
+# --- Quantization Configuration ---
+quantization:
+  quantization_plan: null

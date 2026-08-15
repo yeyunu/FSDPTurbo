@@ -11,12 +11,21 @@ logger = logging.getLogger(__name__)
 
 CP_PATCHES_ATTR = "_fsdp_turbo_cp_patches"
 CAUSAL_LM_LOSS = "causal_lm_loss"
+GATED_DELTA_NET = "gated_delta_net"
 
 
-def apply_function_patch_specs(specs, group, patch_types, label):
-    """Build and install direct replacements for configured CP patch specs."""
+def apply_function_patch_specs(specs, group, patch_types, label, model=None):
+    """Build and install direct replacements for configured CP patch specs.
+
+    ``type: gated_delta_net`` specs are class-method patches deferred to
+    :func:`apply_gdn_patches` (they require ``model``); all other types are
+    installed as module-level function wrappers via ``patch_types``.
+    """
     for spec in specs:
         patch_type = spec["type"]
+        if patch_type == GATED_DELTA_NET:
+            apply_gdn_patches(model, spec, label)
+            continue
         if patch_type not in patch_types:
             raise ValueError(f"Unknown {label} function patch type {patch_type!r}.")
         wrapper = patch_types[patch_type]
@@ -46,6 +55,26 @@ def apply_cp_loss_patches(specs, group):
         {CAUSAL_LM_LOSS: get_cp_causal_lm_loss_fn},
         label="CP",
     )
+
+
+def apply_gdn_patches(model, spec, label):
+    """Install the GDN common-class forward on configured GatedDeltaNet layers.
+
+    Unlike the module-level function wrapping used by the attention/loss
+    patches, GDN targets are ``module.Class.member`` paths patched on matching
+    model instances via the generic class-member patch path.
+    """
+    if model is None:
+        raise RuntimeError(f"[Context Parallel/{label}] GDN patches require a model.")
+
+    from fsdp_turbo.modules.gated_delta_net import GatedDeltaNet
+    from fsdp_turbo.utils.patch import patch_model_members
+
+    for target in spec["target_functions"]:
+        matched = patch_model_members(model, target, GatedDeltaNet.forward)
+        if not matched:
+            raise RuntimeError(f"[Context Parallel/{label}] GDN patch target did not match any module: {target!r}.")
+        print_rank(logger.info, f"[Context Parallel/{label}] Patched gdn: {target}")
 
 
 def _replace_transformers_registry_references(original_fn, wrapped_fn):

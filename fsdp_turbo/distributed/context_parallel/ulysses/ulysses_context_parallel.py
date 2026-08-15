@@ -16,11 +16,18 @@ _ULYSSES_FUNCTION_PATCH_TYPES = {
 
 
 def ulysses_context_parallelize_modules(model, ulysses_group, cp_plan):
-    """Install Ulysses attention wrappers and return ``model`` unchanged."""
+    """Install Ulysses attention wrappers and the GDN common-class forward.
+
+    GDN specs (``type: gated_delta_net``) live alongside attention specs in
+    ``ulysses_function_patches`` but are class-method patches; they are routed
+    to :func:`apply_gdn_patches` inside :func:`apply_function_patch_specs`
+    (hence ``model`` is forwarded).
+    """
     apply_function_patch_specs(
         cp_plan.ulysses_function_patches,
         ulysses_group,
         _ULYSSES_FUNCTION_PATCH_TYPES,
         label="Ulysses",
+        model=model,
     )
     return model
