@@ -2,6 +2,8 @@
 # ============================================================
 # Qwen3.5 27B Dense Distributed Training Launch Script
 # ============================================================
+# dependency: GPU torch==2.10.0, torchvision==0.25.0, transformers==5.15.0
+# dependency: NPU torch==2.10.0, torch_npu==2.10.0, torchvision==0.25.0, transformers==5.15.0
 
 set -e
 

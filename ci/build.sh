@@ -11,6 +11,7 @@ BASE_IMAGE=""
 PYTHON_VERSION="3.11"
 TORCH_VERSION="2.10"
 TORCH_NPU_VERSION="2.10"
+TORCHVISION_VERSION="0.25.0"
 IMAGE_NAME=""
 NO_CACHE=""
 CLEANUP_ON_FAIL=false
@@ -50,6 +51,7 @@ Options:
     --python-version VER      Python tag in the CANN base image (default: 3.11)
     --torch-version VER       PyTorch version (default: 2.10)
     --torch-npu-version VER   torch_npu version (default: 2.10)
+    --torchvision-version VER torchvision version (default: 0.25.0)
     --cleanup-on-fail         Clean dangling images/containers if build fails
     -h, --help                Show help
 
@@ -97,6 +99,7 @@ while [[ $# -gt 0 ]]; do
         --python-version)     PYTHON_VERSION="$2"; shift 2 ;;
         --torch-version)      TORCH_VERSION="$2"; shift 2 ;;
         --torch-npu-version)  TORCH_NPU_VERSION="$2"; shift 2 ;;
+        --torchvision-version) TORCHVISION_VERSION="$2"; shift 2 ;;
         --cleanup-on-fail)    CLEANUP_ON_FAIL=true; shift ;;
         -h|--help)            show_help; exit 0 ;;
         *)                    echo "Unknown argument: $1"; show_help; exit 1 ;;
@@ -161,6 +164,7 @@ BUILD_ARGS="$BUILD_ARGS --build-arg NPU_TYPE=${NPU_TYPE_LOWER}"
 BUILD_ARGS="$BUILD_ARGS --build-arg PYTHON_VERSION=${PYTHON_VERSION}"
 BUILD_ARGS="$BUILD_ARGS --build-arg TORCH_VERSION=${TORCH_VERSION}"
 BUILD_ARGS="$BUILD_ARGS --build-arg TORCH_NPU_VERSION=${TORCH_NPU_VERSION}"
+BUILD_ARGS="$BUILD_ARGS --build-arg TORCHVISION_VERSION=${TORCHVISION_VERSION}"
 
 if [ -n "$BASE_IMAGE" ]; then
     BUILD_ARGS="$BUILD_ARGS --build-arg BASE_IMAGE=${BASE_IMAGE}"
@@ -184,6 +188,7 @@ fi
 echo "Python Version:     ${PYTHON_VERSION}"
 echo "PyTorch Version:    ${TORCH_VERSION}"
 echo "torch_npu Version:  ${TORCH_NPU_VERSION}"
+echo "torchvision Version: ${TORCHVISION_VERSION}"
 echo "No Cache:           ${NO_CACHE:-No}"
 echo "=========================================="
 

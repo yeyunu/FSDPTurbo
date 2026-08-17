@@ -21,6 +21,7 @@ SHELL ["/bin/bash", "-c"]
 ARG OS_FAMILY=ubuntu
 ARG TORCH_VERSION=2.10
 ARG TORCH_NPU_VERSION=2.10
+ARG TORCHVISION_VERSION=0.25.0
 
 # Prepare required system dependencies
 COPY configure_repo.sh /tmp/configure_repo.sh
@@ -90,7 +91,7 @@ RUN ARCH=$(uname -m) && \
     if [ -f /usr/local/Ascend/nnal/atb/set_env.sh ]; then \
         source /usr/local/Ascend/nnal/atb/set_env.sh; \
     fi && \
-    pip install torch==${TORCH_VERSION} torch_npu==${TORCH_NPU_VERSION} torchvision==0.25.0 && \
+    pip install torch==${TORCH_VERSION} torch_npu==${TORCH_NPU_VERSION} torchvision==${TORCHVISION_VERSION} && \
     pip install pyyaml>=6.0 transformers>=5.2.0 datasets>=2.14.0 pillow>=9.0.0 && \
     pip install fla-core flash-linear-attention && \
     rm -rf /tmp/* /var/tmp/* && \
