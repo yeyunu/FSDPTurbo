@@ -330,10 +330,10 @@ class BaseTrainer:
             print_rank(logger.warning, "Model is None, skipping optimizer build.")
             return None
         print_rank(logger.info, "> Building Optimizer...")
+        from fsdp_turbo.quantization.cache import hook_optimizer_step
         from fsdp_turbo.training.factories import OptimizerFactory
 
-        print(self.config.optimizer.lr, type(self.config.optimizer.lr))
-        return OptimizerFactory.create(
+        optimizer = OptimizerFactory.create(
             self.config.optimizer.optimizer_type,
             self.model.parameters(),
             lr=self.config.optimizer.lr,
@@ -341,6 +341,8 @@ class BaseTrainer:
             betas=(self.config.optimizer.adam_beta1, self.config.optimizer.adam_beta2),
             eps=self.config.optimizer.adam_epsilon,
         )
+        hook_optimizer_step(self.model, optimizer)
+        return optimizer
 
     def build_scheduler(self):
         """Build LR scheduler using SchedulerFactory."""

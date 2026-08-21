@@ -68,7 +68,7 @@ class W8A16GMM(torch.nn.Module):
     def num_local_experts(self, value):
         self._num_local_experts = value
 
-    def forward(self, hidden_states, routing_weights=None, selected_experts=None):
+    def forward(self, hidden_states, selected_experts=None, routing_weights=None):
         from fsdp_turbo.ops.moe import permute, unpermute
 
         permuted_hidden_states, row_ids_map = permute(hidden_states, selected_experts.to(torch.int32))

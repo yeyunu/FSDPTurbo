@@ -19,16 +19,27 @@ logger = logging.getLogger(__name__)
 
 
 def expert_fully_shard_modules(
-    model: torch.nn.Module, efsdp_mesh, ep_plan: EPPlanConfig, fsdp_plan: FSDPPlanConfig
+    model: torch.nn.Module,
+    efsdp_mesh,
+    ep_plan: EPPlanConfig,
+    fsdp_plan: FSDPPlanConfig,
+    enable_lp_all_gather: bool = False,
 ) -> torch.nn.Module:
     efsdp_modules = get_efsdp_modules(model, ep_plan)
     efsdp_hook_modules = get_fsdp_hook_modules(model, fsdp_plan)
     offload_policy = get_offload_policy(fsdp_plan)
+
+    # LP-AG gathers weight+scale together (torch copy-out needs dim-0); otherwise keep the historical dim-1 placement for 2D+.
+    def shard_placement_fn(x):
+        if enable_lp_all_gather:
+            return Shard(0)
+        return Shard(1) if x.dim() > 1 else Shard(0)
+
     config = {
         'mesh': efsdp_mesh,
         'mp_policy': MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
         'offload_policy': offload_policy,
-        'shard_placement_fn': lambda x: Shard(1) if x.dim() > 1 else Shard(0),
+        'shard_placement_fn': shard_placement_fn,
     }
 
     apply_hccl_premul_sum_patch()

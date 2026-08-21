@@ -1,3 +1,4 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 from typing import Optional, Dict, Any
 
@@ -15,21 +16,24 @@ class PostQuantWeight(torch.Tensor):
     _weight_bwd: torch.Tensor
     _scale_bwd: torch.Tensor
     _orig_dtype: torch.dtype
+    _source: torch.Tensor
     __slots__ = [
         "_weight_fwd",
         "_scale_fwd",
         "_weight_bwd",
         "_scale_bwd",
         "_orig_dtype",
+        "_source",
     ]
 
     def __new__(
-            cls,
-            weight_fwd: Optional[torch.Tensor],
-            scale_fwd: Optional[torch.Tensor],
-            weight_bwd: Optional[torch.Tensor],
-            scale_bwd: Optional[torch.Tensor],
-            orig_dtype: torch.dtype,
+        cls,
+        weight_fwd: Optional[torch.Tensor],
+        scale_fwd: Optional[torch.Tensor],
+        weight_bwd: Optional[torch.Tensor],
+        scale_bwd: Optional[torch.Tensor],
+        orig_dtype: torch.dtype,
+        source: Optional[torch.Tensor] = None,
     ):
         reference_tensor = weight_fwd if weight_fwd is not None else weight_bwd
         if reference_tensor is None:
@@ -51,6 +55,7 @@ class PostQuantWeight(torch.Tensor):
         self._weight_bwd = weight_bwd
         self._scale_bwd = scale_bwd
         self._orig_dtype = orig_dtype
+        self._source = source
         return self
 
     def __repr__(self):
@@ -135,4 +140,5 @@ def _float8_desugar_op(aten_op, args, kwargs=None):
         new_data_bwd,
         new_scale_bwd,
         args[0]._orig_dtype,
+        source=args[0],
     )

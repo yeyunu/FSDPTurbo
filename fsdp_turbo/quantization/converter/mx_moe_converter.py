@@ -5,7 +5,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import torch.nn as nn
+from torch import nn
 
 from fsdp_turbo.quantization.mxfp8_config import get_mxfp8linear_config
 from fsdp_turbo.quantization.converter.model_converter import register_model_converter
@@ -22,7 +22,6 @@ class MXMoeConverter:
 
     def __init__(self, config: QuantizeConfig):
         self.config = get_mxfp8linear_config(config)
-        self.config.enable_fsdp_low_precision_all_gather = False
 
     def convert(self, model: nn.Module):
         """Converts MoE expert modules in the model to MXFP8GMM.
@@ -31,6 +30,7 @@ class MXMoeConverter:
         """
         from fsdp_turbo.quantization.quantize import quantize_
         from fsdp_turbo.quantization.mx_formats.mx_gmm import _mx_gmm_transform
+
         quantize_(
             model,
             config=self.config,

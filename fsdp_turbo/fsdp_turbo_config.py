@@ -450,6 +450,9 @@ class FSDPTurboConfig:
             QuantizeConfig() if self.quantization.quantization_plan is None else self.quantization.quantization_plan
         )
         self.quantization.quantization_plan.fsdp_world_size = self.distributed.fully_shard_parallel_size
+        if not (self.quantization.quantization_plan.converters or self.quantization.quantization_plan.quant_recipe):
+            # LP all-gather only applies when quantization is actually enabled.
+            self.quantization.quantization_plan.enable_fsdp_low_precision_all_gather = False
 
     def __str__(self):
         import dataclasses as dc

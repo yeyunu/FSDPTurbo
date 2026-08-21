@@ -34,7 +34,7 @@ class mx_mm(torch.autograd.Function):
         ctx.mx_tensor = mx_tensor
         # input @ weight_t = output
         ctx.input_orig_shape = input_hp.shape
-        input_hp = input_hp.view(-1, input_hp.size(-1))
+        input_hp = input_hp.reshape(-1, input_hp.size(-1))
 
         # 低精量化
         input_mx = mx_tensor.to_mxfp8(input_hp, 'inputs')
@@ -84,7 +84,7 @@ class mx_mm(torch.autograd.Function):
         mx_tensor = ctx.mx_tensor
         ori_dtype = input_mx.ori_dtype
         grad_orig_shape = grad_output_hp.shape
-        grad_output_hp = grad_output_hp.view(-1, grad_output_hp.size(-1))
+        grad_output_hp = grad_output_hp.reshape(-1, grad_output_hp.size(-1))
 
         # 低精量化
         grads_mx = mx_tensor.to_mxfp8(grad_output_hp, 'grads')

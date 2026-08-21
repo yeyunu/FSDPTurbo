@@ -27,7 +27,13 @@ def weight_quant_gmm(weight: torch.Tensor, dst_type, new_shape: tuple) -> tuple:
         (weight_fwd, weight_scale_fwd, weight_bwd, weight_scale_bwd)
     """
     original_shape = weight.shape
-    weight = weight.reshape(new_shape)
+    num_experts = weight.numel() // (new_shape[1] * new_shape[2])
+    if weight.dim() == 2:
+        rows_per_expert = weight.shape[0] // num_experts
+        weight = weight.view(num_experts, rows_per_expert, -1)
+    else:
+        weight = weight.view(num_experts, weight.shape[1], weight.shape[2])
+    weight = weight.transpose(1, 2).contiguous()  # [E, out, in] -> [E, in, out]
     weight_bwd, weight_scale_bwd, weight_fwd, weight_scale_fwd = dynamic_mx_quant_with_dual_axis(
         weight, dst_type=dst_type
     )
@@ -78,14 +84,12 @@ def mx_quant_group_gemm(
 
     if is_post_quant:
         pq = weight_unwrapped
-        if weight_transposed:
-            weight_fwd = pq._weight_fwd.view(num_experts, -1, K).transpose(1, 2).contiguous()
-            weight_bwd = pq._weight_bwd.view(num_experts, -1, K).contiguous()
-        else:
-            weight_fwd = pq._weight_fwd.view(num_experts, K, -1).contiguous()
-            weight_bwd = pq._weight_bwd.view(num_experts, K, -1).transpose(1, 2).contiguous()
+        weight_fwd = pq._weight_fwd
+        weight_bwd = None
         weight_scale_fwd = pq._scale_fwd
-        weight_scale_bwd = pq._scale_bwd.transpose(1, 2).contiguous()
+        weight_scale_bwd = None
+        if weight_fwd is not None:
+            weight_fwd = weight_fwd.view(num_experts, K, -1).contiguous()
     else:
         if weight_transposed:
             weight_3d = weight_unwrapped.view(num_experts, -1, K).transpose(1, 2).contiguous()
@@ -171,7 +175,7 @@ class MXFP8GMM(torch.nn.Module):
     def num_local_experts(self, value):
         self._num_local_experts = value
 
-    def forward(self, hidden_states, routing_weights=None, selected_experts=None):
+    def forward(self, hidden_states, selected_experts=None, routing_weights=None):
         """Full MoE forward with FP8 quantization (non-EP path).
 
         Args:
@@ -221,9 +225,6 @@ class MXFP8GMM(torch.nn.Module):
         Returns:
             Expert output before AllToAll combine.
         """
-        gate_up_proj = self.gate_up_proj.to_local() if hasattr(self.gate_up_proj, 'to_local') else self.gate_up_proj
-        down_proj = self.down_proj.to_local() if hasattr(self.down_proj, 'to_local') else self.down_proj
-
         if isinstance(tokens_per_expert, list):
             group_list = torch.tensor(tokens_per_expert, device=hidden_states.device, dtype=torch.int64)
         else:
@@ -235,7 +236,7 @@ class MXFP8GMM(torch.nn.Module):
 
         fc1_output = mx_quant_group_gemm(
             x=hidden_states,
-            weight=gate_up_proj,
+            weight=self.gate_up_proj,
             group_list=group_list_cumsum,
             config=quant_config,
             grad_enabled=torch.is_grad_enabled(),
@@ -245,7 +246,7 @@ class MXFP8GMM(torch.nn.Module):
 
         fc2_out = mx_quant_group_gemm(
             x=fc1_activation,
-            weight=down_proj,
+            weight=self.down_proj,
             group_list=group_list_cumsum,
             config=quant_config,
             grad_enabled=torch.is_grad_enabled(),

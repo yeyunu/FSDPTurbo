@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
+import logging
 import re
 from typing import Callable, Dict, Type
 import torch
@@ -12,7 +13,13 @@ from torch import nn
 
 from fsdp_turbo.ops.moe import grouped_matmul
 from fsdp_turbo.quantization.mxfp8_config import QuantBaseConfig
+from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.str_match import module_name_match
+
+logger = logging.getLogger(__name__)
+
+# Per-shard LP-AG quant breaks the mx scale grid (wants ceil(K/64)) for out not aligned to 64*ws -> bf16
+_SMALL_LINEAR_DIM = 64
 
 
 _QUANTIZE_CONFIG_HANDLER: Dict[
@@ -107,9 +114,18 @@ def resolve_expert_weights(module):
 
 
 def module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
-    return isinstance(mod, nn.Linear) and _apply_modules_match(
-        fqn, config, 'mxfp8_apply_modules', 'mxfp8_ignored_modules'
-    )
+    if not isinstance(mod, nn.Linear):
+        return False
+    if not _apply_modules_match(fqn, config, 'mxfp8_apply_modules', 'mxfp8_ignored_modules'):
+        return False
+    if mod.out_features < _SMALL_LINEAR_DIM or mod.in_features < _SMALL_LINEAR_DIM:
+        print_rank(
+            logger.warning,
+            f"[MXFP8] skip quantizing {fqn}: shape=({mod.in_features}, {mod.out_features}) "
+            f"has a dim < {_SMALL_LINEAR_DIM}, keeping bf16",
+        )
+        return False
+    return True
 
 
 def w8a16_module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:

@@ -81,6 +81,7 @@ class FSDPTurbo(torch.nn.Module):
                 self.parallel_state.get_device_mesh('edp_efsdp'),
                 self.config.distributed.ep_plan,
                 self.config.distributed.fsdp_plan,
+                enable_lp_all_gather=self.config.quantization.quantization_plan.enable_fsdp_low_precision_all_gather,
             )
 
     def apply_module_patches(self):

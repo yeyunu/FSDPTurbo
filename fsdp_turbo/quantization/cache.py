@@ -1,4 +1,6 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+import types
+import warnings
 from typing import Callable, Any
 
 import torch
@@ -16,6 +18,13 @@ def cached_weight_quant(
     **kwargs,
 ) -> Any:
     global _num_quantized, _num_cache_hits
+
+    if not _opt_hooked:
+        warnings.warn(
+            "optimizer.step is not hooked, quantizer will be called without caching, "
+            "which will impair the training performance"
+        )
+        return quantizer(weight, *args, **kwargs)
 
     key = weight.untyped_storage().data_ptr()
 
@@ -50,9 +59,9 @@ def hook_optimizer_step(model, optimizer) -> None:
 
     original_step = optimizer.step
 
-    def step_with_cache_clear(*args, **kwargs):
+    def step_with_cache_clear(self, *args, **kwargs):
         clear_weight_cache()
         return original_step(*args, **kwargs)
 
-    optimizer.step = step_with_cache_clear
+    optimizer.step = types.MethodType(step_with_cache_clear, optimizer)
     _opt_hooked = True

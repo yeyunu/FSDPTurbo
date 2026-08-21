@@ -1,6 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
-import logging
 from typing import Any, Optional, Tuple, Callable
 import warnings
 
@@ -11,8 +10,6 @@ from torch.distributed.tensor import DTensor
 
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
 from fsdp_turbo.quantization.cache import cached_weight_quant
-
-logger = logging.getLogger(__name__)
 
 
 def _get_module_fsdp_state(module):
@@ -41,6 +38,14 @@ def _get_module_fsdp_state(module):
 _npu_dtype_cast = getattr(getattr(torch.ops, "npu", None), "_npu_dtype_cast", None)
 _npu_ops = {_npu_dtype_cast.default} if _npu_dtype_cast is not None else set()
 
+# foreach AdamW ops are benign (in-place updates / m-v state init):
+# silence their per-step noise, keep warnings for other non-preserved ops.
+_ops_quiet_no_preserve = {
+    torch.ops.aten.zeros_like.default,
+    torch.ops.aten._foreach_mul_.Scalar,
+    torch.ops.aten._foreach_addcdiv_.ScalarList,
+}
+
 _ops_to_preserve_subclass = {
     torch.ops.aten.empty_like.default,
     torch.ops.aten.new_zeros.default,
@@ -53,6 +58,7 @@ _ops_to_preserve_subclass = {
     torch.ops.aten.split.Tensor,
     torch.ops.aten.clone.default,
     torch.ops.aten.expand.default,
+    torch.ops.c10d.scatter_.default,
 } | _npu_ops
 
 
@@ -126,10 +132,11 @@ class PreQuantWeight(torch.Tensor):
         args, kwargs = pytree.tree_map_only(PreQuantWeight, unwrap, (args, kwargs or {}))
         out = func(*args, **kwargs)
         if func not in _ops_to_preserve_subclass:
-            warnings.warn(
-                f"PreQuantWeight type is not preserved for Operator {func}, "
-                f"enable_fsdp_low_precision_all_gather is disabled"
-            )
+            if func not in _ops_quiet_no_preserve:
+                warnings.warn(
+                    f"PreQuantWeight type is not preserved for Operator {func}, "
+                    f"enable_fsdp_low_precision_all_gather is disabled"
+                )
             return out
         return pytree.tree_map_only(
             torch.Tensor,
@@ -229,7 +236,7 @@ class PreQuantWeight(torch.Tensor):
 
         if out is not None:
             if isinstance(out, DTensor):
-                out = out.to_local()
+                out = out._local_tensor
             if not isinstance(out, PostQuantWeight):
                 raise TypeError(f"Expected PostQuantWeight, but got {type(out).__name__}")
 

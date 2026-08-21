@@ -18,7 +18,7 @@ class MXTensor:
         except (AttributeError, TypeError):
             pass
         accelerator = torch.accelerator.current_accelerator()
-        if accelerator is not None and data_hf.device != accelerator:
+        if accelerator is not None and data_hf.device.type != accelerator.type:
             data_hf = data_hf.to(accelerator)
         ori_dtype = data_hf.dtype
 
