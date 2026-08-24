@@ -110,19 +110,40 @@ def get_ulysses_attention_fn(fn: Callable, group: dist.ProcessGroup):
     def wrapper(  # pylint: disable=keyword-arg-before-vararg
         module, query, key, value, attention_mask=None, *args, **kwargs
     ):
+        config = module.config
+        num_key_value_groups = getattr(config, "num_key_value_groups", None)
+
+        # Expand GQA KV heads when they cannot be split across the Ulysses group;
+        # neutralize the downstream repeat_kv (module.num_key_value_groups = 1 is a no-op).
+        kv_heads = getattr(config, "num_key_value_heads", None)
+        ulysses_size = dist.get_world_size(group)
+        saved_kv_groups = None
+        if kv_heads is not None and kv_heads % ulysses_size != 0:
+            kv_expand_repeats = int(config.num_attention_heads / kv_heads)
+            key = torch.repeat_interleave(key, dim=1, repeats=kv_expand_repeats)
+            value = torch.repeat_interleave(value, dim=1, repeats=kv_expand_repeats)
+            if hasattr(module, "num_key_value_groups"):
+                saved_kv_groups = module.num_key_value_groups
+                module.num_key_value_groups = 1
+
         def attention_fn(q, k, v, *inner_args, **inner_kwargs):
             return fn(module, q, k, v, *inner_args, **inner_kwargs)
 
-        return ulysses_context_parallel_attention(
-            attention_fn,
-            query,
-            key,
-            value,
-            *args,
-            attention_mask=attention_mask,
-            ulysses_group=group,
-            **kwargs,
-        )
+        try:
+            return ulysses_context_parallel_attention(
+                attention_fn,
+                query,
+                key,
+                value,
+                *args,
+                attention_mask=attention_mask,
+                ulysses_group=group,
+                num_key_value_groups=num_key_value_groups,
+                **kwargs,
+            )
+        finally:
+            if saved_kv_groups is not None:
+                module.num_key_value_groups = saved_kv_groups
 
     return wrapper
 
