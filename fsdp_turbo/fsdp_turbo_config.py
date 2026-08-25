@@ -64,6 +64,7 @@ class DataConfig:
     shuffle: bool = True
     is_multimodal: bool = False
     image_column: str = "images"
+    media_key: str = "images"
     conversation_column: str = "messages"
 
 
@@ -243,6 +244,7 @@ class FSDPTurboConfig:
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
 
     def __post_init__(self):
+        self.validate_data_config()
         self.validate_tp_config()
         self.validate_cp_config()
         self.validate_module_patches()
@@ -251,6 +253,19 @@ class FSDPTurboConfig:
         self.validate_chunk_batch_config()
         self.validate_quantization_config()
         self.validate_fsdp_config()
+
+    def validate_data_config(self):
+        """Validate and normalize dataloader configuration."""
+        supported_media_keys = {"images", "medias"}
+        if self.data.media_key not in supported_media_keys:
+            raise ValueError(
+                f"data.media_key must be one of {sorted(supported_media_keys)}, got {self.data.media_key!r}."
+            )
+        if self.data.is_multimodal:
+            if not isinstance(self.data.image_column, str) or not self.data.image_column:
+                raise ValueError("data.image_column must be a non-empty string for multimodal data.")
+            if not isinstance(self.data.conversation_column, str) or not self.data.conversation_column:
+                raise ValueError("data.conversation_column must be a non-empty string for multimodal data.")
 
     def validate_fsdp_config(self):
         '''fully shard plan

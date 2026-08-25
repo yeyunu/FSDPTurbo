@@ -7,7 +7,7 @@ from unittest import mock
 import torch
 from torch.utils.data import Dataset
 
-from fsdp_turbo.fsdp_turbo_config import DataConfig
+from fsdp_turbo.fsdp_turbo_config import DataConfig, FSDPTurboConfig
 from fsdp_turbo.training.dataloader import _MultimodalCollator, _process_multimodal_dataset, build_dataloader
 
 
@@ -57,11 +57,21 @@ class _Processor:
 
 class DataloaderTests(unittest.TestCase):
     def test_multimodal_config_has_public_schema(self):
-        config = DataConfig(is_multimodal=True, image_column="pictures", conversation_column="dialogue")
+        config = DataConfig(
+            is_multimodal=True,
+            image_column="pictures",
+            media_key="medias",
+            conversation_column="dialogue",
+        )
 
         self.assertTrue(config.is_multimodal)
         self.assertEqual(config.image_column, "pictures")
+        self.assertEqual(config.media_key, "medias")
         self.assertEqual(config.conversation_column, "dialogue")
+
+    def test_multimodal_config_rejects_unknown_media_key(self):
+        with self.assertRaisesRegex(ValueError, "data.media_key"):
+            FSDPTurboConfig(data=DataConfig(is_multimodal=True, media_key="media"))
 
     def test_multimodal_dataset_uses_configured_columns_and_chat_template(self):
         processor = _Processor()
@@ -108,6 +118,30 @@ class DataloaderTests(unittest.TestCase):
 
         self.assertEqual(len(processor.calls[0]["images"]), 1)
         torch.testing.assert_close(batch["labels"], torch.tensor([[-100, 4, -100]]))
+
+    def test_multimodal_collator_wraps_kimi_medias(self):
+        processor = _Processor()
+        collator = _MultimodalCollator(processor, "pictures", media_key="medias")
+        image_module = types.ModuleType("PIL.Image")
+
+        class _Image:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def convert(self, _mode):
+                return self
+
+        image_module.open = lambda _path: _Image()
+        pil_module = types.ModuleType("PIL")
+        pil_module.Image = image_module
+        with mock.patch.dict(sys.modules, {"PIL": pil_module, "PIL.Image": image_module}):
+            collator([{"text": "prompt", "pictures": ["image.jpg"]}])
+
+        self.assertEqual(processor.calls[0]["medias"][0]["type"], "image")
+        self.assertIsInstance(processor.calls[0]["medias"][0]["image"], _Image)
 
     def test_multimodal_dataloader_requires_processor(self):
         datasets_module = types.ModuleType("datasets")

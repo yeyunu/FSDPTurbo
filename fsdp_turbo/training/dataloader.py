@@ -53,7 +53,7 @@ def build_dataloader(data_cfg, tokenizer=None, processor=None):
             raise ValueError("A processor is required when data.is_multimodal is enabled.")
         dataset = load_dataset("json", data_files=data_cfg.dataset_path, split=data_cfg.split)
         dataset = _process_multimodal_dataset(dataset, data_cfg, processor)
-        collate_fn = _MultimodalCollator(processor, data_cfg.image_column)
+        collate_fn = _MultimodalCollator(processor, data_cfg.image_column, data_cfg.media_key)
     else:
         dataset = load_dataset(data_cfg.dataset_path, data_cfg.dataset_config, split=data_cfg.split)
         dataset = _process_text_dataset(dataset, data_cfg, tokenizer) if tokenizer is not None else dataset
@@ -148,9 +148,10 @@ def _process_multimodal_dataset(dataset, data_cfg, processor):
 
 
 class _MultimodalCollator:
-    def __init__(self, processor, image_column):
+    def __init__(self, processor, image_column, media_key="images"):
         self.processor = processor
         self.image_column = image_column
+        self.media_key = media_key
 
     def __call__(self, features):
         from PIL import Image
@@ -169,7 +170,16 @@ class _MultimodalCollator:
             "return_tensors": "pt",
         }
         if images:
-            processor_kwargs["images"] = images
+            if self.media_key == "medias":
+                medias = [
+                    image
+                    if isinstance(image, dict) and image.get("type") == "image"
+                    else {"type": "image", "image": image}
+                    for image in images
+                ]
+                processor_kwargs["medias"] = medias
+            else:
+                processor_kwargs["images"] = images
 
         batch = self.processor(**processor_kwargs)
         labels = batch["input_ids"].clone()
@@ -181,5 +191,8 @@ class _MultimodalCollator:
         pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
         if pad_token_id is not None:
             labels[labels == pad_token_id] = -100
+        media_token_id = getattr(self.processor.tokenizer, "media_placehodler_token_id", None)
+        if media_token_id is not None:
+            labels[labels == media_token_id] = -100
         batch["labels"] = labels
         return batch

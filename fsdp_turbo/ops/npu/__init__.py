@@ -1,3 +1,4 @@
+from fsdp_turbo.ops.npu.causal_conv1d import causal_conv1d_npu, causal_conv1d_update_npu
 from fsdp_turbo.ops.npu.grouped_matmul import grouped_matmul_npu
 from fsdp_turbo.ops.npu.grouped_matmul_mc2 import all2all_grouped_matmul_npu, grouped_matmul_all2all_npu
 from fsdp_turbo.ops.npu.mx_grouped_matmul import mx_grouped_matmul_npu
@@ -13,6 +14,8 @@ from fsdp_turbo.ops.npu.rms_norm import rms_norm_npu
 from fsdp_turbo.ops.npu.sinkhorn import hc_split_sinkhorn_npu
 
 __all__ = [
+    'causal_conv1d_npu',
+    'causal_conv1d_update_npu',
     'grouped_matmul_npu',
     'all2all_grouped_matmul_npu',
     'grouped_matmul_all2all_npu',
