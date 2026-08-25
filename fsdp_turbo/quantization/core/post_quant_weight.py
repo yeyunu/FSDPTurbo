@@ -59,7 +59,23 @@ class PostQuantWeight(torch.Tensor):
         return self
 
     def __repr__(self):
-        return f"PostQuantWeight(fwd_dtype={self._weight_fwd.dtype})"
+        reference = self._weight_fwd if self._weight_fwd is not None else self._weight_bwd
+        return f"PostQuantWeight(dtype={reference.dtype})"
+
+    def get_forward_pair(self):
+        if self._weight_fwd is None or self._scale_fwd is None:
+            raise RuntimeError(
+                "MXFP8 forward weight is not resident. Check the FSDP training state and recompute-aware weight phase."
+            )
+        return self._weight_fwd, self._scale_fwd
+
+    def get_backward_pair(self):
+        if self._weight_bwd is None or self._scale_bwd is None:
+            raise RuntimeError(
+                "MXFP8 backward weight is not resident. Check the FSDP training state "
+                "and low-precision all-gather mode."
+            )
+        return self._weight_bwd, self._scale_bwd
 
     def __tensor_flatten__(self):
         metadata = {

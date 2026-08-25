@@ -10,6 +10,7 @@ Defines the prototype UX for converting a model to use mx weights
 
 from functools import partial
 from typing import Optional
+import weakref
 import torch
 
 from torch.distributed.tensor import DTensor
@@ -19,6 +20,7 @@ from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
 from fsdp_turbo.quantization.core.pre_quant_weight import PreQuantWeight
 from fsdp_turbo.quantization.mx_formats.mx_tensor import MXTensor
 from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig
+from fsdp_turbo.quantization.core.recompute_phase import resolve_live_post_quant_weight
 from fsdp_turbo.quantization.utils import register_quantize_module_handler
 
 
@@ -30,6 +32,7 @@ class mx_mm(torch.autograd.Function):
         input_hp: torch.Tensor,
         weight_hp: torch.Tensor,
         mx_tensor: MXTensor,
+        weight_owner=None,
     ):
         ctx.mx_tensor = mx_tensor
         # input @ weight_t = output
@@ -42,11 +45,13 @@ class mx_mm(torch.autograd.Function):
         if isinstance(weight_hp, PostQuantWeight):
             ctx.is_post_quant = True
             ctx.weight_pq = weight_hp
+            ctx.weight_owner_ref = weakref.ref(weight_owner) if weight_owner is not None else None
+            weight_fwd, weight_scale_fwd = weight_hp.get_forward_pair()
 
             output = mx_quant_matmul(
                 input_mx.data,
-                weight_hp._weight_fwd.t(),
-                weight_hp._scale_fwd.transpose(0, 1),
+                weight_fwd.t(),
+                weight_scale_fwd.transpose(0, 1),
                 pertoken_scale=input_mx.scale,
                 output_dtype=input_hp.dtype,
                 group_sizes=[1, 1, 32],
@@ -90,11 +95,12 @@ class mx_mm(torch.autograd.Function):
         grads_mx = mx_tensor.to_mxfp8(grad_output_hp, 'grads')
 
         if ctx.is_post_quant:
-            weight_pq = ctx.weight_pq
+            weight_pq = resolve_live_post_quant_weight(ctx.weight_pq, ctx.weight_owner_ref, "weight")
+            weight_bwd, weight_scale_bwd = weight_pq.get_backward_pair()
             dx = mx_quant_matmul(
                 grads_mx.data,
-                weight_pq._weight_bwd,
-                weight_pq._scale_bwd,
+                weight_bwd,
+                weight_scale_bwd,
                 pertoken_scale=grads_mx.scale,
                 output_dtype=ori_dtype,
                 group_sizes=[1, 1, 32],
@@ -143,7 +149,7 @@ class mx_mm(torch.autograd.Function):
         input_mx.data_t.untyped_storage().resize_(0)
         input_mx.scale_t.untyped_storage().resize_(0)
 
-        return dx, dw, None
+        return dx, dw, None, None
 
 
 class MXLinear(torch.nn.Linear):
@@ -241,7 +247,7 @@ class MXLinear(torch.nn.Linear):
             except (AttributeError, TypeError):
                 pass
 
-        y = mx_mm.apply(x, w, self.mx_tensor)
+        y = mx_mm.apply(x, w, self.mx_tensor, self)
         if self.bias is not None:
             y = y + self.bias
 

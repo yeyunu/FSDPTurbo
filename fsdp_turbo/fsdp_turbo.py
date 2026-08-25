@@ -133,10 +133,13 @@ class FSDPTurbo(torch.nn.Module):
         if not self.config.quantization.quantization_plan.quant_recipe:
             return
         try:
-            # When recompute is enabled, forward may be called during backward.
-            # Force "all" mode so both fwd and bwd quantized tensors are available.
-            if self.config.memory.recompute:
-                self.config.quantization.quantization_plan.fsdp_low_precision_all_gather_mode = "all"
+            quantization_plan = self.config.quantization.quantization_plan
+            quantization_plan._recompute_aware = (
+                self.config.memory.recompute
+                and quantization_plan.quant_recipe == "mxfp8"
+                and quantization_plan.enable_fsdp_low_precision_all_gather
+                and quantization_plan.fsdp_low_precision_all_gather_mode == "on-demand"
+            )
 
             from fsdp_turbo.quantization.converter.model_converter import build_model_converter
 

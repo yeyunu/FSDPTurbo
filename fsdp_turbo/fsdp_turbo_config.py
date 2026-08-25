@@ -152,6 +152,7 @@ class QuantizeConfig:
     converters: List[str] = None
     enable_fsdp_low_precision_all_gather: bool = True
     fsdp_low_precision_all_gather_mode: str = "on-demand"
+    _recompute_aware: bool = field(default=False, init=False, repr=False)
     fsdp_world_size: int = 1
     quant_gmm: bool = False
     gemm_gradient_accumulation_fusion: bool = False

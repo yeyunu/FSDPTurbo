@@ -10,29 +10,11 @@ from torch.distributed.tensor import DTensor
 
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
 from fsdp_turbo.quantization.cache import cached_weight_quant
-
-
-def _get_module_fsdp_state(module):
-    if hasattr(module, "_get_fsdp_state"):
-        fsdp_state = module._get_fsdp_state()
-    elif getattr(module, "_cached_parent_fsdp_state", None) is not None:
-        fsdp_state = module._cached_parent_fsdp_state
-    else:
-        from torch.distributed._composable_state import _module_state_mapping
-
-        min_nodes_in_parent = float("inf")
-        closest_parent_fsdp_mod = None
-        for fsdp_mod in _module_state_mapping.keys():
-            all_submodules = list(fsdp_mod.modules())
-            for submodule in all_submodules:
-                if submodule is module and min_nodes_in_parent > len(all_submodules):
-                    closest_parent_fsdp_mod = fsdp_mod
-                    min_nodes_in_parent = len(all_submodules)
-        if closest_parent_fsdp_mod is None:
-            raise RuntimeError("Module is not FSDP-wrapped and does not have any FSDP-wrapped parent modules.")
-        fsdp_state = closest_parent_fsdp_mod._get_fsdp_state()
-        module._cached_parent_fsdp_state = fsdp_state
-    return fsdp_state
+from fsdp_turbo.quantization.core.recompute_phase import (
+    MXFP8WeightPhase,
+    get_module_fsdp_state,
+    select_recompute_aware_phase,
+)
 
 
 _npu_dtype_cast = getattr(getattr(torch.ops, "npu", None), "_npu_dtype_cast", None)
@@ -168,7 +150,7 @@ class PreQuantWeight(torch.Tensor):
         return f"PreQuantWeight(tensor={self._tensor}, dtype={self._dtype})"
 
     def fsdp_pre_all_gather(self, mesh, orig_size, contiguous_orig_stride, module, mp_policy):
-        fsdp_state = _get_module_fsdp_state(module)
+        fsdp_state = get_module_fsdp_state(module)
         reshard_after_forward = fsdp_state._fsdp_param_group._reshard_after_forward
 
         hp_tensor = self._tensor
@@ -185,9 +167,14 @@ class PreQuantWeight(torch.Tensor):
 
         training_state = fsdp_state._fsdp_param_group._training_state
         mode = getattr(self.config, 'fsdp_low_precision_all_gather_mode', 'on-demand')
+        recompute_phase = select_recompute_aware_phase(fsdp_state, self.config, training_state)
 
         if reshard_after_forward and mode != "all":
-            is_backward_pass = training_state == TrainingState.PRE_BACKWARD
+            is_backward_pass = (
+                recompute_phase == MXFP8WeightPhase.BACKWARD
+                if recompute_phase is not None
+                else training_state == TrainingState.PRE_BACKWARD
+            )
 
             if is_backward_pass:
                 sharded_tensors = (weight_bwd,) if world_size == 1 else (weight_bwd, scale_bwd)
@@ -240,12 +227,12 @@ class PreQuantWeight(torch.Tensor):
             if not isinstance(out, PostQuantWeight):
                 raise TypeError(f"Expected PostQuantWeight, but got {type(out).__name__}")
 
-            if fwd_usage:
-                out._weight_fwd = weight_fwd
-                out._scale_fwd = scale_fwd
-            if bwd_usage:
-                out._weight_bwd = weight_bwd
-                out._scale_bwd = scale_bwd
+            # FSDP reuses all-gather output storages. Clear the inactive pair
+            # so a stale alias cannot consume a buffer from the wrong phase.
+            out._weight_fwd = weight_fwd if fwd_usage else None
+            out._scale_fwd = scale_fwd if fwd_usage else None
+            out._weight_bwd = weight_bwd if bwd_usage else None
+            out._scale_bwd = scale_bwd if bwd_usage else None
         else:
             out = PostQuantWeight(
                 weight_fwd,

@@ -66,6 +66,8 @@ def mx_grouped_matmul(
     x_dtype,
     group_list,
     group_list_type,
+    weight_owner=None,
+    weight_attr=None,
 ):
     """FP8 quantized grouped matmul for the MX MoE path."""
     return dispatch_op(
@@ -85,4 +87,6 @@ def mx_grouped_matmul(
         x_dtype,
         group_list,
         group_list_type,
+        weight_owner,
+        weight_attr,
     )

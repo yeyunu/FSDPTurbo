@@ -83,10 +83,11 @@ class MXFP8LinearConfig(QuantBaseConfig):
     mxfp8_ignored_modules: list[str] = field(default_factory=list)
     mxfp8_apply_modules: list[str] = field(default_factory=list)
     converter: str = "quantize.linear.mx"
+    _recompute_aware: bool = field(default=False, init=False, repr=False)
 
 
 def get_mxfp8linear_config(quant_config: QuantizeConfig):
-    return MXFP8LinearConfig(
+    config = MXFP8LinearConfig(
         quant_format=quant_config.quant_format,
         block_size=quant_config.block_size,
         mxfp8_ignored_modules=quant_config.quant_ignored_modules or [],
@@ -95,3 +96,5 @@ def get_mxfp8linear_config(quant_config: QuantizeConfig):
         fsdp_low_precision_all_gather_mode=quant_config.fsdp_low_precision_all_gather_mode,
         fsdp_world_size=quant_config.fsdp_world_size,
     )
+    config._recompute_aware = quant_config._recompute_aware
+    return config

@@ -1,5 +1,6 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 import torch
+import weakref
 from torch.distributed.tensor import DTensor
 
 try:
@@ -8,6 +9,7 @@ except ImportError:
     torch_npu = None
 
 from fsdp_turbo.ops.registry import register_op
+from fsdp_turbo.quantization.core.recompute_phase import resolve_live_post_quant_weight
 
 
 @torch._dynamo.allow_in_graph
@@ -32,6 +34,8 @@ class MxGroupedMatmul(torch.autograd.Function):
         input_dtype,
         group_list: torch.Tensor,
         group_list_type: int,
+        weight_owner=None,
+        weight_attr=None,
     ):
         ctx.weight_2d_shape = weight_2d_shape
         ctx.weight_transposed = weight_transposed
@@ -47,6 +51,8 @@ class MxGroupedMatmul(torch.autograd.Function):
             w = w.to_local()
         ctx.post_quant = hasattr(w, "_weight_fwd")
         ctx.weight_ref = weight
+        ctx.weight_owner_ref = weakref.ref(weight_owner) if weight_owner is not None else None
+        ctx.weight_attr = weight_attr
 
         ctx.save_for_backward(x, group_list, weight_bwd, weight_scale_bwd)
 
@@ -71,23 +77,15 @@ class MxGroupedMatmul(torch.autograd.Function):
         x, group_list, weight_bwd, weight_scale_bwd = ctx.saved_tensors
 
         if ctx.post_quant:
-            w = ctx.weight_ref
-            if isinstance(w, torch.nn.Parameter) and not hasattr(w, "_weight_fwd"):
-                w = w.data
-            if hasattr(w, "to_local"):
-                w = w.to_local()
-            # Follow the _source chain to the bwd all-gather's fill target.
-            while w._weight_bwd is None and getattr(w, "_source", None) is not None:
-                w = w._source
-            weight_bwd = w._weight_bwd
-            if weight_bwd is None:
-                raise RuntimeError(
-                    "PostQuantWeight._weight_bwd is None during backward; "
-                    "on-demand low-precision all-gather must gather the bwd weight."
-                )
+            w = resolve_live_post_quant_weight(
+                ctx.weight_ref,
+                ctx.weight_owner_ref,
+                ctx.weight_attr,
+            )
+            weight_bwd, weight_scale_bwd = w.get_backward_pair()
             K = x.shape[-1]
             weight_bwd = weight_bwd.view(len(group_list), K, -1).transpose(1, 2).contiguous()
-            weight_scale_bwd = w._scale_bwd.transpose(1, 2).contiguous() if w._scale_bwd is not None else None
+            weight_scale_bwd = weight_scale_bwd.transpose(1, 2).contiguous()
 
         group_list_int32 = group_list.to(torch.int32)
         total_tokens = group_list[-1].item()
@@ -163,6 +161,8 @@ class MxGroupedMatmul(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -183,6 +183,8 @@ def mx_grouped_matmul_npu(
     input_dtype,
     group_list,
     group_list_type,
+    weight_owner=None,
+    weight_attr=None,
 ):
     return MxGroupedMatmul.apply(
         x,
@@ -200,4 +202,6 @@ def mx_grouped_matmul_npu(
         input_dtype,
         group_list,
         group_list_type,
+        weight_owner,
+        weight_attr,
     )

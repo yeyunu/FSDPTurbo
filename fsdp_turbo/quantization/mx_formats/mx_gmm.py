@@ -49,6 +49,8 @@ def mx_quant_group_gemm(
     config: MXFP8LinearConfig,
     grad_enabled: bool = True,
     group_list_type: int = 0,
+    weight_owner=None,
+    weight_attr: str = None,
 ) -> torch.Tensor:
     """FP8 quantized grouped matrix multiplication.
 
@@ -84,12 +86,10 @@ def mx_quant_group_gemm(
 
     if is_post_quant:
         pq = weight_unwrapped
-        weight_fwd = pq._weight_fwd
+        weight_fwd, weight_scale_fwd = pq.get_forward_pair()
         weight_bwd = None
-        weight_scale_fwd = pq._scale_fwd
         weight_scale_bwd = None
-        if weight_fwd is not None:
-            weight_fwd = weight_fwd.view(num_experts, K, -1).contiguous()
+        weight_fwd = weight_fwd.view(num_experts, K, -1).contiguous()
     else:
         if weight_transposed:
             weight_3d = weight_unwrapped.view(num_experts, -1, K).transpose(1, 2).contiguous()
@@ -123,6 +123,8 @@ def mx_quant_group_gemm(
         x.dtype,
         group_list,
         group_list_type,
+        weight_owner,
+        weight_attr,
     )
 
 
@@ -200,6 +202,8 @@ class MXFP8GMM(torch.nn.Module):
             group_list=group_list,
             config=quant_config,
             grad_enabled=torch.is_grad_enabled(),
+            weight_owner=self,
+            weight_attr="gate_up_proj",
         )
 
         fc1_activation = swiglu(fc1_output, dim=-1)
@@ -210,6 +214,8 @@ class MXFP8GMM(torch.nn.Module):
             group_list=group_list,
             config=quant_config,
             grad_enabled=torch.is_grad_enabled(),
+            weight_owner=self,
+            weight_attr="down_proj",
         )
 
         output = unpermute(fc2_out, row_ids_map, probs=routing_weights)
@@ -240,6 +246,8 @@ class MXFP8GMM(torch.nn.Module):
             group_list=group_list_cumsum,
             config=quant_config,
             grad_enabled=torch.is_grad_enabled(),
+            weight_owner=self,
+            weight_attr="gate_up_proj",
         )
 
         fc1_activation = swiglu(fc1_output, dim=-1)
@@ -250,6 +258,8 @@ class MXFP8GMM(torch.nn.Module):
             group_list=group_list_cumsum,
             config=quant_config,
             grad_enabled=torch.is_grad_enabled(),
+            weight_owner=self,
+            weight_attr="down_proj",
         )
 
         return fc2_out
