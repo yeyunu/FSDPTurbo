@@ -1,7 +1,12 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import torch
 
-from fsdp_turbo.ops.quantize import dynamic_mx_quant_with_dual_axis
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
+from fsdp_turbo.ops.quantize import dynamic_mx_quant_with_dual_axis, mx_to_block_mx_quant
 from fsdp_turbo.quantization.utils import TensorWithTranspose, view_as_n_dim
 
 
@@ -28,8 +33,32 @@ class MXTensor:
         self.fp8_format_dtype = self.config.get_key_dtype(key)
         tensor_2d = view_as_n_dim(data_hf)
 
-        col_data, col_scale, row_data, row_scale = dynamic_mx_quant_with_dual_axis(
-            tensor_2d, dst_type=self.fp8_format_dtype
-        )
+        if key == 'weight' and self.config.quant_format == 'W4A8':
+            weight_mxfp4, weight_mxscale_mxfp4 = torch_npu.npu_dynamic_mx_quant(
+                tensor_2d, axis=-1, round_mode="rint", dst_type=torch_npu.float4_e2m1fn_x2, block_size=32, scale_alg=0
+            )
+            weight_fwd_fp8, weight_fwd_scale_mxfp8, weight_bwd_scale_mxfp8 = mx_to_block_mx_quant(
+                weight_mxfp4, weight_mxscale_mxfp4, dst_type=torch_npu.float8_e4m3fn, x_type=torch_npu.float4_e2m1fn_x2
+            )
+            weight_bwd = weight_fwd_fp8.clone()
+            return TensorWithTranspose(
+                self.fp8_format_dtype,
+                weight_fwd_fp8,
+                weight_fwd_scale_mxfp8,
+                weight_bwd,
+                weight_bwd_scale_mxfp8,
+                ori_dtype,
+            )
+        else:
+            col_data, col_scale, row_data, row_scale = dynamic_mx_quant_with_dual_axis(
+                tensor_2d, dst_type=self.fp8_format_dtype
+            )
 
-        return TensorWithTranspose(self.fp8_format_dtype, col_data, col_scale, row_data, row_scale, ori_dtype)
+        return TensorWithTranspose(
+            self.fp8_format_dtype,
+            col_data,
+            col_scale,
+            row_data,
+            row_scale,
+            ori_dtype,
+        )

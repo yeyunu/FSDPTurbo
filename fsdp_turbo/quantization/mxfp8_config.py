@@ -5,6 +5,11 @@ from typing import Optional, NamedTuple
 
 import torch
 
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
 from fsdp_turbo.fsdp_turbo_config import QuantizeConfig
 
 
@@ -41,6 +46,7 @@ class FormatEnum(Enum):
     E4M3 = FP8Format(448, 4, 3, torch.float8_e4m3fn)
     E5M2 = FP8Format(57344, 5, 2, torch.float8_e5m2)
     HIF8 = FP8Format(57344, 5, 2, None)
+    E2M1 = FP8Format(6, 2, 1, torch_npu.float4_e2m1fn_x2)
 
 
 class _FormatConfig(NamedTuple):
@@ -53,6 +59,7 @@ class Format(Enum):
     E4M3 = _FormatConfig()
     HYBRID = _FormatConfig(grads=FormatEnum.E5M2)
     HIF8 = _FormatConfig(inputs=FormatEnum.HIF8, weight=FormatEnum.HIF8, grads=FormatEnum.HIF8)
+    W4A8 = _FormatConfig(weight=FormatEnum.E2M1)
 
     @classmethod
     def from_config_fp8(cls, key: str):

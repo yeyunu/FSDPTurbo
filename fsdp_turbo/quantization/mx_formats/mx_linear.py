@@ -13,15 +13,41 @@ from typing import Optional
 import weakref
 import torch
 
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
+
 from torch.distributed.tensor import DTensor
 
-from fsdp_turbo.ops.quantize import dynamic_mx_quant_with_dual_axis, mx_quant_matmul
+from fsdp_turbo.ops.quantize import mx_quant_matmul, mx_to_block_mx_quant
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
 from fsdp_turbo.quantization.core.pre_quant_weight import PreQuantWeight
 from fsdp_turbo.quantization.mx_formats.mx_tensor import MXTensor
 from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig
 from fsdp_turbo.quantization.core.recompute_phase import resolve_live_post_quant_weight
 from fsdp_turbo.quantization.utils import register_quantize_module_handler
+
+
+def weight_quant(weight, dst_type, quant_format):
+    if quant_format == "W4A8":
+        weight_mxfp4, weight_mxscale_mxfp4 = torch_npu.npu_dynamic_mx_quant(
+            weight, axis=-1, round_mode="rint", dst_type=torch_npu.float4_e2m1fn_x2, block_size=32, scale_alg=0
+        )
+
+        weight_fwd, weight_scale_fwd, weight_scale_bwd = mx_to_block_mx_quant(
+            weight_mxfp4,
+            weight_mxscale_mxfp4,
+            dst_type=292,  # FP8_E4M3FN；291=FP8_E5M2
+            x_type=296,  # FP4_E2M1；297=FP4_E1M2
+        )
+        weight_bwd = weight_fwd.clone()
+    else:
+        weight_fwd, weight_scale_fwd, weight_bwd, weight_scale_bwd = torch_npu.npu_dynamic_mx_quant_with_dual_axis(
+            weight, dst_type=dst_type
+        )
+
+    return weight_fwd, weight_scale_fwd, weight_bwd, weight_scale_bwd
 
 
 @torch._dynamo.allow_in_graph
@@ -189,10 +215,8 @@ class MXLinear(torch.nn.Linear):
                 return mod
 
             weight_dtype = config.get_key_dtype('weight')
-            quantizer_fn = partial(
-                dynamic_mx_quant_with_dual_axis,
-                dst_type=weight_dtype,
-            )
+            quant_format = config.quant_format
+            quantizer_fn = partial(weight_quant, dst_type=weight_dtype, quant_format=quant_format)
 
             if isinstance(w, DTensor):
                 pre_quant = PreQuantWeight(

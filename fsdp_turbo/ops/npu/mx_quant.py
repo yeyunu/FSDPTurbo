@@ -7,6 +7,12 @@ try:
 except ImportError:
     torch_npu = None
 
+try:
+    import torch
+    import cann_ops_nn
+except ImportError:
+    cann_ops_nn = None
+
 
 def get_hifloat8_dtype():
     """Return the NPU hifloat8 dtype, or None when torch_npu is unavailable."""
@@ -43,3 +49,14 @@ def grouped_dynamic_mx_quant_npu(tensor, group_list, round_mode='rint', dst_type
 def swiglu_npu(x, dim=-1):
     """Fused SiGLU activation: silu(x[..., :D]) * x[..., D:] along ``dim``."""
     return torch_npu.npu_swiglu(x, dim=dim)
+
+
+@register_op('mx_to_block_mx_quant', 'npu')
+def mx_to_block_mx_quant_npu(weight_mxfp4, weight_mxscale_mxfp4, dst_type, x_type):
+    weight_fwd, weight_scale_fwd, weight_scale_bwd = torch.ops.cann_ops_nn.mx_to_block_mx_quant(
+        weight_mxfp4,
+        weight_mxscale_mxfp4,
+        dst_type=dst_type,
+        x_type=x_type,
+    )
+    return weight_fwd, weight_scale_fwd, weight_scale_bwd

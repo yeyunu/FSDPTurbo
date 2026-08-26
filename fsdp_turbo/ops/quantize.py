@@ -90,3 +90,18 @@ def mx_grouped_matmul(
         weight_owner,
         weight_attr,
     )
+
+
+def mx_to_block_mx_quant(
+    weight_mxfp4,
+    weight_mxscale_mxfp4,
+    dst_type,
+    x_type,
+):
+    return dispatch_op(
+        'mx_to_block_mx_quant',
+        weight_mxfp4,
+        weight_mxscale_mxfp4,
+        dst_type,
+        x_type,
+    )

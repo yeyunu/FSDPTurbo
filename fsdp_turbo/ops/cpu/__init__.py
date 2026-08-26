@@ -8,6 +8,7 @@ from fsdp_turbo.ops.cpu.mx_quant import (
     dynamic_mx_quant_with_dual_axis_cpu,
     grouped_dynamic_mx_quant_cpu,
     swiglu_cpu,
+    mx_to_block_mx_quant_cpu,
 )
 from fsdp_turbo.ops.cpu.permute import permute_cpu, unpermute_cpu
 from fsdp_turbo.ops.cpu.rms_norm import rms_norm_cpu
@@ -29,4 +30,5 @@ __all__ = [
     'unpermute_cpu',
     'rms_norm_cpu',
     'hc_split_sinkhorn_cpu',
+    'mx_to_block_mx_quant_cpu',
 ]
