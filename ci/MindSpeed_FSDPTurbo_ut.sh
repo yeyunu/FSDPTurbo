@@ -16,7 +16,7 @@ function setup_running_env() {
     # 安装FSDPTurbo
     echo "Installing FSDPTurbo..."
     cd "${WORKSPACE}"/CODE
-    pip install -e . -v
+    pip install -e . -v --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi
 
     echo "Install Complete..."
     pip list

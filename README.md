@@ -123,7 +123,7 @@ config = FSDPTurboConfig(
     expert_parallel_size=2,
     ep_plan=EPPlanConfig(
         apply_modules=['*mlp.experts*'],
-        dispatcher='fused'  # 或 'eager'、'mc2'
+        dispatcher='fused'  # 也可使用 'eager'、'mc2'、'domino' 或自定义 EP forward
     ),
 
     # 量化
@@ -135,6 +135,16 @@ config = FSDPTurboConfig(
     # 其他配置...
 )
 ```
+
+`dispatcher='custom_ep_forward_eager'` 和 `dispatcher='custom_ep_forward_fused'`
+用于模型具有非标准专家计算语义、需要自行实现完整 EP forward 的场景。匹配的专家模块必须分别实现：
+
+```python
+ep_forward_eager(hidden_states, top_k_index, top_k_weights, *, ep_group, fixed_router)
+ep_forward_fused(hidden_states, top_k_index, top_k_weights, *, ep_group, fixed_router)
+```
+
+普通 GLU/SwiGLU MoE 模型应优先使用内置的 `eager`、`fused`、`mc2` 或 `domino` dispatcher。
 
 ***
 

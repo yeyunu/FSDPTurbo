@@ -134,7 +134,7 @@ class CPPlanConfig:
 @dataclass
 class EPPlanConfig:
     apply_modules: List[str] = None
-    dispatcher: Union[Literal["eager", "fused", "mc2", "domino"], Callable] = None
+    dispatcher: Union[Literal["eager", "fused", "mc2", "domino"], Callable, str] = None
     fixed_router: bool = False
     apply_efsdp_modules: List[str] = None
     # Gradient divide factor for expert HSDP. When unset (None) it is
@@ -364,7 +364,8 @@ class FSDPTurboConfig:
             distributed=DistributedConfig(
                 ep_plan=EPPlanConfig(
                     apply_modules: ['*mlp.experts*'],
-                    dispatcher: 'eager', 'fused', 'mc2'
+                    dispatcher: 'eager', 'fused', 'mc2', 'domino',
+                                'custom_ep_forward_eager', 'custom_ep_forward_fused'
                 )
             )
         )

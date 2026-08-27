@@ -22,6 +22,9 @@ setup(
         "transformers>=5.2.0",
         "datasets>=2.14.0",
         "pillow>=9.0.0",
+        "tiktoken",
+        "triton>=3.5.0",
+        "triton_ascend>=3.2.2",
     ],
     extras_require={
         "npu": [

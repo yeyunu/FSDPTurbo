@@ -46,7 +46,7 @@ def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, pl
         # distribute experts weights
         distribute_experts_module(module, ep_mesh)
 
-        # replace forward with ep forward
+        # Select the complete EP forward explicitly through the dispatcher plan.
         experts_forward_fn = get_dispatcher_fn(plan.dispatcher, ep_group, fixed_router=plan.fixed_router)
         module.forward = types.MethodType(experts_forward_fn, module)
     return modules
@@ -110,6 +110,24 @@ def get_dispatcher_fn(dispatcher, ep_group, fixed_router=False):
             forward_fn = get_experts_forward_mc2_fn(ep_group, fixed_router=fixed_router)
         elif dispatcher == 'domino':
             forward_fn = get_domino_experts_forward_fn(ep_group, fixed_router=fixed_router)
+        elif dispatcher.startswith('custom_'):
+            method_name = dispatcher.removeprefix('custom_')
+
+            def custom_ep_forward(self, hidden_states, top_k_index, top_k_weights):
+                method = getattr(self, method_name, None)
+                if not callable(method):
+                    raise RuntimeError(
+                        f'EP dispatcher requires {type(self).__name__}.{method_name} to be a callable method.'
+                    )
+                return method(
+                    hidden_states,
+                    top_k_index,
+                    top_k_weights,
+                    ep_group=ep_group,
+                    fixed_router=fixed_router,
+                )
+
+            forward_fn = custom_ep_forward
 
     if forward_fn is None:
         raise RuntimeError(f'Unsupported dispatcher {dispatcher}.')

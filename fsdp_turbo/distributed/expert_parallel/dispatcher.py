@@ -23,7 +23,10 @@ def get_experts_forward_fn(ep_group, fused, fixed_router=False):
         # Ensure correct parameter order and dimensions
         top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
         hidden_states_shape = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        hidden_dim = getattr(self, "hidden_dim", None)
+        if hidden_dim is None:
+            hidden_dim = hidden_states.shape[-1]
+        hidden_states = hidden_states.reshape(-1, hidden_dim)
         if fixed_router:
             top_k_index, top_k_weights = fixed_router_for_debug(top_k_index, top_k_weights, self.num_global_experts)
 

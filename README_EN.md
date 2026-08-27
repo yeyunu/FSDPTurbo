@@ -120,7 +120,7 @@ config = FSDPTurboConfig(
     expert_parallel_size=2,
     ep_plan=EPPlanConfig(
         apply_modules=['*mlp.experts*'],
-        dispatcher='fused'  # or 'eager'、'mc2'
+        dispatcher='fused'  # or 'eager', 'mc2', 'domino', or a custom EP forward
     ),
 
     # Quantization
@@ -132,6 +132,19 @@ config = FSDPTurboConfig(
     # Other configurations...
 )
 ```
+
+Use `dispatcher='custom_ep_forward_eager'` or
+`dispatcher='custom_ep_forward_fused'` when a model has non-standard expert
+semantics and must provide the complete EP forward. The matched expert module
+must implement the corresponding method:
+
+```python
+ep_forward_eager(hidden_states, top_k_index, top_k_weights, *, ep_group, fixed_router)
+ep_forward_fused(hidden_states, top_k_index, top_k_weights, *, ep_group, fixed_router)
+```
+
+Standard GLU/SwiGLU MoE models should prefer the built-in `eager`, `fused`,
+`mc2`, or `domino` dispatcher.
 
 ***
 
