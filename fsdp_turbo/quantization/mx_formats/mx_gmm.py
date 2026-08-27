@@ -3,7 +3,6 @@ from functools import partial
 from typing import Optional
 
 import torch
-import torch_npu
 
 from fsdp_turbo.ops.quantize import (
     dynamic_mx_quant,
@@ -14,31 +13,34 @@ from fsdp_turbo.ops.quantize import (
 )
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
 from fsdp_turbo.quantization.core.pre_quant_weight import PreQuantWeight
-from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig
+from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig, float4_dtype
 from fsdp_turbo.quantization.utils import view_as_n_dim
+
+
+from fsdp_turbo.utils.gmm_layout import from_gmm_3d, to_gmm_3d
 
 
 def weight_quant_gmm(weight: torch.Tensor, dst_type, new_shape: tuple, quant_format) -> tuple:
     """Quantize weight for GMM, reshaping before quantization.
 
-    The weight is reshaped to 3D [num_experts, in_dim, out_dim] before
+    The weight is converted to 3D [num_experts, in_dim, out_dim] before
     quantization so that dual-axis quantization produces correct per-expert
-    scales.
+    scales, then converted back to the original layout for storage.
 
     Returns:
         (weight_fwd, weight_scale_fwd, weight_bwd, weight_scale_bwd)
     """
     original_shape = weight.shape
     num_experts = weight.numel() // (new_shape[1] * new_shape[2])
-    if weight.dim() == 2:
-        rows_per_expert = weight.shape[0] // num_experts
-        weight = weight.view(num_experts, rows_per_expert, -1)
-    else:
-        weight = weight.view(num_experts, weight.shape[1], weight.shape[2])
-    weight = weight.transpose(1, 2).contiguous()  # [E, out, in] -> [E, in, out]
+    weight = to_gmm_3d(weight, num_experts)
     if quant_format == "W4A8":
-        weight_mxfp4, weight_mxscale_mxfp4 = torch_npu.npu_dynamic_mx_quant(
-            weight, axis=-1, round_mode="rint", dst_type=torch_npu.float4_e2m1fn_x2, block_size=32, scale_alg=0
+        weight_mxfp4, weight_mxscale_mxfp4 = dynamic_mx_quant(
+            weight,
+            axis=-1,
+            round_mode="rint",
+            dst_type=float4_dtype(),
+            block_size=32,
+            scale_alg=0,
         )
         weight_fwd, weight_scale_bwd, weight_scale_fwd = mx_to_block_mx_quant(
             weight_mxfp4,
@@ -51,8 +53,8 @@ def weight_quant_gmm(weight: torch.Tensor, dst_type, new_shape: tuple, quant_for
         weight_bwd, weight_scale_bwd, weight_fwd, weight_scale_fwd = dynamic_mx_quant_with_dual_axis(
             weight, dst_type=dst_type
         )
-    weight_fwd = weight_fwd.reshape(original_shape)
-    weight_bwd = weight_bwd.reshape(original_shape)
+    weight_fwd = from_gmm_3d(weight_fwd, original_shape)
+    weight_bwd = from_gmm_3d(weight_bwd, original_shape)
     return weight_fwd, weight_scale_fwd, weight_bwd, weight_scale_bwd
 
 
@@ -94,37 +96,32 @@ def mx_quant_group_gemm(
     if weight_unwrapped.dtype == torch.float32:
         weight_unwrapped = weight_unwrapped.to(torch.bfloat16)
 
-    K = x.shape[-1]
     num_experts = len(group_list)
-    weight_transposed = weight_unwrapped.shape[0] // num_experts != K
 
     if is_post_quant:
         pq = weight_unwrapped
         weight_fwd, weight_scale_fwd = pq.get_forward_pair()
         weight_bwd = None
         weight_scale_bwd = None
-        weight_fwd = weight_fwd.view(num_experts, K, -1).contiguous()
+        weight_fwd = to_gmm_3d(weight_fwd, num_experts)
     else:
-        if weight_transposed:
-            weight_3d = weight_unwrapped.view(num_experts, -1, K).transpose(1, 2).contiguous()
-        else:
-            weight_3d = weight_unwrapped.view(num_experts, K, -1).contiguous()
+        weight_3d = to_gmm_3d(weight_unwrapped, num_experts)
 
         if grad_enabled:
             if config.quant_format == 'W4A8':
-                weight_mxfp4, weight_mxscale_mxfp4 = torch_npu.npu_dynamic_mx_quant(
+                weight_mxfp4, weight_mxscale_mxfp4 = dynamic_mx_quant(
                     weight_3d,
                     axis=-1,
                     round_mode="rint",
-                    dst_type=torch_npu.float4_e2m1fn_x2,
+                    dst_type=float4_dtype(),
                     block_size=32,
                     scale_alg=0,
                 )
                 weight_fwd, weight_scale_bwd_raw, weight_scale_fwd = mx_to_block_mx_quant(
                     weight_mxfp4,
                     weight_mxscale_mxfp4,
-                    dst_type=torch_npu.float8_e4m3fn,
-                    x_type=torch_npu.float4_e2m1fn_x2,
+                    dst_type=torch.float8_e4m3fn,
+                    x_type=float4_dtype(),
                 )
                 weight_bwd = weight_fwd.transpose(1, 2).contiguous()
                 weight_scale_bwd = weight_scale_bwd_raw.transpose(1, 2).contiguous()
@@ -149,7 +146,6 @@ def mx_quant_group_gemm(
         weight_bwd,
         weight_scale_bwd,
         weight_2d_shape,
-        weight_transposed,
         config.get_key_dtype("grads"),
         config.get_key_dtype("inputs"),
         x.dtype,

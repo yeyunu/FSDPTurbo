@@ -7,10 +7,17 @@ import torch
 from fsdp_turbo.fsdp_turbo import FSDPTurbo
 from fsdp_turbo.fsdp_turbo_config import QuantizeConfig
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
-from fsdp_turbo.quantization.core.recompute_phase import resolve_live_post_quant_weight
+from fsdp_turbo.quantization.core.pre_quant_weight import PreQuantWeight
+from fsdp_turbo.quantization.core.recompute_phase import (
+    MXFP8WeightPhase,
+    resolve_live_post_quant_weight,
+)
 from fsdp_turbo.quantization.mx_formats.mx_gmm import mx_quant_group_gemm
 from fsdp_turbo.quantization.mx_formats.mx_linear import mx_mm
-from fsdp_turbo.quantization.mxfp8_config import get_mxfp8linear_config
+from fsdp_turbo.quantization.mxfp8_config import (
+    MXFP8LinearConfig,
+    get_mxfp8linear_config,
+)
 
 
 def _post_quant_weight(with_backward=False):
@@ -120,7 +127,7 @@ def test_live_owner_shape_mismatch_fails_closed():
 class _FakeQuantizedTensor:
     def __init__(self, tensor):
         self.data = tensor.clone()
-        self.scale = torch.ones(1, dtype=tensor.dtype)
+        self.scale = torch.ones(1, tensor.shape[-1], dtype=tensor.dtype)
         self.data_t = tensor.clone()
         self.scale_t = torch.ones(1, 1, dtype=tensor.dtype)
         self.ori_dtype = tensor.dtype
@@ -194,3 +201,126 @@ def test_gmm_propagates_canonical_owner_attribute(weight_attr):
     assert output is expected
     assert grouped_matmul.call_args.args[-2] is owner
     assert grouped_matmul.call_args.args[-1] == weight_attr
+
+
+def test_resolve_without_owner_fails_closed():
+    """All callers must pass weight_owner; the _source fallback chain is gone."""
+    saved_weight = _post_quant_weight()
+
+    with pytest.raises(RuntimeError, match="requires weight_owner"):
+        resolve_live_post_quant_weight(saved_weight, None, "weight")
+
+
+def test_linear_autograd_backward_uses_plain_weight():
+    """Non-post-quant branch: dx/dw come from the fp8 weight kept in ctx,
+    with no owner resolution involved.
+    """
+    input_tensor = torch.randn(2, 64, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(64, 64, dtype=torch.bfloat16, requires_grad=True)
+
+    with patch(
+        "fsdp_turbo.quantization.mx_formats.mx_linear.mx_quant_matmul",
+        side_effect=lambda lhs, rhs, *_args, **_kwargs: lhs @ rhs,
+    ):
+        output = mx_mm.apply(input_tensor, weight, _FakeMXTensor(), None)
+        output.sum().backward()
+
+    ones = torch.ones_like(output)
+    torch.testing.assert_close(input_tensor.grad, ones @ weight, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(weight.grad, ones.t() @ input_tensor.detach(), rtol=1e-2, atol=1e-2)
+
+
+def test_post_quant_weight_desugar_preserves_pairs():
+    """Desugar ops (clone/detach) must carry both fp8 pairs onto the new
+    PostQuantWeight so backward can still find the bwd pair.
+    """
+    weight = _post_quant_weight(with_backward=True)
+
+    for new_weight in (weight.clone(), weight.detach()):
+        assert isinstance(new_weight, PostQuantWeight)
+        assert torch.equal(new_weight._weight_fwd, weight._weight_fwd)
+        assert torch.equal(new_weight._weight_bwd, weight._weight_bwd)
+        assert new_weight._scale_fwd is weight._scale_fwd
+        assert new_weight._scale_bwd is weight._scale_bwd
+
+
+def _pre_quant_weight(config=None):
+    tensor = torch.randn(64, 64, dtype=torch.bfloat16, requires_grad=True)
+    return PreQuantWeight(tensor, lambda t: t, config, tensor.dtype, "test.weight")
+
+
+def _fsdp_state_mock(reshard_after_forward=True):
+    fsdp_state = Mock()
+    fsdp_state._fsdp_param_group._reshard_after_forward = reshard_after_forward
+    return fsdp_state
+
+
+@pytest.mark.parametrize(
+    "mode,phase,expected,exp_fwd,exp_bwd",
+    [
+        ("on-demand", MXFP8WeightPhase.BACKWARD, ("wb",), False, True),
+        ("on-demand", MXFP8WeightPhase.FORWARD, ("wf",), True, False),
+        ("all", MXFP8WeightPhase.BACKWARD, ("wf", "wb"), True, True),
+    ],
+)
+def test_pre_quant_all_gather_selects_pairs(mode, phase, expected, exp_fwd, exp_bwd):
+    """LP-AG gathers only the pair the current phase needs (on-demand) or
+    both (all mode).
+    """
+    pq = _pre_quant_weight(config=MXFP8LinearConfig(fsdp_low_precision_all_gather_mode=mode))
+    wf, sf, wb, sb = (
+        torch.randn(64, 64),
+        torch.randn(1, 64),
+        torch.randn(64, 64),
+        torch.randn(1, 64),
+    )
+
+    with (
+        patch(
+            "fsdp_turbo.quantization.core.pre_quant_weight.get_module_fsdp_state",
+            return_value=_fsdp_state_mock(),
+        ),
+        patch(
+            "fsdp_turbo.quantization.core.pre_quant_weight.select_recompute_aware_phase",
+            return_value=phase,
+        ),
+        patch(
+            "fsdp_turbo.quantization.core.pre_quant_weight.cached_weight_quant",
+            return_value=(wf, sf, wb, sb),
+        ),
+    ):
+        tensors, metadata = pq.fsdp_pre_all_gather(None, None, None, Mock(), None)
+
+    fwd_usage, bwd_usage, scale_fwd, scale_bwd = metadata
+    assert tensors == tuple({"wf": wf, "wb": wb}[t] for t in expected)
+    assert fwd_usage is exp_fwd and bwd_usage is exp_bwd
+    assert scale_fwd is sf and scale_bwd is sb
+
+
+def test_pre_quant_post_all_gather_assembles_both_pairs():
+    pq = _pre_quant_weight()
+    wf = torch.randn(64, 64)
+    wb = torch.randn(64, 64)
+    metadata = (True, True, torch.randn(1, 64), torch.randn(1, 64))
+
+    out, _ = pq.fsdp_post_all_gather((wf, wb), metadata, torch.bfloat16)
+
+    assert isinstance(out, PostQuantWeight)
+    assert out._weight_fwd is wf and out._weight_bwd is wb
+    assert out._scale_fwd is metadata[2] and out._scale_bwd is metadata[3]
+
+
+def test_pre_quant_post_all_gather_inplace_clears_inactive_pair():
+    """out= existing PostQuantWeight: the inactive pair is nulled so a stale
+    alias cannot consume a buffer from the wrong phase.
+    """
+    pq = _pre_quant_weight()
+    wf = torch.randn(64, 64)
+    metadata = (True, False, torch.randn(1, 64), None)
+    out = PostQuantWeight(wf, metadata[2], torch.randn(64, 64), torch.randn(1, 64), torch.bfloat16)
+
+    ret, _ = pq.fsdp_post_all_gather((wf,), metadata, torch.bfloat16, out=out)
+
+    assert ret is out
+    assert out._weight_fwd is wf and out._weight_bwd is None
+    assert out._scale_bwd is None

@@ -5,23 +5,24 @@ from typing import Optional, NamedTuple
 
 import torch
 
-try:
-    import torch_npu
-except ImportError:
-    torch_npu = None
-
 from fsdp_turbo.fsdp_turbo_config import QuantizeConfig
 
 
-def _load_hifloat8():
+def _load_npu_dtype(getter_name):
     try:
-        from fsdp_turbo.ops.npu.mx_quant import get_hifloat8_dtype
+        from fsdp_turbo.ops.npu.mx_quant import get_float4_dtype, get_hifloat8_dtype
     except ImportError:
         return None
-    return get_hifloat8_dtype()
+    return {"hifloat8": get_hifloat8_dtype, "float4": get_float4_dtype}[getter_name]()
 
 
-_HIFLOAT8 = _load_hifloat8()
+_HIFLOAT8 = _load_npu_dtype("hifloat8")
+_FLOAT4_E2M1 = _load_npu_dtype("float4")
+
+
+def float4_dtype():
+    """NPU float4 e2m1 dtype, or None when torch_npu is unavailable."""
+    return _FLOAT4_E2M1
 
 
 class FP8Format:
@@ -46,7 +47,7 @@ class FormatEnum(Enum):
     E4M3 = FP8Format(448, 4, 3, torch.float8_e4m3fn)
     E5M2 = FP8Format(57344, 5, 2, torch.float8_e5m2)
     HIF8 = FP8Format(57344, 5, 2, None)
-    E2M1 = FP8Format(6, 2, 1, torch_npu.float4_e2m1fn_x2)
+    E2M1 = FP8Format(6, 2, 1, _FLOAT4_E2M1)
 
 
 class _FormatConfig(NamedTuple):

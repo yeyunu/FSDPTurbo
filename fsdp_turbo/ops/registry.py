@@ -1,3 +1,4 @@
+import importlib
 import logging
 
 import torch
@@ -52,7 +53,8 @@ def get_op(op_name: str, device_type: str = None):
         KeyError: If operator not found for the device type
     """
     if device_type is None:
-        device_type = torch.accelerator.current_accelerator().type
+        accelerator = torch.accelerator.current_accelerator()
+        device_type = accelerator.type if accelerator is not None else "cpu"
 
     if op_name not in _OPERATOR_REGISTRY:
         raise KeyError(f"Operator '{op_name}' is not registered")
@@ -63,15 +65,11 @@ def get_op(op_name: str, device_type: str = None):
     if 'cpu' in _OPERATOR_REGISTRY[op_name]:
         log_warning_once(
             logger,
-            f"Operator '{op_name}' not available for device '{device_type}', "
-            f"falling back to CPU implementation"
+            f"Operator '{op_name}' not available for device '{device_type}', falling back to CPU implementation",
         )
         return _OPERATOR_REGISTRY[op_name]['cpu']
 
-    raise KeyError(
-        f"Operator '{op_name}' not available for device '{device_type}' "
-        f"and no CPU fallback exists"
-    )
+    raise KeyError(f"Operator '{op_name}' not available for device '{device_type}' and no CPU fallback exists")
 
 
 def dispatch_op(op_name: str, *args, device_type: str = None, **kwargs):
@@ -92,16 +90,17 @@ def dispatch_op(op_name: str, *args, device_type: str = None, **kwargs):
 
 def get_device_ops_module():
     """Get the appropriate ops module for the current device."""
-    device_type = torch.accelerator.current_accelerator().type
+    accelerator = torch.accelerator.current_accelerator()
+    device_type = accelerator.type if accelerator is not None else "cpu"
     try:
         if device_type == 'npu':
-            import fsdp_turbo.ops.npu
-            return fsdp_turbo.ops.npu
-        elif device_type == 'cuda':
-            import fsdp_turbo.ops.cuda
-            return fsdp_turbo.ops.cuda
-        else:
-            raise ImportError
+            return importlib.import_module("fsdp_turbo.ops.npu")
+        if device_type == "cuda":
+            return importlib.import_module("fsdp_turbo.ops.cuda")
+        raise ImportError
     except ImportError:
-        log_warning_once(logger, f'[] Could not import fsdp_turbo.ops.{device_type} fallback to cpu ops!')
+        log_warning_once(
+            logger,
+            f"[] Could not import fsdp_turbo.ops.{device_type} fallback to cpu ops!",
+        )
         return None

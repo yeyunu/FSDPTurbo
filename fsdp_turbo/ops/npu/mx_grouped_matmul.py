@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
-import torch
 import weakref
+
+import torch
 from torch.distributed.tensor import DTensor
 
 try:
@@ -10,6 +11,7 @@ except ImportError:
 
 from fsdp_turbo.ops.registry import register_op
 from fsdp_turbo.quantization.core.recompute_phase import resolve_live_post_quant_weight
+from fsdp_turbo.utils.gmm_layout import to_gmm_3d
 
 
 @torch._dynamo.allow_in_graph
@@ -28,7 +30,6 @@ class MxGroupedMatmul(torch.autograd.Function):
         weight_bwd: torch.Tensor,
         weight_scale_bwd: torch.Tensor,
         weight_2d_shape: tuple,
-        weight_transposed: bool,
         grad_fp8_dtype,
         input_fp8_dtype,
         input_dtype,
@@ -38,7 +39,6 @@ class MxGroupedMatmul(torch.autograd.Function):
         weight_attr=None,
     ):
         ctx.weight_2d_shape = weight_2d_shape
-        ctx.weight_transposed = weight_transposed
         ctx.grad_fp8_dtype = grad_fp8_dtype
         ctx.input_fp8_dtype = input_fp8_dtype
         ctx.input_dtype = input_dtype
@@ -83,8 +83,8 @@ class MxGroupedMatmul(torch.autograd.Function):
                 ctx.weight_attr,
             )
             weight_bwd, weight_scale_bwd = w.get_backward_pair()
-            K = x.shape[-1]
-            weight_bwd = weight_bwd.view(len(group_list), K, -1).transpose(1, 2).contiguous()
+            # dx: grad [T, N] x W [E, N, K] - [E, K, N] transposed
+            weight_bwd = to_gmm_3d(weight_bwd, len(group_list)).transpose(1, 2).contiguous()
             weight_scale_bwd = weight_scale_bwd.transpose(1, 2).contiguous()
 
         group_list_int32 = group_list.to(torch.int32)
@@ -137,7 +137,8 @@ class MxGroupedMatmul(torch.autograd.Function):
                 split_item=3,
             )[0]
 
-        if ctx.weight_transposed:
+        # 3D stored [E, N, K] needs transpose back; 2D [E*K, N] reshapes directly
+        if len(ctx.weight_2d_shape) == 3:
             dw = dw.transpose(1, 2).reshape(ctx.weight_2d_shape)
         else:
             dw = dw.reshape(ctx.weight_2d_shape)
@@ -148,7 +149,6 @@ class MxGroupedMatmul(torch.autograd.Function):
         return (
             dx,
             dw,
-            None,
             None,
             None,
             None,
@@ -177,7 +177,6 @@ def mx_grouped_matmul_npu(
     weight_bwd,
     weight_scale_bwd,
     weight_2d_shape,
-    weight_transposed,
     grad_fp8_dtype,
     input_fp8_dtype,
     input_dtype,
@@ -196,7 +195,6 @@ def mx_grouped_matmul_npu(
         weight_bwd,
         weight_scale_bwd,
         weight_2d_shape,
-        weight_transposed,
         grad_fp8_dtype,
         input_fp8_dtype,
         input_dtype,

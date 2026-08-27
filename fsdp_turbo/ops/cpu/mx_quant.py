@@ -24,7 +24,9 @@ def _e4m3fn_quantize(tensor: torch.Tensor) -> torch.Tensor:
 @lru_cache(maxsize=None)
 def get_lut_256(device):
     e2m1 = torch.tensor(
-        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=torch.float16, device=device
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        dtype=torch.float16,
+        device=device,
     )
     indices = torch.arange(256, device=device, dtype=torch.int32)
     low = indices & 0x0F
@@ -81,7 +83,7 @@ def _mx_quant_single_axis(x: torch.Tensor, dim: int, block_size: int) -> tuple:
 
 
 @register_op('dynamic_mx_quant', 'cpu')
-def dynamic_mx_quant_cpu(x, axis=-1, dst_type=None, scale_alg=1, block_size=32):
+def dynamic_mx_quant_cpu(x, axis=-1, dst_type=None, scale_alg=1, block_size=32, round_mode=None):
     """Pure-torch e4m3 + per-block shared-exponent quantization (MX format).
 
     Bit-identical to ``npu_dynamic_mx_quant`` (scale_alg=1, block_size=32)
@@ -95,7 +97,13 @@ def dynamic_mx_quant_cpu(x, axis=-1, dst_type=None, scale_alg=1, block_size=32):
     return _mx_quant_single_axis(x, dim=axis, block_size=block_size)
 
 
-def transform_mxfp4_to_mxfp8(quant_fp4_packed, scale_fp4_packed, mx4_block_size=32, mx8_block_h=128, mx8_block_w=128):
+def transform_mxfp4_to_mxfp8(
+    quant_fp4_packed,
+    scale_fp4_packed,
+    mx4_block_size=32,
+    mx8_block_h=128,
+    mx8_block_w=128,
+):
     B, H, W_packed = quant_fp4_packed.shape
     original_W = W_packed * 2
     device = quant_fp4_packed.device
@@ -142,7 +150,7 @@ def expand_scale_to_per_row(scale_2d, block_size=32):
 
 def convert_mx_scale_to_axis2(weight_scale_mx, weight_shape, block_size_old=32):
     B, H_blocks_old, W_blocks_old = weight_scale_mx.shape
-    _, H, W = weight_shape
+    _, _, W = weight_shape
     W = W * 2
 
     ratio = 2
@@ -208,7 +216,11 @@ def mx_to_block_mx_quant_cpu(weight_mxfp4, weight_mxscale_mxfp4, dst_type, x_typ
         weight_mxfp4_3D = weight_mxfp4_3D.unsqueeze(0)
 
     weight_fwd_fp8, weight_scale_fp8 = transform_mxfp4_to_mxfp8(
-        weight_mxfp4_3D, weight_mxscale_mxfp4, mx4_block_size=32, mx8_block_h=32, mx8_block_w=32
+        weight_mxfp4_3D,
+        weight_mxscale_mxfp4,
+        mx4_block_size=32,
+        mx8_block_h=32,
+        mx8_block_w=32,
     )
 
     weight_fwd_scale_mxfp8 = expand_scale_to_per_row(weight_scale_fp8, block_size=32).to(torch.uint8)

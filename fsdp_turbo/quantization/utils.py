@@ -75,7 +75,15 @@ def _apply_modules_match(fqn: str, config, apply_attr: str, ignored_attr: str = 
     return any(module_name_match(pattern, prefix) for pattern in getattr(config, apply_attr, []))
 
 
-def quant_grouped_gemm(x, weight, split_list, config, grad_enabled=True):
+def quant_grouped_gemm(
+    x,
+    weight,
+    split_list,
+    config,
+    grad_enabled=True,
+    weight_owner=None,
+    weight_attr: str | None = None,
+):
     """Quantization-aware grouped matmul, dispatched by config type.
 
     split_list: per-expert token counts. W8A16Config -> fake quant +
@@ -93,7 +101,15 @@ def quant_grouped_gemm(x, weight, split_list, config, grad_enabled=True):
         return grouped_matmul(x, split_list, weight_3d)
 
     group_list = torch.cumsum(split_list, dim=0)
-    return mx_gemm(x, weight, group_list, config, grad_enabled=grad_enabled)
+    return mx_gemm(
+        x,
+        weight,
+        group_list,
+        config,
+        grad_enabled=grad_enabled,
+        weight_owner=weight_owner,
+        weight_attr=weight_attr,
+    )
 
 
 def resolve_expert_weights(module):

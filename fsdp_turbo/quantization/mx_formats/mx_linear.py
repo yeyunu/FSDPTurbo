@@ -13,26 +13,31 @@ from typing import Optional
 import weakref
 import torch
 
-try:
-    import torch_npu
-except ImportError:
-    torch_npu = None
-
 from torch.distributed.tensor import DTensor
 
-from fsdp_turbo.ops.quantize import mx_quant_matmul, mx_to_block_mx_quant
+from fsdp_turbo.ops.quantize import (
+    dynamic_mx_quant,
+    dynamic_mx_quant_with_dual_axis,
+    mx_quant_matmul,
+    mx_to_block_mx_quant,
+)
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
 from fsdp_turbo.quantization.core.pre_quant_weight import PreQuantWeight
 from fsdp_turbo.quantization.mx_formats.mx_tensor import MXTensor
-from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig
+from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig, float4_dtype
 from fsdp_turbo.quantization.core.recompute_phase import resolve_live_post_quant_weight
 from fsdp_turbo.quantization.utils import register_quantize_module_handler
 
 
 def weight_quant(weight, dst_type, quant_format):
     if quant_format == "W4A8":
-        weight_mxfp4, weight_mxscale_mxfp4 = torch_npu.npu_dynamic_mx_quant(
-            weight, axis=-1, round_mode="rint", dst_type=torch_npu.float4_e2m1fn_x2, block_size=32, scale_alg=0
+        weight_mxfp4, weight_mxscale_mxfp4 = dynamic_mx_quant(
+            weight,
+            axis=-1,
+            round_mode="rint",
+            dst_type=float4_dtype(),
+            block_size=32,
+            scale_alg=0,
         )
 
         weight_fwd, weight_scale_fwd, weight_scale_bwd = mx_to_block_mx_quant(
@@ -43,7 +48,7 @@ def weight_quant(weight, dst_type, quant_format):
         )
         weight_bwd = weight_fwd.clone()
     else:
-        weight_fwd, weight_scale_fwd, weight_bwd, weight_scale_bwd = torch_npu.npu_dynamic_mx_quant_with_dual_axis(
+        weight_fwd, weight_scale_fwd, weight_bwd, weight_scale_bwd = dynamic_mx_quant_with_dual_axis(
             weight, dst_type=dst_type
         )
 
@@ -65,7 +70,6 @@ class mx_mm(torch.autograd.Function):
         ctx.input_orig_shape = input_hp.shape
         input_hp = input_hp.reshape(-1, input_hp.size(-1))
 
-        # 低精量化
         input_mx = mx_tensor.to_mxfp8(input_hp, 'inputs')
 
         if isinstance(weight_hp, PostQuantWeight):
@@ -117,7 +121,6 @@ class mx_mm(torch.autograd.Function):
         grad_orig_shape = grad_output_hp.shape
         grad_output_hp = grad_output_hp.reshape(-1, grad_output_hp.size(-1))
 
-        # 低精量化
         grads_mx = mx_tensor.to_mxfp8(grad_output_hp, 'grads')
 
         if ctx.is_post_quant:
@@ -148,27 +151,17 @@ class mx_mm(torch.autograd.Function):
         grads_mx.data.untyped_storage().resize_(0)
         grads_mx.scale.untyped_storage().resize_(0)
 
-        if ctx.is_post_quant:
-            dw = mx_quant_matmul(
-                grads_mx.data_t.t(),
-                input_mx.data_t,
-                input_mx.scale_t,
-                pertoken_scale=grads_mx.scale_t.transpose(0, 1),
-                output_dtype=ori_dtype,
-                group_sizes=[1, 1, 32],
-            )
-        else:
-            weight_mx = ctx.weight_mx
-            dw = mx_quant_matmul(
-                grads_mx.data_t.t(),
-                input_mx.data_t,
-                input_mx.scale_t,
-                pertoken_scale=grads_mx.scale_t.transpose(0, 1),
-                output_dtype=ori_dtype,
-                group_sizes=[1, 1, 32],
-            )
-            weight_mx.data_t.untyped_storage().resize_(0)
-            weight_mx.scale_t.untyped_storage().resize_(0)
+        dw = mx_quant_matmul(
+            grads_mx.data_t.t(),
+            input_mx.data_t,
+            input_mx.scale_t,
+            pertoken_scale=grads_mx.scale_t.transpose(0, 1),
+            output_dtype=ori_dtype,
+            group_sizes=[1, 1, 32],
+        )
+        if not ctx.is_post_quant:
+            ctx.weight_mx.data_t.untyped_storage().resize_(0)
+            ctx.weight_mx.scale_t.untyped_storage().resize_(0)
 
         grads_mx.data_t.untyped_storage().resize_(0)
         grads_mx.scale_t.untyped_storage().resize_(0)

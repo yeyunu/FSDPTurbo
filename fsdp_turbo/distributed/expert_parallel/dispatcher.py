@@ -14,7 +14,12 @@ from fsdp_turbo.quantization.utils import quant_grouped_gemm
 
 
 def get_experts_forward_fn(ep_group, fused, fixed_router=False):
-    def experts_forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor):
+    def experts_forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ):
         # Ensure correct parameter order and dimensions
         top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
         hidden_states_shape = hidden_states.shape
@@ -42,6 +47,7 @@ def get_experts_forward_fn(ep_group, fused, fixed_router=False):
             self.expert_ids_per_ep_rank,
             act_limit,
             quant_config,
+            expert_module=self,
         )
         return hidden_states.view(*hidden_states_shape)
 
@@ -60,6 +66,7 @@ def dispatch_mlp_combine(
     expert_ids_per_ep_rank,
     act_limit,
     quant_config=None,
+    expert_module=None,
 ):
     gate_up_weights, down_weights = weights
     # MoE preprocess to get local/global indices and AllToAll split sizes
@@ -73,7 +80,15 @@ def dispatch_mlp_combine(
         ep_group, hidden_states, top_k_index, permute_indices, split_sizes, fused
     )
     hidden_states = experts_computation(
-        hidden_states, permute_indices[0], gate_up_weights, down_weights, act_fn, act_limit, fused, quant_config
+        hidden_states,
+        permute_indices[0],
+        gate_up_weights,
+        down_weights,
+        act_fn,
+        act_limit,
+        fused,
+        quant_config,
+        weight_owner=expert_module,
     )
     hidden_states = alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes, fused)
     return hidden_states
@@ -123,20 +138,36 @@ def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes
 
 
 def experts_computation(
-    hidden_states, split_list, gate_up_weights, down_weights, act_fn, act_limit, fused, quant_config=None
+    hidden_states,
+    split_list,
+    gate_up_weights,
+    down_weights,
+    act_fn,
+    act_limit,
+    fused,
+    quant_config=None,
+    weight_owner=None,
 ):
-    def gmm_fn(x, w):
+    def gmm_fn(x, w, weight_attr):
         if quant_config is not None:
-            return quant_grouped_gemm(x, w, split_list, quant_config, grad_enabled=torch.is_grad_enabled())
+            return quant_grouped_gemm(
+                x,
+                w,
+                split_list,
+                quant_config,
+                grad_enabled=torch.is_grad_enabled(),
+                weight_owner=weight_owner,
+                weight_attr=weight_attr,
+            )
         return grouped_matmul(x, split_list, w, use_eager=not fused)
 
-    fc1 = gmm_fn(hidden_states, gate_up_weights)
+    fc1 = gmm_fn(hidden_states, gate_up_weights, "gate_up_proj")
     gate, up = fc1.chunk(2, dim=-1)
     if act_limit is not None:
         gate = gate.clamp(max=act_limit)
         up = up.clamp(min=-act_limit, max=act_limit)
     act = act_fn(gate) * up
-    hidden_states = gmm_fn(act, down_weights)
+    hidden_states = gmm_fn(act, down_weights, "down_proj")
     return hidden_states
 
 

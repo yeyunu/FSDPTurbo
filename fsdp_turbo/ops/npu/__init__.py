@@ -12,7 +12,11 @@ from fsdp_turbo.ops.npu.mx_quant import (
 )
 from fsdp_turbo.ops.npu.permute import permute_npu, unpermute_npu
 from fsdp_turbo.ops.npu.rms_norm import rms_norm_npu
-from fsdp_turbo.ops.npu.sinkhorn import hc_split_sinkhorn_npu
+
+try:
+    from fsdp_turbo.ops.npu.sinkhorn import hc_split_sinkhorn_npu
+except ImportError:  # triton is optional; the package must still load without it
+    hc_split_sinkhorn_npu = None
 
 __all__ = [
     'causal_conv1d_npu',

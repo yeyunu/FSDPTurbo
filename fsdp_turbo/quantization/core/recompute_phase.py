@@ -179,31 +179,25 @@ def ensure_mxfp8_backward_phase(module: Any) -> None:
 
 def resolve_live_post_quant_weight(saved_weight: Any, owner_ref: Any, weight_attr: str):
     """Resolve the FSDP-owned weight after the replay-to-backward hand-off."""
-    live_weight = saved_weight
+    if owner_ref is None:
+        raise RuntimeError(
+            "MXFP8 backward weight resolution requires weight_owner; "
+            "all callers must pass the module that owns the weight"
+        )
+    if not isinstance(weight_attr, str) or not weight_attr:
+        raise RuntimeError("MXFP8 live weight resolution requires a non-empty owner attribute name")
+
+    owner = owner_ref()
+    if owner is None:
+        raise RuntimeError("MXFP8 weight owner was released before backward")
+    ensure_mxfp8_backward_phase(owner)
+    live_weight = getattr(owner, weight_attr, None)
     saved_local = saved_weight.to_local() if hasattr(saved_weight, "to_local") else saved_weight
-    if owner_ref is not None:
-        if not isinstance(weight_attr, str) or not weight_attr:
-            raise RuntimeError("MXFP8 live weight resolution requires a non-empty owner attribute name")
-        owner = owner_ref()
-        if owner is None:
-            raise RuntimeError("MXFP8 weight owner was released before backward")
-        ensure_mxfp8_backward_phase(owner)
-        live_weight = getattr(owner, weight_attr, None)
 
     if hasattr(live_weight, "to_local"):
         live_weight = live_weight.to_local()
 
     from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
-
-    # Keep direct/custom operator calls compatible when they do not provide a
-    # module owner. With an owner, only its canonical attribute is trusted so
-    # a mis-bound owner cannot be hidden by a stale autograd source chain.
-    if owner_ref is None:
-        while isinstance(live_weight, PostQuantWeight) and live_weight._weight_bwd is None:
-            source = getattr(live_weight, "_source", None)
-            if source is None:
-                break
-            live_weight = source
 
     if not isinstance(live_weight, PostQuantWeight):
         raise TypeError(

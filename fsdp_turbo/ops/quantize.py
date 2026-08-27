@@ -2,13 +2,21 @@
 from fsdp_turbo.ops import dispatch_op
 
 
-def dynamic_mx_quant(x, axis=-1, dst_type=None, scale_alg=0, block_size=32):
+def dynamic_mx_quant(x, axis=-1, dst_type=None, scale_alg=0, block_size=32, round_mode=None):
     """Dynamic MX quantization (e4m3 data + per-block e8m0 shared exponent).
 
     scale_alg: 0 = kernel default (MX path), 1 = FP8 block-scaling (W8A16).
     Returns (data, scale_bytes).
     """
-    return dispatch_op('dynamic_mx_quant', x, axis=axis, dst_type=dst_type, scale_alg=scale_alg, block_size=block_size)
+    return dispatch_op(
+        "dynamic_mx_quant",
+        x,
+        axis=axis,
+        dst_type=dst_type,
+        scale_alg=scale_alg,
+        block_size=block_size,
+        round_mode=round_mode,
+    )
 
 
 def dynamic_mx_quant_with_dual_axis(tensor, dst_type=None):
@@ -33,7 +41,14 @@ def swiglu(x, dim=-1):
     return dispatch_op('swiglu', x, dim=dim)
 
 
-def mx_quant_matmul(input_tensor, weight, scale, pertoken_scale=None, output_dtype=None, group_sizes=None):
+def mx_quant_matmul(
+    input_tensor,
+    weight,
+    scale,
+    pertoken_scale=None,
+    output_dtype=None,
+    group_sizes=None,
+):
     """FP8 (e4m3 data + e8m0 scales) quantized matmul.
 
     input [M, K] x weight [K, N], scale [num_k_blocks, N] and pertoken_scale
@@ -60,7 +75,6 @@ def mx_grouped_matmul(
     weight_bwd,
     weight_scale_bwd,
     weight_2d_shape,
-    weight_transposed,
     grad_dtype,
     input_dtype,
     x_dtype,
@@ -81,7 +95,6 @@ def mx_grouped_matmul(
         weight_bwd,
         weight_scale_bwd,
         weight_2d_shape,
-        weight_transposed,
         grad_dtype,
         input_dtype,
         x_dtype,
