@@ -26,7 +26,7 @@ def cached_weight_quant(
         )
         return quantizer(weight, *args, **kwargs)
 
-    key = weight.untyped_storage().data_ptr()
+    key = (weight.untyped_storage().data_ptr(), tuple(weight.shape), id(quantizer))
 
     if key in _weight_cache:
         _num_cache_hits += 1

@@ -11,7 +11,7 @@ except ImportError:
 
 from fsdp_turbo.ops.registry import register_op
 from fsdp_turbo.quantization.core.recompute_phase import resolve_live_post_quant_weight
-from fsdp_turbo.utils.gmm_layout import to_gmm_3d
+from fsdp_turbo.utils.gmm_layout import from_gmm_3d, to_gmm_3d
 
 
 @torch._dynamo.allow_in_graph
@@ -84,7 +84,7 @@ class MxGroupedMatmul(torch.autograd.Function):
             )
             weight_bwd, weight_scale_bwd = w.get_backward_pair()
             # dx: grad [T, N] x W [E, N, K] - [E, K, N] transposed
-            weight_bwd = to_gmm_3d(weight_bwd, len(group_list)).transpose(1, 2).contiguous()
+            weight_bwd = to_gmm_3d(weight_bwd, len(group_list), k=x.shape[1]).transpose(1, 2).contiguous()
             weight_scale_bwd = weight_scale_bwd.transpose(1, 2).contiguous()
 
         group_list_int32 = group_list.to(torch.int32)
@@ -136,12 +136,7 @@ class MxGroupedMatmul(torch.autograd.Function):
                 per_token_scale_dtype=torch_npu.float8_e8m0fnu,
                 split_item=3,
             )[0]
-
-        # 3D stored [E, N, K] needs transpose back; 2D [E*K, N] reshapes directly
-        if len(ctx.weight_2d_shape) == 3:
-            dw = dw.transpose(1, 2).reshape(ctx.weight_2d_shape)
-        else:
-            dw = dw.reshape(ctx.weight_2d_shape)
+            dw = from_gmm_3d(dw, ctx.weight_2d_shape)
 
         if ctx.post_quant and hasattr(ctx.weight_ref, "to_local"):
             dw = DTensor.from_local(dw, ctx.weight_ref.device_mesh, ctx.weight_ref.placements)

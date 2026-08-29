@@ -32,7 +32,7 @@ def weight_quant_gmm(weight: torch.Tensor, dst_type, new_shape: tuple, quant_for
     """
     original_shape = weight.shape
     num_experts = weight.numel() // (new_shape[1] * new_shape[2])
-    weight = to_gmm_3d(weight, num_experts)
+    weight = to_gmm_3d(weight, num_experts, k=new_shape[1])
     if quant_format == "W4A8":
         weight_mxfp4, weight_mxscale_mxfp4 = dynamic_mx_quant(
             weight,
@@ -103,9 +103,9 @@ def mx_quant_group_gemm(
         weight_fwd, weight_scale_fwd = pq.get_forward_pair()
         weight_bwd = None
         weight_scale_bwd = None
-        weight_fwd = to_gmm_3d(weight_fwd, num_experts)
+        weight_fwd = to_gmm_3d(weight_fwd, num_experts, k=x.shape[1])
     else:
-        weight_3d = to_gmm_3d(weight_unwrapped, num_experts)
+        weight_3d = to_gmm_3d(weight_unwrapped, num_experts, k=x.shape[1])
 
         if grad_enabled:
             if config.quant_format == 'W4A8':
@@ -215,7 +215,18 @@ class MXFP8GMM(torch.nn.Module):
 
         Returns:
             Output after expert computation.
+
+        Callers may pass (selected_experts, routing_weights) in either order;
+        the dtype check (integral indices, float weights) swaps a swapped pair.
         """
+        if (
+            isinstance(selected_experts, torch.Tensor)
+            and selected_experts.is_floating_point()
+            and isinstance(routing_weights, torch.Tensor)
+            and not routing_weights.is_floating_point()
+        ):
+            selected_experts, routing_weights = routing_weights, selected_experts
+
         from fsdp_turbo.ops.moe import permute, unpermute
 
         permuted_hidden_states, row_ids_map = permute(hidden_states, selected_experts.to(torch.int32))

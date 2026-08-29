@@ -78,7 +78,7 @@ def test_storage_layout_round_trip_preserves_quantized_op_layout():
     """
     e, k, n = 4, 8, 6
 
-    for stored_shape in ((e * k, n), (e, n, k)):
+    for stored_shape in ((e * k, n), (e, n, k), (e, k, n)):
         captured = {}
         weight = torch.randn(*stored_shape)
         with patch(
@@ -87,8 +87,27 @@ def test_storage_layout_round_trip_preserves_quantized_op_layout():
         ):
             weight_fwd, _, weight_bwd, _ = weight_quant_gmm(weight, torch.bfloat16, (-1, k, n), quant_format="E4M3")
 
-        assert torch.equal(to_gmm_3d(weight_fwd, e), captured["input"])
-        assert torch.equal(to_gmm_3d(weight_bwd, e), captured["input"])
+        assert torch.equal(to_gmm_3d(weight_fwd, e, k=k), captured["input"])
+        assert torch.equal(to_gmm_3d(weight_bwd, e, k=k), captured["input"])
+
+
+def test_weight_quant_gmm_3d_op_layout_quantizes_without_transpose():
+    """3D [E, K, N] (op layout, MindSpeed-MM style): no transpose in or out."""
+    e, k, n = 4, 8, 6
+    weight = torch.randn(e, k, n)
+    captured = {}
+
+    with patch(
+        "fsdp_turbo.quantization.mx_formats.mx_gmm.dynamic_mx_quant_with_dual_axis",
+        side_effect=_quantizer_mock(captured),
+    ):
+        weight_fwd, _, weight_bwd, _ = weight_quant_gmm(weight, torch.bfloat16, (-1, k, n), quant_format="E4M3")
+
+    assert captured["input"] is not None
+    assert captured["input"].shape == (e, k, n)
+    assert torch.equal(captured["input"], weight)  # no transpose
+    assert weight_fwd.shape == weight.shape and torch.equal(weight_fwd, weight)
+    assert weight_bwd.shape == weight.shape and torch.equal(weight_bwd, weight)
 
 
 def _post_quant_weight(fwd_shape, bwd_shape=None):
@@ -127,6 +146,66 @@ def test_post_quant_path_views_fwd_pair_in_gmm_layout():
     assert weight_fwd.shape == (e, k, n)
     assert torch.equal(weight_fwd, pq._weight_fwd.view(e, k, -1))
     assert weight_bwd is None
+
+
+def test_post_quant_path_keeps_3d_op_layout_storage():
+    """is_post_quant with 3D [E, K, N] stored: fwd pair reaches kernel as-is."""
+    e, k, n = 4, 8, 6
+    x = torch.randn(8, k, dtype=torch.bfloat16)
+    group_list = torch.tensor([2, 4, 6, 8], dtype=torch.int64)
+    pq = _post_quant_weight(fwd_shape=(e, k, n))
+    config = Mock()
+    config.get_key_dtype.return_value = torch.bfloat16
+
+    with (
+        patch(
+            "fsdp_turbo.quantization.mx_formats.mx_gmm.dynamic_mx_quant",
+            return_value=(x, torch.ones(8, 1)),
+        ),
+        patch(
+            "fsdp_turbo.quantization.mx_formats.mx_gmm.mx_grouped_matmul",
+            return_value=torch.zeros(8, n, dtype=torch.bfloat16),
+        ) as grouped_matmul,
+    ):
+        mx_quant_group_gemm(x, pq, group_list, config, weight_owner=Mock(), weight_attr="down_proj")
+
+    weight_fwd = grouped_matmul.call_args.args[4]
+    assert weight_fwd.shape == (e, k, n)
+    assert torch.equal(weight_fwd, pq._weight_fwd)  # stored as-is, no transpose
+
+
+def test_plain_weight_3d_op_layout_quantizes_without_transpose():
+    """else path with 3D [E, K, N] stored: fwd stays [E, K, N], bwd transposed."""
+    e, k, n = 4, 8, 6
+    x = torch.randn(8, k, dtype=torch.bfloat16)
+    weight = torch.randn(e, k, n, dtype=torch.bfloat16)
+    group_list = torch.tensor([2, 4, 6, 8], dtype=torch.int64)
+    config = Mock()
+    config.get_key_dtype.return_value = torch.bfloat16
+    captured = {}
+
+    with (
+        patch(
+            "fsdp_turbo.quantization.mx_formats.mx_gmm.dynamic_mx_quant",
+            return_value=(x, torch.ones(8, 1)),
+        ),
+        patch(
+            "fsdp_turbo.quantization.mx_formats.mx_gmm.dynamic_mx_quant_with_dual_axis",
+            side_effect=_quantizer_mock(captured),
+        ),
+        patch(
+            "fsdp_turbo.quantization.mx_formats.mx_gmm.mx_grouped_matmul",
+            return_value=torch.zeros(8, n, dtype=torch.bfloat16),
+        ) as grouped_matmul,
+    ):
+        mx_quant_group_gemm(x, weight, group_list, config)
+
+    assert captured["input"].shape == (e, k, n)  # no transpose for op layout
+    weight_fwd = grouped_matmul.call_args.args[4]
+    weight_bwd = grouped_matmul.call_args.args[6]
+    assert weight_fwd.shape == (e, k, n)
+    assert weight_bwd.shape == (e, n, k)
+    assert torch.equal(weight_bwd, weight.transpose(1, 2))
 
 
 def test_plain_weight_grad_enabled_quantizes_bwd_pair_transposed():
