@@ -72,7 +72,7 @@ distributed:
   data_parallel_size: 1
   fully_shard_parallel_size: 16
   tensor_parallel_size: 1
-  ulysses_parallel_size: 1  # Ulysses CP: split sequence across 2 ranks
+  ulysses_parallel_size: 2  # Ulysses CP: split sequence across 2 ranks
   expert_parallel_size: 16
   expert_fully_shard_parallel_size: 1
   expert_data_parallel_size: 1
@@ -114,6 +114,24 @@ distributed:
     # model-specific eager EP implementation instead of the generic GLU path.
     dispatcher: custom_ep_forward_eager
 
+  # --- Context Parallel Plan ---
+  cp_plan:
+    ulysses_function_patches:
+      - target_functions:
+          - modeling_kimi_linear.eager_attention_forward
+        type: full_attention
+      - target_functions:
+          - modeling_kimi_linear.KimiDeltaAttention.forward
+        type: kda
+    loss_function_patches:
+      - target_functions:
+          - transformers.loss.loss_utils.ForCausalLMLoss
+        type: causal_lm_loss
+
+# --- Module Patch Plan ---
+module_patches:
+  - target: modeling_kimi_k3.KimiK3ForConditionalGeneration.forward
+    replacement: fsdp_turbo.models.kimi.kimi_k3_cp.kimi_k3_model_forward
 
 # --- Memory Configuration ---
 memory:

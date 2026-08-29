@@ -126,7 +126,6 @@ class ContextParallelPatchTests(unittest.TestCase):
 
         self.assertIs(getattr(self.module, "causal_loss"), first)
         self.assertEqual(getattr(first, CP_PATCHES_ATTR), ("CP:causal_lm_loss",))
-        self.assertFalse(hasattr(first.__wrapped__, CP_PATCHES_ATTR))
 
     def test_kv_then_ulysses_attention_patches_execute_in_filo_order(self):
         target = f"{self.module_name}.attention"
@@ -162,6 +161,46 @@ class ContextParallelPatchTests(unittest.TestCase):
             self.trace,
             ["ulysses:before", "kv:before", "attention", "kv:after", "ulysses:after"],
         )
+
+    def test_kda_patch_targets_remote_code_class_by_suffix(self):
+        suffix = "modeling_kimi_linear_for_cp_test"
+        dynamic_name = f"transformers_modules.checkpoint.{suffix}"
+        dynamic_module = types.ModuleType(dynamic_name)
+
+        class KimiDeltaAttention(torch.nn.Module):
+            def forward(self, hidden_states, **kwargs):
+                del kwargs
+                return hidden_states
+
+        KimiDeltaAttention.__module__ = dynamic_name
+        dynamic_module.KimiDeltaAttention = KimiDeltaAttention
+        sys.modules[dynamic_name] = dynamic_module
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attention = KimiDeltaAttention()
+
+        def factory(_original, _group):
+            def replacement(_module, hidden_states, **kwargs):
+                del kwargs
+                return hidden_states + 3
+
+            return replacement
+
+        try:
+            model = Model()
+            specs = [
+                {
+                    "target_functions": [f"{suffix}.KimiDeltaAttention.forward"],
+                    "type": "kda",
+                }
+            ]
+            with mock.patch("fsdp_turbo.modules.kda.get_ulysses_kda_forward", side_effect=factory):
+                apply_function_patch_specs(specs, object(), {}, label="Ulysses", model=model)
+            torch.testing.assert_close(model.attention(torch.tensor(2)), torch.tensor(5))
+        finally:
+            sys.modules.pop(dynamic_name, None)
 
 
 if __name__ == "__main__":

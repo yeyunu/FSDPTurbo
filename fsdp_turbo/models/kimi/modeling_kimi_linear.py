@@ -91,6 +91,18 @@ from fsdp_turbo.ops.triton.causal_conv1d_utils import tensor_cache
 
 from fsdp_turbo.modules.short_conv import ShortConvolution
 
+try:
+    from triton_ascend_kernels.attention.fla.kda.chunk import chunk_kda
+except ImportError:
+    # Triton Ascend kernels are optional; fall back to the registered
+    # small-op implementation when they are unavailable.
+    from fsdp_turbo.ops.kda import chunk_kda
+
+    _USE_FUSED_KDA_KERNEL = False
+else:
+    _USE_FUSED_KDA_KERNEL = True
+
+
 from .configuration_kimi_k3 import KimiLinearConfig
 
 assert version.parse(transformers.__version__) >= version.parse("4.56.0"), "Please upgrade transformers to >= 4.56.0"
@@ -686,13 +698,7 @@ class KimiDeltaAttention(nn.Module):
         #     elif kda_implementation == "naive":
         #         # 小算子版本
         beta = torch.sigmoid(beta)
-        try:
-            from triton_ascend_kernels.attention.fla.kda.chunk import chunk_kda
-        except ImportError:
-            # Triton Ascend kernels are optional; fall back to the registered
-            # small-op implementation when they are unavailable.
-            from fsdp_turbo.ops.kda import chunk_kda
-
+        if not _USE_FUSED_KDA_KERNEL:
             o, recurrent_state = chunk_kda(
                 q=q,
                 k=k,
@@ -1258,10 +1264,11 @@ class KimiLinearModel(KimiPreTrainedModel):
             self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
         if getattr(config, "_attn_implementation", None) is not None:
-            if config._attn_implementation != "flash_attention_2":
-                logger.warning_once(f"Ignoring the provided attention implementation {config._attn_implementation}")
-                logger.warning_once("Using flash_attention_2 backend instead.")
-                config._attn_implementation = "flash_attention_2"
+            # if config._attn_implementation != "flash_attention_2":
+            #     logger.warning_once(f"Ignoring the provided attention implementation {config._attn_implementation}")
+            #     logger.warning_once("Using flash_attention_2 backend instead.")
+            #     config._attn_implementation = "flash_attention_2"
+            logger.warning_once("Using {config._attn_implementation} backend.")
         else:
             config._attn_implementation = "flash_attention_2"
 

@@ -220,7 +220,11 @@ def import_module_or_suffix(module_path):
 
     The suffix fallback supports dotted paths whose leading components are
     namespace/package prefixes while preserving import errors raised from an
-    existing module's own dependencies.
+    existing module's own dependencies.  Hugging Face remote-code modules are
+    loaded below a generated ``transformers_modules.<checkpoint>`` package;
+    when a normal import cannot find the requested suffix, reuse a uniquely
+    loaded module with that suffix so configuration does not depend on the
+    checkpoint directory name.
     """
     parts = module_path.split(".")
     for index in range(len(parts)):
@@ -231,6 +235,16 @@ def import_module_or_suffix(module_path):
             missing = error.name or ""
             if missing != candidate and not candidate.startswith(f"{missing}."):
                 raise
+    loaded_matches = [
+        module
+        for name, module in tuple(sys.modules.items())
+        if module is not None and (name == module_path or name.endswith(f".{module_path}"))
+    ]
+    if len(loaded_matches) == 1:
+        return loaded_matches[0]
+    if len(loaded_matches) > 1:
+        names = sorted(getattr(module, "__name__", repr(module)) for module in loaded_matches)
+        raise ImportError(f"Ambiguous loaded module suffix {module_path!r}: {names}.")
     raise ModuleNotFoundError(f"No module named {module_path!r}.")
 
 
@@ -239,7 +253,7 @@ def resolve_owner_member(path: str):
     module_path, sep, member_name = path.rpartition(".")
     if not sep:
         raise ValueError(f"Invalid member path {path!r}.")
-    return importlib.import_module(module_path), member_name
+    return import_module_or_suffix(module_path), member_name
 
 
 def resolve_class_member(path: str):
@@ -250,7 +264,7 @@ def resolve_class_member(path: str):
     module_path, sep, class_name = class_path.rpartition(".")
     if not sep:
         raise ValueError(f"Invalid class member path {path!r}; use 'module.Class.member'.")
-    cls = getattr(importlib.import_module(module_path), class_name, None)
+    cls = getattr(import_module_or_suffix(module_path), class_name, None)
     if not isinstance(cls, type):
         raise TypeError(f"Resolved class {class_path!r} is not a type.")
     return cls, member_name

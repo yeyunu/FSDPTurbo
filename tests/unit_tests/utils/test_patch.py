@@ -4,7 +4,12 @@ import types
 import unittest
 
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig, load_config_from_yaml
-from fsdp_turbo.utils.patch import apply_module_patches, patch_model_members, patch_namespace_members
+from fsdp_turbo.utils.patch import (
+    apply_module_patches,
+    patch_model_members,
+    patch_namespace_members,
+    resolve_callable,
+)
 
 
 def patched_function(value, bias=0):
@@ -179,6 +184,48 @@ class PatchTargetTests(unittest.TestCase):
         self.assertEqual(matched, 1)
         self.assertEqual(getattr(self.owner, "target_function")(2, bias=3), 15)
         self.assertEqual(getattr(self.alias, "target_function")(2, bias=3), 15)
+
+    def test_remote_code_module_can_be_resolved_by_unique_suffix(self):
+        suffix = "modeling_remote_function_for_patch_test"
+        dynamic_name = f"transformers_modules.checkpoint.{suffix}"
+        dynamic_module = types.ModuleType(dynamic_name)
+
+        def remote_function(value):
+            return value + 1
+
+        dynamic_module.remote_function = remote_function
+        sys.modules[dynamic_name] = dynamic_module
+        try:
+            resolved = resolve_callable(f"{suffix}.remote_function")
+            self.assertIs(resolved, remote_function)
+        finally:
+            sys.modules.pop(dynamic_name, None)
+
+    def test_remote_code_class_member_can_be_patched_by_unique_suffix(self):
+        suffix = "modeling_remote_kimi"
+        dynamic_name = f"transformers_modules.checkpoint.{suffix}"
+        dynamic_module = types.ModuleType(dynamic_name)
+
+        class RemoteBlock:
+            def forward(self, value):
+                return value * 2
+
+        RemoteBlock.__module__ = dynamic_name
+        dynamic_module.RemoteBlock = RemoteBlock
+        sys.modules[dynamic_name] = dynamic_module
+
+        class RemoteModel:
+            def __init__(self):
+                self.block = RemoteBlock()
+
+            def named_modules(self):
+                return [("", self), ("block", self.block)]
+
+        try:
+            matched = patch_model_members(RemoteModel(), f"{suffix}.RemoteBlock.forward", patched_method)
+            self.assertEqual(matched, 1)
+        finally:
+            sys.modules.pop(dynamic_name, None)
 
     def test_namespace_member_patch_is_idempotent_and_calls_callback_once(self):
         callbacks = []
