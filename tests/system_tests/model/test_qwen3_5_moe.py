@@ -24,9 +24,10 @@ from fsdp_turbo.fsdp_turbo_config import (
     MemoryConfig,
 )
 from fsdp_turbo.models.qwen.qwen3_5_moe import qwen3_5_moe_model_forward
+from fsdp_turbo.training.clip_grads import compute_grad_norm
 from fsdp_turbo.utils.device import set_accelerator_compatible
 from fsdp_turbo.utils.log import set_log_level
-from fsdp_turbo.utils.model import set_num_hidden_layers
+from fsdp_turbo.utils.model import init_submodule_weights, set_num_hidden_layers
 from fsdp_turbo.utils.random import set_seed
 
 
@@ -44,7 +45,7 @@ BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '1'))
 MAX_LENGTH = int(os.environ.get('MAX_LENGTH', '512'))
 NUM_WORKERS = int(os.environ.get('NUM_WORKERS', '0'))
 LR = 1e-4
-NUM_STEPS = int(os.environ.get('NUM_STEPS', '3'))
+NUM_STEPS = int(os.environ.get('NUM_STEPS', '10'))
 # Reduce language-model layers and randomly initialize (CI mode, no weights).
 NUM_HIDDEN_LAYERS = int(os.environ.get('NUM_HIDDEN_LAYERS', '4'))
 
@@ -87,8 +88,9 @@ def get_model_tokenizer(config):
     taken from ``config.model.model_name_or_path`` (config.json +
     tokenizer/processor only, no weights), the language decoder is reduced via
     ``config.model.num_hidden_layers``, and the model is built on the ``meta``
-    device then materialized on NPU via ``to_empty`` (random init). The
-    processor is loaded for multimodal data (images + conversations).
+    device. trainer_with_config then materializes it via ``to_empty`` and
+    randomly initializes it via ``_init_weights`` BEFORE FSDPTurbo wrapping.
+    The processor is loaded for multimodal data (images + conversations).
     """
     model_config = AutoConfig.from_pretrained(config.model.model_name_or_path)
     model_config._attn_implementation = "eager"
@@ -211,16 +213,14 @@ def train_step(model, batch, optimizer):
 
     outputs = model.forward(**batch)
     loss = outputs.loss
-
-    if torch.accelerator.current_device_index() == 0:
-        print(f'[Rank {torch.accelerator.current_device_index()}] Loss: {loss.item()}')
-
     loss.backward()
+    grad_norm = compute_grad_norm(list(model.parameters()))
+
     optimizer.step()
     clear_weight_cache()
     model.zero_grad()
 
-    return loss
+    return loss, grad_norm
 
 
 def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, enable_profiler=False):
@@ -243,8 +243,11 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
         print(f'{"=" * 60}\n')
 
     model, processor = get_model_tokenizer(config)
-    model = FSDPTurbo(config, model)
     model.to_empty(device='npu')
+    init_submodule_weights(model.model.language_model, name="language_model")
+    init_submodule_weights(model.model.visual, name="visual")
+    model.tie_weights()
+    model = FSDPTurbo(config, model)
     dataloader = get_dataloader(processor)
 
     if torch.accelerator.current_device_index() == 0:
@@ -280,10 +283,9 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
 
             torch.distributed.barrier()
             torch.npu.reset_peak_memory_stats()
-            print(f'[Rank {torch.accelerator.current_device_index()}] start step {i}')
 
             step_start = time.perf_counter()
-            loss = train_step(model, batch, optimizer)
+            loss, grad_norm = train_step(model, batch, optimizer)
             torch.npu.synchronize()
             step_time = time.perf_counter() - step_start
 
@@ -296,6 +298,7 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
                     f'[Rank {torch.accelerator.current_device_index()}] step {i} '
                     f'step time: {step_time:.4f}s '
                     f'loss: {loss.item():.4f} '
+                    f'grad norm: {grad_norm:.4f} '
                     f'memory: {torch.npu.memory_allocated() / 1024**3:.4f} GB '
                     f'max memory: {torch.npu.max_memory_allocated() / 1024**3:.4f} GB',
                 )

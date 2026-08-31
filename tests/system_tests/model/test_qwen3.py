@@ -25,6 +25,7 @@ from fsdp_turbo.fsdp_turbo_config import (
     QuantizationConfig,
     ChunkBatchPlanConfig,
 )
+from fsdp_turbo.training.clip_grads import compute_grad_norm
 from fsdp_turbo.utils.device import set_accelerator_compatible
 from fsdp_turbo.utils.log import set_log_level
 from fsdp_turbo.utils.random import set_seed
@@ -45,7 +46,7 @@ LOG_LEVEL = 'INFO'
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '1'))
 MAX_LENGTH = int(os.environ.get('MAX_LENGTH', '512'))
 LR = 1e-4
-NUM_STEPS = int(os.environ.get('NUM_STEPS', '3'))
+NUM_STEPS = int(os.environ.get('NUM_STEPS', '10'))
 
 # Parallel configuration
 TENSOR_PARALLEL_SIZE = int(os.environ.get('TENSOR_PARALLEL_SIZE', '2'))
@@ -154,7 +155,7 @@ def get_complete_custom_config():
                 reduce_dtype='fp32',
                 output_dtype='bf16',
                 hook_modules=['model.layers.{*}'],
-                fsdp_implementation='custom',
+                fsdp_implementation='native',
                 num_to_forward_prefetch=1,
                 num_to_backward_prefetch=1,
             ),
@@ -191,7 +192,7 @@ def get_complete_custom_config():
 # Training loop
 # ============================================================
 def train_step(model, batch, optimizer):
-    """Execute a single training step: forward, backward, optimizer step, zero_grad."""
+    """Execute a single training step: forward, backward, grad norm, optimizer step, zero_grad."""
     input_ids = batch['input_ids'].npu()
     attention_mask = batch['attention_mask'].npu()
     labels = batch['labels'].npu()
@@ -199,15 +200,14 @@ def train_step(model, batch, optimizer):
     outputs = model.forward(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
     loss = outputs.loss
 
-    if torch.accelerator.current_device_index() == 0:
-        print(f'[Rank {torch.accelerator.current_device_index()}] Loss: {loss.item()}')
-
     loss.backward()
+    grad_norm = compute_grad_norm(list(model.parameters()))
+
     optimizer.step()
     clear_weight_cache()
     model.zero_grad()
 
-    return loss
+    return loss, grad_norm
 
 
 def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, enable_profiler=False):
@@ -266,10 +266,9 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
 
             torch.distributed.barrier()
             torch.npu.reset_peak_memory_stats()
-            print(f'[Rank {torch.accelerator.current_device_index()}] start step {i}')
 
             step_start = time.perf_counter()
-            loss = train_step(model, batch, optimizer)
+            loss, grad_norm = train_step(model, batch, optimizer)
             torch.npu.synchronize()
             step_time = time.perf_counter() - step_start
 
@@ -282,6 +281,7 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
                     f'[Rank {torch.accelerator.current_device_index()}] step {i} '
                     f'step time: {step_time:.4f}s '
                     f'loss: {loss.item():.4f} '
+                    f'grad norm: {grad_norm:.4f} '
                     f'memory: {torch.npu.memory_allocated() / 1024**3:.4f} GB '
                     f'max memory: {torch.npu.max_memory_allocated() / 1024**3:.4f} GB',
                 )
