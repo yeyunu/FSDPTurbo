@@ -75,10 +75,19 @@ class SwapOptimizerOperate:
         self.byte_param = 4 if params[0].dtype == torch.float32 else 2
         self.total_memory = torch.accelerator.get_device_properties(torch.accelerator.current_device()).total_memory
 
+    @staticmethod
+    def _memory_allocated():
+        # torch.accelerator.memory_allocated() internally asserts with
+        # torch_npu ("Allocator for npu is not a DeviceAllocator"),
+        # so query the NPU backend directly when it is available.
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return torch.npu.memory_allocated()
+        return torch.accelerator.memory_allocated()
+
     def get_swap_numel_from_unused_memory(self):
         # The available accelerator memory can be used to calculate
         # the number of parameters that can be transferred simultaneously.
-        used_memory = torch.accelerator.memory_allocated()
+        used_memory = self._memory_allocated()
         unused_memory = self.total_memory - used_memory
 
         # for example: the memory of exp_avg and exp_avg_sq of  is  (self.byte_param * 2)

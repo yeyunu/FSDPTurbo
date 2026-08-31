@@ -11,21 +11,22 @@ from fsdp_turbo.utils.log import print_rank
 
 logger = logging.getLogger(__name__)
 
+
 def convert_model_dtype(model, dtype):
     for param in model.parameters():
         param.data = param.data.to(dtype)
     for buffer in model.buffers():
         buffer.data = buffer.data.to(dtype)
 
-class DeepseekV4Trainer(BaseTrainer):
 
+class DeepseekV4Trainer(BaseTrainer):
     def __init__(self, config):
         super().__init__(config)
         self.config = config
 
     def build_model(self):
         from transformers.models.deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4Config
-        import modeling_deepseek_v4
+        import modeling_deepseek_v4  # noqa: F401  (side-effect import: registers the model)
 
         print_rank(logger.info, "> Building DeepseekV4 Model...")
         model_config = DeepseekV4Config()
@@ -39,9 +40,20 @@ class DeepseekV4Trainer(BaseTrainer):
             model = DeepseekV4ForCausalLM(model_config)
         convert_model_dtype(model, self.config.model.torch_dtype)
 
+        # The model is constructed on meta, so its constructor cannot
+        # produce real initialized values. Save the HF initializer before
+        # wrapping, since the FSDPTurbo wrapper does not expose it.
+        init_weights = model._init_weights
+
         print_rank(logger.info, "> Applying FSDPTurbo parallelism...")
         model = FSDPTurbo(self.config, model)
         model.to_empty(device='npu')
+
+        # Initialize the materialized local shards. Use _init_weights
+        # directly: modules were already marked as initialized while the
+        # model was on meta, so init_weights() would skip them.
+        with torch.no_grad():
+            model.apply(init_weights)
 
         # indexer grad bypass
         for name, module in model.named_modules():

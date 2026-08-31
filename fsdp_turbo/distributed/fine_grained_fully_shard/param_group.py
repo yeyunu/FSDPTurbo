@@ -1,5 +1,10 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 
+# pylint cannot see the attributes initialized by torch's FSDPParamGroup
+# (torch is not importable in the lint environment), so it reports
+# attribute-defined-outside-init / access-member-before-definition for
+# inherited state such as _all_gather_result and _post_reduce_event.
+# pylint: disable=attribute-defined-outside-init,access-member-before-definition
 from typing import Any
 
 import torch
@@ -36,10 +41,6 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
     - Overrides wait_for_unshard and post_backward methods
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.reduce_scatter_reduce_op = None
-
     def wait_for_unshard(self):
         """
         Waits for preceding All-Gather operations to complete before unsharding.
@@ -58,9 +59,7 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
                 if not hasattr(fsdp_param, '_unsharded_param'):
                     unsharded_param = fsdp_param._sharded_local_tensor
                     if fsdp_param.is_dtensor:
-                        unsharded_param = _from_local_no_grad(
-                            unsharded_param, fsdp_param._tp_spec
-                        )
+                        unsharded_param = _from_local_no_grad(unsharded_param, fsdp_param._tp_spec)
                     fsdp_param._unsharded_param = unsharded_param
             self._to_unsharded()
             self._all_gather_result = None
@@ -97,7 +96,7 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
         else:
             self._wait_all_gather_streams_on_event(all_gather_copy_out_event)
         self._all_gather_result = None  # free unless saved in `all_gather_state`
-    
+
     def post_backward(self, *unused: Any):
         """
         Custom post-backward logic for gradient reduction and resharding.
@@ -144,9 +143,7 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
         with record_function(self._with_fqn("FSDP::post_backward_reduce")):
             # Wait for local context reduce-scatter
             if self.comm_ctx.reduce_scatter_state is not None:
-                self.device_handle.current_stream().wait_event(
-                    self.comm_ctx.reduce_scatter_state.event
-                )
+                self.device_handle.current_stream().wait_event(self.comm_ctx.reduce_scatter_state.event)
                 self.comm_ctx.reduce_scatter_state = None
 
             # Wait for GLOBAL context reduce-scatters from DIFFERENT hook modules
@@ -161,9 +158,7 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
                 # this means the native HSDP is not enabled,
                 # but user may want to have a custom HSDP setup
                 if self._all_reduce_hook is None:
-                    raise AssertionError(
-                        "all reduce hook stream is specified but hook itself is missing."
-                    )
+                    raise AssertionError("all reduce hook stream is specified but hook itself is missing.")
                 all_reduce_stream = self._all_reduce_hook_stream
             else:
                 all_reduce_stream = self.comm_ctx.all_reduce_stream
@@ -185,7 +180,12 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
                 self._orig_dtype,
                 self._reduce_dtype,
                 self.device,
-                self.reduce_scatter_reduce_op,
+                # The 9th positional argument of torch's foreach_reduce is
+                # gradient_divide_factor (not a reduce op): passing
+                # reduce_scatter_reduce_op (=None) here silently dropped the
+                # factor set via set_gradient_divide_factor, so EP expert
+                # gradients stayed SUM instead of MEAN.
+                self.gradient_divide_factor,
                 self._all_reduce_process_group if self._is_hsdp else None,
                 all_reduce_stream,
                 self.all_reduce_grads,
@@ -198,6 +198,4 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
             if all_reduce_input is not None:
                 if all_reduce_event is None:
                     raise AssertionError("all_reduce_event cannot be None.")
-                self._all_reduce_state = AllReduceState(
-                    all_reduce_input, all_reduce_event
-                )
+                self._all_reduce_state = AllReduceState(all_reduce_input, all_reduce_event)
