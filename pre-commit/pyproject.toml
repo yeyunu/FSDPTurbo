@@ -77,6 +77,10 @@ disable = [
   # 所有保护成员访问警告
   "protected-access",
 
+  # 继承属性在 __init__ 外定义/定义前访问（FSDP 父类固有写法）
+  "attribute-defined-outside-init",
+  "access-member-before-definition",
+
   # 所有风格优化建议
   "no-else-raise",
   "no-else-return",

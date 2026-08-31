@@ -5,6 +5,7 @@
 # attribute-defined-outside-init / access-member-before-definition for
 # inherited state such as _all_gather_result and _post_reduce_event.
 # pylint: disable=attribute-defined-outside-init,access-member-before-definition
+import inspect
 from typing import Any
 
 import torch
@@ -31,6 +32,42 @@ from fsdp_turbo.distributed.fine_grained_fully_shard.state import (
 )
 
 
+def _get_foreach_reduce_sig() -> inspect.Signature:
+    """
+    Return the real ``inspect.Signature`` of ``foreach_reduce``.
+
+    ``foreach_reduce`` is wrapped by ``@torch.no_grad()`` which produces a
+    ``context_decorator`` wrapper.  Although the wrapper uses
+    ``functools.wraps`` (setting ``__wrapped__``), some Python/torch
+    combinations do not make ``inspect.signature`` follow that chain, yielding
+    a useless ``(*args, **kwargs)``.  We explicitly ``inspect.unwrap`` first
+    so the true parameter list is always obtained.
+    """
+    return inspect.signature(inspect.unwrap(foreach_reduce))
+
+
+_FOREACH_REDUCE_SIG = _get_foreach_reduce_sig()
+
+
+def _call_foreach_reduce(**kwargs: Any):
+    """
+    Call ``foreach_reduce`` with only the keyword arguments that the installed
+    PyTorch version actually accepts.
+
+    ``foreach_reduce``'s signature evolves across releases (params renamed,
+    added, or removed).  Instead of branching on version, we build a *superset*
+    of all candidate arguments and rely on ``Signature.bind`` to keep only the
+    ones the live function declares, discarding the rest.  This gives a single
+    code path that works on every version with zero if/else.
+
+    Returns the raw tuple from ``foreach_reduce`` (6 elements on 2.6–2.8,
+    7 elements on ``main`` where ``post_reduce_stream`` was added).
+    """
+    valid = _FOREACH_REDUCE_SIG.parameters
+    filtered = {k: v for k, v in kwargs.items() if k in valid}
+    return foreach_reduce(**filtered)
+
+
 class FSDPParamGroup(PyTorchFSDPParamGroup):
     """
     FSDPTurbo Extended FSDP Parameter Group
@@ -40,6 +77,18 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
     - global_comm_ctx: Supports multiple communication contexts
     - Overrides wait_for_unshard and post_backward methods
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # ``reduce_scatter_reduce_op`` was renamed to ``gradient_divide_factor``
+        # in PyTorch 2.8.0.  Newer torch initialises both in the parent
+        # ``__init__``; older versions do not, so initialise whichever
+        # attribute the installed ``foreach_reduce`` signature expects.
+        _params = _FOREACH_REDUCE_SIG.parameters
+        if "reduce_scatter_reduce_op" in _params and not hasattr(self, "reduce_scatter_reduce_op"):
+            self.reduce_scatter_reduce_op = None
+        if "gradient_divide_factor" in _params and not hasattr(self, "gradient_divide_factor"):
+            self.gradient_divide_factor = None
 
     def wait_for_unshard(self):
         """
@@ -154,44 +203,66 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
 
             all_reduce_pg = self._all_reduce_process_group if self._is_hsdp else None
             all_reduce_stream: torch.cuda.Stream
-            if all_reduce_pg is None and self._all_reduce_hook_stream is not None:
+            _all_reduce_hook_stream = getattr(self, "_all_reduce_hook_stream", None)
+            if all_reduce_pg is None and _all_reduce_hook_stream is not None:
                 # this means the native HSDP is not enabled,
                 # but user may want to have a custom HSDP setup
-                if self._all_reduce_hook is None:
+                _all_reduce_hook = getattr(self, "_all_reduce_hook", None)
+                if _all_reduce_hook is None:
                     raise AssertionError("all reduce hook stream is specified but hook itself is missing.")
-                all_reduce_stream = self._all_reduce_hook_stream
+                all_reduce_stream = _all_reduce_hook_stream
             else:
                 all_reduce_stream = self.comm_ctx.all_reduce_stream
 
             self._wait_for_post_backward()
+
+            # Pass a superset of all version-specific arguments; ``_call_foreach_reduce``
+            # keeps only those the installed ``foreach_reduce`` actually accepts.
+            # Note: on torch >= 2.8 the divide argument is ``gradient_divide_factor``
+            # (not a reduce op) -- passing ``reduce_scatter_reduce_op`` (=None) there
+            # would silently drop the factor set via ``set_gradient_divide_factor``,
+            # leaving EP expert gradients SUM instead of MEAN.
+            reduce_result = _call_foreach_reduce(
+                fsdp_params=fsdp_params_with_grad,
+                unsharded_grads=unsharded_grads,
+                reduce_scatter_group=self._reduce_scatter_process_group,
+                reduce_scatter_stream=self.comm_ctx.reduce_scatter_stream,
+                reduce_scatter_comm=getattr(self, "_reduce_scatter_comm", None),
+                orig_dtype=self._orig_dtype,
+                reduce_dtype=self._reduce_dtype,
+                device=self.device,
+                reduce_scatter_reduce_op=getattr(self, "reduce_scatter_reduce_op", None),
+                gradient_divide_factor=getattr(self, "gradient_divide_factor", None),
+                all_reduce_group=self._all_reduce_process_group if self._is_hsdp else None,
+                all_reduce_stream=all_reduce_stream,
+                all_reduce_grads=self.all_reduce_grads,
+                partial_reduce_output=self._partial_reduce_output,
+                all_reduce_hook=getattr(self, "_all_reduce_hook", None),
+                force_sum_reduction_for_comms=getattr(self, "force_sum_reduction_for_comms", False),
+            )
+            # ``main`` returns 7 values (adds ``post_reduce_stream``);
+            # 2.6/2.7/2.8/2.9 return 6.  Unpack the common tail uniformly.
             (
                 reduce_scatter_input,
                 reduce_scatter_event,
-                self._post_reduce_event,
-                all_reduce_input,
-                all_reduce_event,
-                self._partial_reduce_output,
-            ) = foreach_reduce(
-                fsdp_params_with_grad,
-                unsharded_grads,
-                self._reduce_scatter_process_group,
-                self.comm_ctx.reduce_scatter_stream,
-                self._reduce_scatter_comm,
-                self._orig_dtype,
-                self._reduce_dtype,
-                self.device,
-                # The 9th positional argument of torch's foreach_reduce is
-                # gradient_divide_factor (not a reduce op): passing
-                # reduce_scatter_reduce_op (=None) here silently dropped the
-                # factor set via set_gradient_divide_factor, so EP expert
-                # gradients stayed SUM instead of MEAN.
-                self.gradient_divide_factor,
-                self._all_reduce_process_group if self._is_hsdp else None,
-                all_reduce_stream,
-                self.all_reduce_grads,
-                self._partial_reduce_output,
-                self._all_reduce_hook,
-            )
+                *rest,
+            ) = reduce_result
+            # ``main`` inserts ``post_reduce_stream`` before ``_post_reduce_event``
+            if len(rest) == 4:  # _post_reduce_event, all_reduce_input, all_reduce_event, _partial_reduce_output
+                (
+                    self._post_reduce_event,
+                    all_reduce_input,
+                    all_reduce_event,
+                    self._partial_reduce_output,
+                ) = rest
+            else:  # len == 5 on ``main``: _post_reduce_stream, _post_reduce_event, ...
+                (
+                    _post_reduce_stream,
+                    self._post_reduce_event,
+                    all_reduce_input,
+                    all_reduce_event,
+                    self._partial_reduce_output,
+                ) = rest
             self.comm_ctx.reduce_scatter_state = ReduceScatterState(
                 reduce_scatter_input, reduce_scatter_event, self.hook_module
             )
