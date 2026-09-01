@@ -12,6 +12,20 @@ from fsdp_turbo.quantization.mxfp8_config import MXFP8LinearConfig
 from fsdp_turbo.quantization.utils import _QUANTIZE_CONFIG_HANDLER
 
 
+def _move_real_tensors_to(module: nn.Module, device: torch.device) -> None:
+    """Move real (non-meta) params/buffers to ``device``; never touch meta tensors.
+
+    meta->real would allocate uninitialized storage and real->meta would discard
+    data, so meta tensors are left for later FSDP / weight-loading materialization.
+    """
+    if device is None:
+        return
+    device = torch.device(device)
+    if device.type == "meta":
+        return  # never metafy real weights
+    module._apply(lambda t: t if t.is_meta or t.device == device else t.to(device))
+
+
 def _replace_with_custom_fn_if_matches_filter(  # pylint: disable=keyword-arg-before-vararg
     model,
     config,
@@ -24,7 +38,7 @@ def _replace_with_custom_fn_if_matches_filter(  # pylint: disable=keyword-arg-be
     if filter_fn(model, cur_fqn[:-1], config):
         name = cur_fqn[:-1]
         if device is not None:
-            model.to(device=device)  # move to device before quantization
+            _move_real_tensors_to(model, device)
             model = replacement_fn(model, config)
             return model
         else:
@@ -44,7 +58,7 @@ def _replace_with_custom_fn_if_matches_filter(  # pylint: disable=keyword-arg-be
             if new_child is not child and new_child is not None:
                 setattr(model, name, new_child)
         if device is not None:
-            model.to(device=device)
+            _move_real_tensors_to(model, device)
         return model
 
 
