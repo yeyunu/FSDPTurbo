@@ -169,6 +169,7 @@ def get_complete_custom_config():
             ep_plan=EPPlanConfig(
                 apply_modules=['model.layers.{*}.mlp.experts'],
                 dispatcher='fused',
+                fixed_router=True,
             ),
         ),
         memory=MemoryConfig(
