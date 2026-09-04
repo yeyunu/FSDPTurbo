@@ -287,9 +287,7 @@ class FSDPTurboConfig:
         if self.distributed.fully_shard_parallel_size > 1:
             if self.distributed.expert_parallel_size > 1:
                 self.distributed.fsdp_plan.ignored_modules.extend(self.distributed.ep_plan.apply_modules)
-            if self.distributed.tensor_parallel_size > 1:
-                self.distributed.fsdp_plan.ignored_modules.extend(self.distributed.tp_plan.colwise_parallel)
-                self.distributed.fsdp_plan.ignored_modules.extend(self.distributed.tp_plan.rowwise_parallel)
+
             self.distributed.fsdp_plan.ignored_modules = list(
                 set(self.distributed.fsdp_plan.ignored_modules)
             )  # remove duplicates

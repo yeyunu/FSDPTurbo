@@ -79,7 +79,7 @@ class ParallelState(metaclass=Singleton):
 
         # create CDP/CP/Ulysses groups as a separate device mesh
         self.context_data_parallel_size = self._create_mesh(
-            ('data', 'kvallgather', 'ulysses', 'tp'),
+            ('data', 'kvallgather', 'ulysses', 'ctp'),
             (self.kv_allgather_parallel_size, self.ulysses_parallel_size, self.tensor_parallel_size),
         )
 

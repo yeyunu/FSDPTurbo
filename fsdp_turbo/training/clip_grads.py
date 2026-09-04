@@ -23,9 +23,15 @@ try:
     from torch.distributed._tensor import DTensor
     from torch.distributed.tensor.placement_types import Shard
 
+    try:
+        from torch.distributed.tensor.placement_types import _StridedShard
+    except ImportError:
+        _StridedShard = None
+
     _HAS_DTENSOR = True
 except ImportError:
     _HAS_DTENSOR = False
+    _StridedShard = None
 
 
 # ------------------------------------------------------------------
@@ -65,7 +71,10 @@ def _get_shard_groups_if_dtensor(
     # requires an all-reduce for norm sync.
     groups = []
     for dim_idx, placement in enumerate(tensor.placements):
-        if isinstance(placement, Shard):
+        is_shard = isinstance(placement, Shard)
+        if not is_shard and _StridedShard is not None:
+            is_shard = isinstance(placement, _StridedShard)
+        if is_shard:
             groups.append(mesh.get_group(dim_idx))
     return groups
 
