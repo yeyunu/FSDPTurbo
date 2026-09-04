@@ -31,6 +31,7 @@ class FSDPTurbo(torch.nn.Module):
         self.apply_module_patches()
         self.apply_ep_modules()
         self.apply_recompute_modules()
+        self.apply_swap_activation_modules()
         self.apply_chunk_batch_modules()
         self.apply_fsdp_modules()
 
@@ -101,6 +102,13 @@ class FSDPTurbo(torch.nn.Module):
         if not self.config.memory.recompute:
             return
         self.model = recompute_modules(self.model, self.config.memory.recompute_plan)
+
+    def apply_swap_activation_modules(self):
+        if not self.config.memory.swap_activation:
+            return
+        from fsdp_turbo.memory.swap_activation.swap_activation import swap_activation_modules
+
+        self.model = swap_activation_modules(self.model, self.config.memory.swap_activation_plan.apply_modules)
 
     def _capture_tp_info_on_mx_linear(self):
         if self.config.distributed.tensor_parallel_size <= 1:

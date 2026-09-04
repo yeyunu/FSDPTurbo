@@ -35,6 +35,10 @@ class OptimizerConfig:
     min_lr: float = 0.0
     clip_grad: float = 1.0
     clip_grad_norm_type: float = 2.0
+    # Swap optimizer (AdamWSwap) only: fraction of free memory used for batched H2D transfers
+    mem_fraction_static: Optional[float] = None
+    # Swap optimizer (AdamWSwap) only: state keys participating in swap; None uses the default
+    state_keys: Optional[List[str]] = None
 
 
 @dataclass
@@ -212,18 +216,33 @@ class ChunkBatchPlanConfig:
 
 
 @dataclass
+class SwapActivationPlanConfig:
+    """Configure which modules offload activations.
+
+    Example: ``apply_modules=["model.layers.{*}"]`` applies to all decoder layers.
+    Matching rules are the same as recompute_plan, using module_name_match.
+    """
+
+    apply_modules: List[str] = None
+
+
+@dataclass
 class MemoryConfig:
     """Memory-saving feature switches.
 
     ``recompute`` reduces saved activations by re-running module forwards during
     backward. ``chunk_batch`` reduces per-module forward/backward peaks by
     splitting the batch dimension into smaller micro batches.
+    ``swap_activation`` offloads saved activations to host memory and fetches
+    them back during backward, trading PCIe bandwidth for device memory.
     """
 
     recompute: bool = False
     recompute_plan: List[str] = None
     chunk_batch: bool = False
     chunk_batch_plan: Optional[ChunkBatchPlanConfig] = None
+    swap_activation: bool = False
+    swap_activation_plan: Optional[SwapActivationPlanConfig] = None
 
 
 @dataclass
@@ -252,6 +271,7 @@ class FSDPTurboConfig:
         self.validate_ep_config()
         self.validate_recompute_config()
         self.validate_chunk_batch_config()
+        self.validate_swap_activation_config()
         self.validate_quantization_config()
         self.validate_fsdp_config()
 
@@ -459,6 +479,27 @@ class FSDPTurboConfig:
             raise ValueError(
                 "chunk_batch_plan must specify chunk_arg_indexs or chunk_kwarg_names when chunk_batch is enabled."
             )
+
+    def validate_swap_activation_config(self):
+        """Normalize and validate swap-activation configuration.
+
+        When the feature is off, ensure the plan is None so downstream code can
+        treat a non-None plan as an enabled signal. When on, require a non-empty
+        apply_modules list — matching no module would silently disable swap.
+        """
+        if not self.memory.swap_activation:
+            self.memory.swap_activation_plan = None
+            return
+        self.memory.swap_activation_plan = (
+            SwapActivationPlanConfig() if self.memory.swap_activation_plan is None else self.memory.swap_activation_plan
+        )
+        self.memory.swap_activation_plan.apply_modules = (
+            []
+            if self.memory.swap_activation_plan.apply_modules is None
+            else self.memory.swap_activation_plan.apply_modules
+        )
+        if not self.memory.swap_activation_plan.apply_modules:
+            raise ValueError("swap_activation_plan.apply_modules must not be empty when swap_activation is enabled.")
 
     def validate_quantization_config(self):
         self.quantization.quantization_plan = (

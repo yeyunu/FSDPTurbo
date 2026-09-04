@@ -333,13 +333,21 @@ class BaseTrainer:
         from fsdp_turbo.quantization.cache import hook_optimizer_step
         from fsdp_turbo.training.factories import OptimizerFactory
 
-        optimizer = OptimizerFactory.create(
-            self.config.optimizer.optimizer_type,
-            self.model.parameters(),
+        kwargs = dict(
             lr=self.config.optimizer.lr,
             weight_decay=self.config.optimizer.weight_decay,
             betas=(self.config.optimizer.adam_beta1, self.config.optimizer.adam_beta2),
             eps=self.config.optimizer.adam_epsilon,
+        )
+        # Swap optimizer specific kwargs: None means use AdamWSwap internal defaults
+        if self.config.optimizer.mem_fraction_static is not None:
+            kwargs["mem_fraction_static"] = self.config.optimizer.mem_fraction_static
+        if self.config.optimizer.state_keys is not None:
+            kwargs["state_keys"] = self.config.optimizer.state_keys
+        optimizer = OptimizerFactory.create(
+            self.config.optimizer.optimizer_type,
+            self.model.parameters(),
+            **kwargs,
         )
         hook_optimizer_step(self.model, optimizer)
         return optimizer
