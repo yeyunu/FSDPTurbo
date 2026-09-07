@@ -71,10 +71,10 @@ class mx_mm(torch.autograd.Function):
         input_hp = input_hp.reshape(-1, input_hp.size(-1))
 
         input_mx = mx_tensor.to_mxfp8(input_hp, 'inputs')
+        ctx.ori_dtype = input_mx.ori_dtype
 
         if isinstance(weight_hp, PostQuantWeight):
             ctx.is_post_quant = True
-            ctx.weight_pq = weight_hp
             ctx.weight_owner_ref = weakref.ref(weight_owner) if weight_owner is not None else None
             weight_fwd, weight_scale_fwd = weight_hp.get_forward_pair()
 
@@ -86,10 +86,10 @@ class mx_mm(torch.autograd.Function):
                 output_dtype=input_hp.dtype,
                 group_sizes=[1, 1, 32],
             )
+            ctx.save_for_backward(input_mx.data_t, input_mx.scale_t, weight_hp)
         else:
             ctx.is_post_quant = False
             weight_mx = mx_tensor.to_mxfp8(weight_hp, 'weight')
-            ctx.weight_mx = weight_mx
 
             output = mx_quant_matmul(
                 input_mx.data,
@@ -99,13 +99,7 @@ class mx_mm(torch.autograd.Function):
                 output_dtype=input_hp.dtype,
                 group_sizes=[1, 1, 32],
             )
-            weight_mx.data.untyped_storage().resize_(0)
-            weight_mx.scale.untyped_storage().resize_(0)
-
-        ctx.input_mx = input_mx
-
-        input_mx.data.untyped_storage().resize_(0)
-        input_mx.scale.untyped_storage().resize_(0)
+            ctx.save_for_backward(input_mx.data_t, input_mx.scale_t, weight_mx.data_t, weight_mx.scale_t)
 
         if len(ctx.input_orig_shape) != 2:
             output = output.reshape(*ctx.input_orig_shape[:-1], output.shape[-1])
@@ -115,16 +109,17 @@ class mx_mm(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output_hp: torch.Tensor):
-        input_mx = ctx.input_mx
         mx_tensor = ctx.mx_tensor
-        ori_dtype = input_mx.ori_dtype
+        saved = ctx.saved_tensors
+        input_data_t, input_scale_t = saved[0], saved[1]
+        ori_dtype = ctx.ori_dtype
         grad_orig_shape = grad_output_hp.shape
         grad_output_hp = grad_output_hp.reshape(-1, grad_output_hp.size(-1))
 
         grads_mx = mx_tensor.to_mxfp8(grad_output_hp, 'grads')
 
         if ctx.is_post_quant:
-            weight_pq = resolve_live_post_quant_weight(ctx.weight_pq, ctx.weight_owner_ref, "weight")
+            weight_pq = resolve_live_post_quant_weight(saved[2], ctx.weight_owner_ref, "weight")
             weight_bwd, weight_scale_bwd = weight_pq.get_backward_pair()
             dx = mx_quant_matmul(
                 grads_mx.data,
@@ -135,11 +130,11 @@ class mx_mm(torch.autograd.Function):
                 group_sizes=[1, 1, 32],
             )
         else:
-            weight_mx = ctx.weight_mx
+            weight_data_t, weight_scale_t = saved[2], saved[3]
             dx = mx_quant_matmul(
                 grads_mx.data,
-                weight_mx.data_t,
-                weight_mx.scale_t,
+                weight_data_t,
+                weight_scale_t,
                 pertoken_scale=grads_mx.scale,
                 output_dtype=ori_dtype,
                 group_sizes=[1, 1, 32],
@@ -153,20 +148,15 @@ class mx_mm(torch.autograd.Function):
 
         dw = mx_quant_matmul(
             grads_mx.data_t.t(),
-            input_mx.data_t,
-            input_mx.scale_t,
+            input_data_t,
+            input_scale_t,
             pertoken_scale=grads_mx.scale_t.transpose(0, 1),
             output_dtype=ori_dtype,
             group_sizes=[1, 1, 32],
         )
-        if not ctx.is_post_quant:
-            ctx.weight_mx.data_t.untyped_storage().resize_(0)
-            ctx.weight_mx.scale_t.untyped_storage().resize_(0)
 
         grads_mx.data_t.untyped_storage().resize_(0)
         grads_mx.scale_t.untyped_storage().resize_(0)
-        input_mx.data_t.untyped_storage().resize_(0)
-        input_mx.scale_t.untyped_storage().resize_(0)
 
         return dx, dw, None, None
 

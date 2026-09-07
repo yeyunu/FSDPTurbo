@@ -15,6 +15,7 @@ def cached_weight_quant(
     weight: torch.Tensor,
     quantizer: Callable[[torch.Tensor, Any], Any],
     *args,
+    cache_source: torch.Tensor | None = None,
     **kwargs,
 ) -> Any:
     global _num_quantized, _num_cache_hits
@@ -26,7 +27,14 @@ def cached_weight_quant(
         )
         return quantizer(weight, *args, **kwargs)
 
-    key = (weight.untyped_storage().data_ptr(), tuple(weight.shape), id(quantizer))
+    source = weight if cache_source is None else cache_source
+    key = (
+        source.device,
+        source.untyped_storage().data_ptr(),
+        source.storage_offset(),
+        tuple(source.shape),
+        id(quantizer),
+    )
 
     if key in _weight_cache:
         _num_cache_hits += 1

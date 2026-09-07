@@ -153,13 +153,16 @@ class PreQuantWeight(torch.Tensor):
         fsdp_state = get_module_fsdp_state(module)
         reshard_after_forward = fsdp_state._fsdp_param_group._reshard_after_forward
 
-        hp_tensor = self._tensor
+        source_tensor = self._tensor
+        hp_tensor = source_tensor
         if hp_tensor.dtype == torch.float32:
             hp_tensor = hp_tensor.to(torch.bfloat16)
         if not hp_tensor.is_contiguous():
             hp_tensor = hp_tensor.contiguous()
 
-        weight_fwd, scale_fwd, weight_bwd, scale_bwd = cached_weight_quant(hp_tensor, self._quantizer)
+        weight_fwd, scale_fwd, weight_bwd, scale_bwd = cached_weight_quant(
+            hp_tensor, self._quantizer, cache_source=source_tensor
+        )
 
         world_size = mesh.size() if mesh is not None else 1
 
