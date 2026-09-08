@@ -1,6 +1,6 @@
-# 2026 Brain-inspired computing lab
-# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
-#
+# Copyright (c) 2026, Brain-inspired computing lab.
+# Copyright (c) 2023-2026, Songlin Yang Yu Zhang Zhiyuan Li.
+# Copyright (c) 2023-2025, Songlin Yang Yu Zhang.
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 # For a list of all contributors, visit:
@@ -13,6 +13,11 @@ import warnings
 import torch
 from torch import nn
 from einops import rearrange
+
+try:
+    from mindspeed_ops.api.triton.convolution import causal_conv1d
+except ModuleNotFoundError:
+    from fsdp_turbo.ops.causal_conv1d import causal_conv1d
 
 
 class ShortConvolution(nn.Conv1d):
@@ -173,8 +178,6 @@ class ShortConvolution(nn.Conv1d):
 
         if self.implementation == 'ascendc':
             raise ValueError(f"Unsupported causal conv1d implementation: {self.implementation}. ")
-
-        from fsdp_turbo.ops.causal_conv1d import causal_conv1d
 
         return causal_conv1d(
             x=x,

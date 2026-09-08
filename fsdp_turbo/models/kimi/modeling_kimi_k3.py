@@ -385,6 +385,7 @@ class MoonVision3dPatchEmbed(nn.Module):
         pos_emb_time: int = 4,
         pos_emb_type: str = 'divided_fixed',
         patch_embed_proj_bias: bool = True,
+        pos_emb_interpolation_mode: str = 'bicubic',
     ):
         super().__init__()
         assert isinstance(patch_size, int | Sequence), f'Invalid patch_size type: {type(patch_size)}'
@@ -397,7 +398,11 @@ class MoonVision3dPatchEmbed(nn.Module):
 
         if pos_emb_type == 'divided_fixed':
             self.pos_emb = Learnable2DInterpPosEmbDivided_fixed(
-                height=pos_emb_height, width=pos_emb_width, num_frames=pos_emb_time, dim=out_dim
+                height=pos_emb_height,
+                width=pos_emb_width,
+                num_frames=pos_emb_time,
+                dim=out_dim,
+                interpolation_mode=pos_emb_interpolation_mode,
             )
         else:
             raise NotImplementedError(f'Not support pos_emb_type: {pos_emb_type}')
@@ -730,6 +735,7 @@ class MoonViT3dPretrainedModel(PreTrainedModel):
             pos_emb_time=config.init_pos_emb_time,
             pos_emb_type=config.pos_emb_type,
             patch_embed_proj_bias=getattr(config, 'patch_embed_proj_bias', True),
+            pos_emb_interpolation_mode=getattr(config, 'pos_emb_interpolation_mode', 'bicubic'),
         )
 
         self.encoder = MoonViT3dEncoder(
@@ -922,6 +928,7 @@ class VisionTowerConfig(PretrainedConfig):
         self.patch_embed_proj_bias = getattr(config, 'patch_embed_proj_bias', True)
         self.mlp_type = getattr(config, 'mlp_type', 'mlp2')
         self.linear_bias = getattr(config, 'linear_bias', True)
+        self.pos_emb_interpolation_mode = getattr(config, 'pos_emb_interpolation_mode', 'bilinear')
 
 
 class ProjectorConfig:

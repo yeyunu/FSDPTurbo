@@ -17,6 +17,7 @@ try:
     from fsdp_turbo.ops.npu.sinkhorn import hc_split_sinkhorn_npu
 except ImportError:  # triton is optional; the package must still load without it
     hc_split_sinkhorn_npu = None
+from fsdp_turbo.ops.npu.situ_glu import situ_glu_npu
 
 __all__ = [
     'causal_conv1d_npu',
@@ -35,4 +36,5 @@ __all__ = [
     'rms_norm_npu',
     'hc_split_sinkhorn_npu',
     'mx_to_block_mx_quant_npu',
+    'situ_glu_npu',
 ]

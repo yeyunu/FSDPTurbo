@@ -160,21 +160,27 @@ class SituAndMul(nn.Module):
     """
     SituAndMul activation: beta * tanh(gate / beta) * sigmoid(gate) * up
     When linear_beta is set, up is also transformed by linear_beta * tanh(up / linear_beta).
+
+    Internally uses fused CANN op on NPU, falls back to eager otherwise.
     """
 
-    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+    def __init__(self, beta: float = 1.0, linear_beta: float | None = None, use_eager: bool = False):
         super().__init__()
         self.beta = beta
         self.linear_beta = linear_beta
+        self.use_eager = use_eager
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        gate = x[..., :d].to(torch.float32)
-        up = x[..., d:].to(torch.float32)
-        situ_a = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
-        if self.linear_beta is not None:
-            up = self.linear_beta * torch.tanh(up / self.linear_beta)
-        return (situ_a * up).to(x.dtype)
+        from fsdp_turbo.ops.situ_glu import fused_situ_glu
+
+        return fused_situ_glu(
+            x,
+            dim=-1,
+            beta=self.beta,
+            linear_beta=self.linear_beta,
+            activate_left=True,
+            use_eager=self.use_eager,
+        )
 
 
 ACT2FN["situ"] = SituAndMul
@@ -320,10 +326,15 @@ class KimiRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        dtype = hidden_states.dtype
-        x = hidden_states.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
-        return self.weight * x.to(dtype)
+        if get_accelerator_name() == "npu":
+            if hidden_states.dtype != self.weight.dtype:
+                hidden_states = hidden_states.to(self.weight.dtype)
+            return rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        else:
+            dtype = hidden_states.dtype
+            x = hidden_states.float()
+            x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+            return self.weight * x.to(dtype)
 
 
 ALL_LAYERNORM_LAYERS.append(KimiRMSNorm)
@@ -345,6 +356,7 @@ class KimiBlockSparseMLP(nn.Module):
             self.act_fn = SituAndMul(
                 beta=beta,
                 linear_beta=linear_beta,
+                use_eager=getattr(config, "use_eager_situ_glu", False),
             )
         else:
             self.act_fn = ACT2FN[config.hidden_act]
@@ -373,6 +385,7 @@ class KimiMLP(nn.Module):
             self.act_fn = SituAndMul(
                 beta=beta,
                 linear_beta=linear_beta,
+                use_eager=getattr(config, "use_eager_situ_glu", False),
             )
         else:
             self.act_fn = ACT2FN[config.hidden_act]
@@ -691,13 +704,6 @@ class KimiDeltaAttention(nn.Module):
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
 
-        # if mode == 'chunk':
-        #     kda_implementation = getattr(self.config, "kda_implementation", "fused")
-        #     if kda_implementation == "fused":
-        # 融合大算子（triton_ascend_kernels）
-        #     elif kda_implementation == "naive":
-        #         # 小算子版本
-        beta = torch.sigmoid(beta)
         if not _USE_FUSED_KDA_KERNEL:
             o, recurrent_state = chunk_kda(
                 q=q,
@@ -719,6 +725,11 @@ class KimiDeltaAttention(nn.Module):
                 chunk_size=64,
             )
         else:
+            if get_accelerator_name() == "npu":
+                use_beta_sigmoid_in_kernel = False
+                beta = torch.sigmoid(beta)
+            else:
+                use_beta_sigmoid_in_kernel = True
             o, recurrent_state = chunk_kda(
                 q=q,
                 k=k,
@@ -731,37 +742,14 @@ class KimiDeltaAttention(nn.Module):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
                 use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=False,
+                use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
                 safe_gate=self.gate_lower_bound is not None,
                 lower_bound=self.gate_lower_bound,
                 transpose_state_layout=True,
                 cu_seqlens=cu_seqlens,
                 skip_recompute=getattr(self.config, "skip_kda_recompute", False),
             )
-        #     else:
-        #         raise ValueError(
-        #             f"Unsupported kda_implementation: {kda_implementation}. "
-        #             "Expected 'fused' or 'naive'."
-        #         )
 
-        # else:
-        #     o, recurrent_state = fused_recurrent_kda(
-        #         q=q,
-        #         k=k,
-        #         v=v,
-        #         g=g,
-        #         beta=beta,
-        #         A_log=self.A_log,
-        #         dt_bias=self.dt_bias,
-        #         initial_state=recurrent_state,
-        #         output_final_state=True,
-        #         use_qk_l2norm_in_kernel=True,
-        #         use_gate_in_kernel=True,
-        #         use_beta_sigmoid_in_kernel=True,
-        #         lower_bound=self.gate_lower_bound,
-        #         transpose_state_layout=True,
-        #         cu_seqlens=cu_seqlens,
-        #     )
         if cache_params is not None:
             cache_params.recurrent_states[self.layer_idx] = recurrent_state
             cache_params.conv_states[self.layer_idx] = (conv_state_q, conv_state_k, conv_state_v)
