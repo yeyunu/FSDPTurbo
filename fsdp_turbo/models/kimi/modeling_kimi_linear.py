@@ -87,7 +87,7 @@ except ImportError:
 from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.utils.device import get_accelerator_name
 from fsdp_turbo.utils.log import print_rank
-from fsdp_turbo.ops.triton.causal_conv1d_utils import tensor_cache
+from fsdp_turbo.ops.triton.utils import tensor_cache
 
 from fsdp_turbo.modules.short_conv import ShortConvolution
 

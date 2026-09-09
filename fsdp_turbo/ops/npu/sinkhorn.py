@@ -4,11 +4,10 @@ import torch
 from fsdp_turbo.ops.registry import register_op
 from fsdp_turbo.ops.triton.sinkhorn_kernel import hc_split_sinkhorn as _hc_split_sinkhorn_kernel
 from fsdp_turbo.ops.triton.sinkhorn_kernel import hc_split_sinkhorn_backward as _hc_split_sinkhorn_backward_kernel
-from mindspeed.lite.ops.triton.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
+from fsdp_turbo.ops.triton.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
 
 class HcSplitSinkhornFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     @autocast_custom_fwd
@@ -19,16 +18,9 @@ class HcSplitSinkhornFunction(torch.autograd.Function):
         hc_base: torch.Tensor,
         hc_mult: int = 4,
         sinkhorn_iters: int = 20,
-        eps: float = 1e-6
+        eps: float = 1e-6,
     ):
-        pre, post, comb = _hc_split_sinkhorn_kernel(
-            mixes,
-            hc_scale,
-            hc_base,
-            hc_mult,
-            sinkhorn_iters,
-            eps
-        )
+        pre, post, comb = _hc_split_sinkhorn_kernel(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
 
         ctx.save_for_backward(mixes, hc_scale, hc_base)
         ctx.hc_mult = hc_mult
@@ -52,9 +44,7 @@ class HcSplitSinkhornFunction(torch.autograd.Function):
         eps = ctx.eps
 
         grad_mixes, grad_scale, grad_base = _hc_split_sinkhorn_backward_kernel(
-            grad_pre, grad_post, grad_comb,
-            mixes, hc_scale, hc_base,
-            hc_mult, sinkhorn_iters, eps
+            grad_pre, grad_post, grad_comb, mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps
         )
 
         return grad_mixes, grad_scale, grad_base, None, None, None
@@ -67,16 +57,9 @@ def _hc_split_sinkhorn_triton(
     hc_base: torch.Tensor,
     hc_mult: int = 4,
     sinkhorn_iters: int = 20,
-    eps: float = 1e-6
+    eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    pre, post, comb = HcSplitSinkhornFunction.apply(
-        mixes,
-        hc_scale,
-        hc_base,
-        hc_mult,
-        sinkhorn_iters,
-        eps
-    )
+    pre, post, comb = HcSplitSinkhornFunction.apply(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
     return pre, post, comb
 
 

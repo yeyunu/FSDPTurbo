@@ -26,7 +26,7 @@ try:
 except ImportError:
     pass
 
-from fsdp_turbo.ops.triton.causal_conv1d_utils import get_vector_num, input_guard, prepare_chunk_indices
+from fsdp_turbo.ops.triton.utils import get_vector_num, input_guard, prepare_chunk_indices
 
 
 @triton.heuristics(

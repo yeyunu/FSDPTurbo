@@ -19,7 +19,7 @@ _PLACEHOLDER = torch.empty(0)
 
 
 def _is_arch35() -> bool:
-    from fsdp_turbo.ops.triton.causal_conv1d_utils import is_arch35
+    from fsdp_turbo.ops.triton.utils import is_arch35
 
     return is_arch35()
 
