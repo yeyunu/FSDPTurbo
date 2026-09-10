@@ -200,9 +200,9 @@ function run_testcase () {
 
     mkdir -p "${GENERATE_LOG_DIR}"
 
-    shopt -s nullglob
-    local test_files=("${SHELL_SCRIPTS_DIR}"/run_test_*.sh)
-    shopt -u nullglob
+    shopt -s nullglob globstar
+    local test_files=("${SHELL_SCRIPTS_DIR}"/**/run_test_*.sh)
+    shopt -u nullglob globstar
 
     if [[ ${#test_files[@]} -eq 0 ]]; then
         echo "No run_test_*.sh files found in ${SHELL_SCRIPTS_DIR}"

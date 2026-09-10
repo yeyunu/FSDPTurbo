@@ -8,22 +8,35 @@
 tests/system_tests/
 ├── README.md                          # 本文档
 ├── model/                             # 训练脚本与用例
-│   ├── run_test_qwen3.sh              # Qwen3 启动脚本（torchrun，全层真实权重）
-│   ├── run_test_qwen3_5.sh            # Qwen3.5 dense 启动脚本（torchrun）
-│   ├── run_test_qwen3_5_moe.sh        # Qwen3.5-MoE 启动脚本
-│   ├── test_qwen3.py                  # Qwen3 训练循环（含每步指标打印）
-│   ├── test_qwen3_5.py                # dense 训练循环（含每步指标打印）
-│   └── test_qwen3_5_moe.py            # MoE 训练循环
+│   ├── qwen3/                          # Qwen3 全层真实权重用例
+│   │   ├── run_test_qwen3.sh
+│   │   └── test_qwen3.py
+│   ├── qwen3.5/                        # Qwen3.5 dense 减层冒烟用例
+│   │   ├── run_test_qwen3_5.sh
+│   │   └── test_qwen3_5.py
+│   ├── qwen3.5_moe/                    # Qwen3.5-MoE 减层冒烟用例
+│   │   ├── run_test_qwen3_5_moe.sh
+│   │   └── test_qwen3_5_moe.py
+│   ├── kimi_k3/                        # Kimi-K3 减层冒烟用例
+│   │   ├── run_test_kimi_k3.sh
+│   │   └── test_kimi_k3.py
+│   └── deepseekv4/                     # DeepSeekV4 CI 基线（5 个可共存特性同时开启）
+│       ├── run_test_deepseekv4.sh      # 启动脚本（torchrun）
+│       ├── test_deepseekv4.py          # 训练循环（含 SwapActivation / SwapOptimizer / ChunkLoss）
+│       ├── config.yaml                 # 合并所有可共存特性的配置
+│       ├── modeling_deepseek_v4.py     # 自定义模型
+│       └── tokenizer -> ...            # 分词器（软链接到 examples）
 ├── test_tools/                        # 看护工具
 │   ├── acquire_json.py                # 日志 → JSON 解析器（可命令行直接用）
 │   └── compare_baseline.py            # 解析日志 + 与基线比对（CI 调用）
 └── baseline_results/                  # 提交的基线 JSON（与脚本同名，.json 后缀）
     ├── run_test_qwen3.json
     ├── run_test_qwen3_5.json
-    └── run_test_qwen3_5_moe.json
+    ├── run_test_qwen3_5_moe.json
+    └── run_test_deepseekv4.json
 ```
 
-ST 编排逻辑内联在 `ci/MindSpeed_FSDPTurbo_ut.sh` 的 `run_testcase` 函数里（扫描 `model/run_test_*.sh`，逐个跑训练 → 有基线则解析+比对，无基线则只测功能跳过比对）。
+ST 编排逻辑内联在 `ci/MindSpeed_FSDPTurbo_ut.sh` 的 `run_testcase` 函数里（扫描 `model/**/run_test_*.sh`，逐个跑训练 → 有基线则解析+比对，无基线则只测功能跳过比对）。
 
 ## 执行流程
 
@@ -86,9 +99,39 @@ ST 编排逻辑内联在 `ci/MindSpeed_FSDPTurbo_ut.sh` 的 `run_testcase` 函�
 
 | 用例 | 脚本 | 模型 | 减层 | 并行配置（8 NPU） | NUM_STEPS |
 |---|---|---|---|---|---|
-| Qwen3 | `run_test_qwen3.sh` / `test_qwen3.py` | Qwen3-30B-A3B | 否（全层真实权重） | FSP=4, TP=2, EP=8, EFP=1 | 10 |
-| Qwen3.5 dense | `run_test_qwen3_5.sh` / `test_qwen3_5.py` | Qwen3.5-27B | 4 | FSP=4, TP=1, ULYSSES=2 | 10 |
-| Qwen3.5-MoE | `run_test_qwen3_5_moe.sh` / `test_qwen3_5_moe.py` | Qwen3.5-35B-A3B | 4 | FSP=4, TP=1, ULYSSES=2, EP=8, EFP=1 | 10 |
+| Qwen3 | `qwen3/run_test_qwen3.sh` / `test_qwen3.py` | Qwen3-30B-A3B | 否（全层真实权重） | FSP=4, TP=2, EP=8, EFP=1 | 10 |
+| Qwen3.5 dense | `qwen3.5/run_test_qwen3_5.sh` / `test_qwen3_5.py` | Qwen3.5-27B | 4 | FSP=4, TP=1, ULYSSES=2 | 10 |
+| Qwen3.5-MoE | `qwen3.5_moe/run_test_qwen3_5_moe.sh` / `test_qwen3_5_moe.py` | Qwen3.5-35B-A3B | 4 | FSP=4, TP=1, ULYSSES=2, EP=8, EFP=1 | 10 |
+| Kimi-K3 | `kimi_k3/run_test_kimi_k3.sh` / `test_kimi_k3.py` | Kimi-K3 | 4 | FSP=8, TP=1, EP=8, EFP=1 | 3 |
+| DeepSeekV4 | `deepseekv4/run_test_deepseekv4.sh` / `test_deepseekv4.py` | DeepSeekV4-4L | 4 | FSP=8, TP=1, EP=1 | 10 |
+
+### DeepSeekV4 CI 基线用例
+
+`model/deepseekv4/` 使用一份合并配置同时开启所有可共存的加速特性，作为 CI 冒烟看护基线。无法共存的并行策略（TP、EP、CP、fine_grained_fsdp）因互斥而未纳入。
+
+| 已开启特性 | 配置位置 | 说明 |
+|-----------|----------|------|
+| recompute | `memory.recompute` | 激活重计算 |
+| chunk_batch | `memory.chunk_batch` | 分块微批次 |
+| chunk_loss | `features.chunk_loss` | 分块 loss 计算 |
+| swap_activation | `features.swap_activation` | 激活换出到 CPU |
+| swap_optimizer | `features.swap_optimizer` | 优化器状态换入换出 |
+
+**用法**：
+
+```bash
+# 默认 10 步
+bash run_test_deepseekv4.sh
+
+# 自定义步数
+NUM_STEPS=5 bash run_test_deepseekv4.sh
+```
+
+**特性开关**：通过 `config.yaml` 的 `features` 段控制，`test_deepseekv4.py` 在模型构建 / 优化器 / 训练步中按需激活，不修改 FSDPTurbo 核心代码。
+
+**输出格式**：每步 rank0 打印 `[Rank 0] step N step time: X.XXXXs loss: X.XXXX grad norm: X.XXXX memory: X.XXXX GB max memory: X.XXXX GB`，与 `acquire_json.py` 兼容。
+
+**模型规格**：DeepSeekV4-4L（4 层、16 专家、topk=16），meta 设备构建 → FSDPTurbo 包裹 → CPU 物化初始化，`max_seq_length=1024`，`batch_size=4`。
 
 Qwen3.5 dense / MoE 两者均为 **CI 冒烟用例**：仅需 `config.json + tokenizer/processor`（不下载真实权重），用 `from_config` 在 `meta` 上建模型 → `to_empty` 物化 → 通过 `fsdp_turbo.utils.model.init_submodule_weights` 调用 text/visual 子模型的 `_init_weights` 随机初始化 → `tie_weights` → `FSDPTurbo` 包裹。其它默认：`BATCH_SIZE=1`、`MAX_LENGTH=512`、`LR=1e-4`、`recompute=True`、混合精度 `bf16` 参数 / `fp32` 约减。
 
@@ -98,7 +141,7 @@ Qwen3 为**全层真实权重用例**：`AutoModelForCausalLM.from_pretrained` �
 
 ## 新增用例
 
-1. 在 `model/` 下加 `run_test_<name>.sh`（参照现有脚本，命名 `{模型}_{任务}_{关键并行策略}.sh`）与 `test_<name>.py`（训练循环里保证每步 rank0 打印上述汇总行，并 `compute_grad_norm` 算全局 grad norm）。
+1. 在 `model/<name>/` 下加 `run_test_<name>.sh`（参照现有脚本，命名 `{模型}_{任务}_{关键并行策略}.sh`）与 `test_<name>.py`（训练循环里保证每步 rank0 打印上述汇总行，并 `compute_grad_norm` 算全局 grad norm）。
 2. 在 `baseline_results/` 下加**同名** `run_test_<name>.json`（先放空列表，见下）。
 3. 基线留空时用例跑通即 PASS（门禁未激活）；从真实 CI 运行填充基线后自动激活。
 
@@ -106,7 +149,7 @@ Qwen3 为**全层真实权重用例**：`AutoModelForCausalLM.from_pretrained` �
 
 三个用例的基线 JSON 已从真实 8-NPU CI 运行填充（loss/grad norm/时间/显存均有值，门禁已激活）。需要重新生成或更新时，推荐用**多次运行取中位数**，抗 run-to-run 抖动（尤其 step time）：
 
-1. 在 CI/备用环境多次跑：`bash tests/system_tests/model/run_test_<name>.sh`（每次日志落到 `run_logs/run_test_<name>.log`；多跑时改名保留，如 `.run0/.run1/.run2`）。
+1. 在 CI/备用环境多次跑：`bash tests/system_tests/model/<name>/run_test_<name>.sh`（每次日志落到 `run_logs/run_test_<name>.log`；多跑时改名保留，如 `.run0/.run1/.run2`）。
 2. 用 `acquire_json.py` 把多条日志合成**中位数基线**（loss/grad/time 逐步取中位数、memo per-rank 取中位数）：
    ```bash
    python tests/system_tests/test_tools/acquire_json.py \

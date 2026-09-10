@@ -12,13 +12,16 @@ NUM_GPUS_PER_NODE=8
 MASTER_ADDR=localhost
 MASTER_PORT=29500
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 echo "Starting Qwen3 complete test suite..."
 echo "This test will run the following configuration.:"
 echo "  FSDP2 + EP + TP + Recompute + Mixed Precision + Hook Module "
 echo ""
 
 torchrun --nproc_per_node=$NUM_GPUS_PER_NODE --nnodes=$NUM_NODES --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-    tests/system_tests/model/test_qwen3.py
+    test_qwen3.py
 TEST_RESULT=$?
 
 echo ""

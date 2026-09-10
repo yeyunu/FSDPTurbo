@@ -1,0 +1,127 @@
+# ============================================================
+# DeepSeekV4 CI Baseline — all compatible features enabled
+#
+# Parallelism: FSP=8, TP=1, EP=1 (baseline)
+# Enabled features: recompute, chunk_batch, chunk_loss,
+#                   swap_activation, swap_optimizer
+# ============================================================
+
+# --- Feature toggles ---
+features:
+  swap_activation: true
+  swap_activation_plan:
+    - model.layers.{*}
+  swap_optimizer: true
+  chunk_loss: true
+  chunk_loss_size: 512
+
+# --- Model Configuration ---
+model:
+  model_name_or_path: "deepseek-ai/DeepSeek-V4-Flash"
+  tokenizer_name_or_path: "/home/dataset/deepseek4_dataset/tokenizer/"
+  torch_dtype: "bf16"
+
+# --- Optimizer Configuration ---
+optimizer:
+  optimizer_type: "AdamW"
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  lr: 3.0e-5
+  warmup_ratio: 0.05
+  lr_scheduler_type: "CosineAnnealingLR"
+  min_lr: 3.0e-6
+  clip_grad: 1.0
+
+# --- Run Configuration ---
+run:
+  seed: 42
+  deterministic: true
+  max_steps: 2000
+  num_train_epochs: 1
+  gradient_accumulation_steps: 1
+  logging_steps: 1
+
+# --- Checkpoint Configuration ---
+checkpoint:
+  output_dir: "./output"
+  save_steps: 200000
+  strict: true
+  save_optim: true
+  load_optim: true
+
+# --- Data Configuration ---
+data:
+  dataset_path: "/home/dataset/deepseek4_dataset/preprocessed_enwiki_shuffle"
+  split: "train"
+  batch_size: 4
+  max_seq_length: 1024
+  num_workers: 8
+  pin_memory: true
+  shuffle: false
+
+# --- Distributed Configuration ---
+distributed:
+  data_parallel_size: 1
+  fully_shard_parallel_size: 8
+  tensor_parallel_size: 1
+  kv_allgather_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  expert_fully_shard_parallel_size: 1
+  expert_data_parallel_size: 1
+
+  fsdp_plan:
+    ignored_modules: []
+    apply_modules:
+      model.layers.{*}:
+        {}
+      model.embed_tokens:
+        {}
+      lm_head:
+        {}
+    param_dtype: "bf16"
+    reduce_dtype: "fp32"
+    output_dtype: "bf16"
+    cast_forward_inputs: true
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+    hook_modules:
+      - model.layers.{*}
+    fsdp_implementation: "native"
+
+  tp_plan:
+    colwise_parallel: []
+    rowwise_parallel: []
+    sequence_parallel: []
+
+  ep_plan:
+    apply_modules:
+      - model.layers.{*}.mlp.experts
+    dispatcher: "eager"
+    apply_efsdp_modules:
+      - model.layers.{*}.mlp.experts
+
+  cp_plan:
+    ulysses_function_patches: []
+    kv_allgather_function_patches: []
+    loss_function_patches: []
+
+# --- Memory Configuration ---
+memory:
+  recompute: true
+  recompute_plan:
+    - model.layers.{*}
+  chunk_batch: true
+  chunk_batch_plan:
+    chunk_mbs: 2
+    apply_modules:
+      - model.layers.{*}
+    batch_dim: 0
+    chunk_arg_indexs: [0]
+    chunk_kwarg_names: ["hidden_states", "attention_mask", "input_ids"]
+
+# --- Quantization Configuration ---
+quantization:
+  quantization_plan: null

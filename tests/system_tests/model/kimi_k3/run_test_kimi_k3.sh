@@ -3,13 +3,16 @@
 # Run Kimi-K3 complete system tests with FSDPTurbo
 # ============================================================
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # MODEL_PATH only needs config/tokenizer/processor and remote-code files.
 # The language model is reduced to NUM_HIDDEN_LAYERS and randomly initialized.
 # DATASET_PATH points to multimodal JSON data (conversations + images).
 
 mkdir -p /home/dataset/Kimi-K3-tmp
 cp -r /home/dataset/Kimi-K3/* /home/dataset/Kimi-K3-tmp
-cp -r fsdp_turbo/models/kimi/* /home/dataset/Kimi-K3-tmp
+cp -r "$SCRIPT_DIR/../../../../fsdp_turbo/models/kimi/"* /home/dataset/Kimi-K3-tmp
 
 export MODEL_PATH=${MODEL_PATH:-/home/dataset/Kimi-K3-tmp}
 export DATASET_PATH=${DATASET_PATH:-/home/dataset/coco/llava_instruct_150k_fsdp_turbo_100.json}
@@ -32,7 +35,7 @@ echo "  FSDP + EP + TP + Recompute + Mixed Precision"
 echo ""
 
 torchrun --nproc_per_node=$NUM_GPUS_PER_NODE --nnodes=$NUM_NODES --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
-    tests/system_tests/model/test_kimi_k3.py
+    test_kimi_k3.py
 TEST_RESULT=$?
 
 rm -rf /home/dataset/Kimi-K3-tmp

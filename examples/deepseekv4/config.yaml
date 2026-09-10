@@ -2,6 +2,16 @@
 # DeepSeekV4 Training Configuration
 # ============================================================
 
+# --- Feature toggles ---
+# Enable via YAML; train.py reads this section at runtime.
+features:
+  swap_activation: false
+  swap_activation_plan:
+    - model.layers.{*}
+  swap_optimizer: false
+  chunk_loss: false
+  chunk_loss_size: 512
+
 # --- Model Configuration ---
 model:
   model_name_or_path: "deepseek-ai/DeepSeek-V4-Flash"
@@ -10,7 +20,7 @@ model:
 
 # --- Optimizer Configuration ---
 optimizer:
-  optimizer_type: "AdamWSwap"
+  optimizer_type: "AdamW"
   weight_decay: 0.1
   adam_beta1: 0.9
   adam_beta2: 0.95
@@ -20,8 +30,6 @@ optimizer:
   lr_scheduler_type: "CosineAnnealingLR"
   min_lr: 3.0e-5
   clip_grad: 1.0
-  mem_fraction_static: 0.9
-  state_keys: ["exp_avg", "exp_avg_sq"]
 
 # --- Run Configuration ---
 run:
@@ -128,10 +136,6 @@ memory:
   recompute: true
   recompute_plan:
     - model.layers.{*}
-  swap_activation: false
-  swap_activation_plan:
-    apply_modules:
-      - model.layers.{*}
 
 # --- Quantization Configuration ---
 quantization:
