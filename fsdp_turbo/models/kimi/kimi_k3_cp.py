@@ -1,11 +1,23 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
-"""Post-fusion Ulysses forward for the remote-code Kimi K3 model."""
+"""Post-fusion context-parallel forward for the remote-code Kimi K3 model."""
 
 import torch
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
 from fsdp_turbo.distributed.context_parallel.batch import shard_fused_sequence_inputs
 from fsdp_turbo.distributed.context_parallel.ulysses.utils import get_ulysses_context
+from fsdp_turbo.distributed.parallel_state import get_parallel_state
+
+
+def _get_kimi_k3_cp_context():
+    parallel_state = get_parallel_state()
+    if parallel_state.kcp_parallel_size > 1:
+        return (
+            parallel_state.get_kcp_group(),
+            parallel_state.get_kcp_rank(),
+            parallel_state.get_kcp_group_size(),
+        )
+    return get_ulysses_context()
 
 
 def _build_position_ids(inputs_embeds, attention_mask):
@@ -50,12 +62,12 @@ def kimi_k3_model_forward(
     if input_ids is None and inputs_embeds is None:
         raise ValueError("You must specify input_ids or inputs_embeds.")
 
-    ulysses_group, _, ulysses_size = get_ulysses_context()
-    if ulysses_size > 1:
+    cp_group, _, cp_size = _get_kimi_k3_cp_context()
+    if cp_size > 1:
         if past_key_values is not None or cache_position is not None or use_cache is True:
-            raise ValueError("Post-fusion Ulysses CP for Kimi K3 does not support cache inputs.")
+            raise ValueError("Post-fusion context parallelism for Kimi K3 does not support cache inputs.")
         if getattr(self, "enable_chunk_loss", False):
-            raise ValueError("Kimi K3 chunk loss is not supported together with Ulysses CP.")
+            raise ValueError("Kimi K3 chunk loss is not supported together with context parallelism.")
         use_cache = False
 
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -92,12 +104,12 @@ def kimi_k3_model_forward(
     complete_attention_mask = attention_mask
     complete_labels = _mask_labels(labels, complete_attention_mask, self.config.ignore_index)
     num_items_in_batch = kwargs.pop("num_items_in_batch", None)
-    if ulysses_size > 1:
+    if cp_size > 1:
         inputs_embeds, position_ids, attention_mask = shard_fused_sequence_inputs(
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            group=ulysses_group,
+            group=cp_group,
         )
 
     outputs = self.language_model(

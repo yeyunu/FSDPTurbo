@@ -46,6 +46,7 @@ class ParallelState(metaclass=Singleton):
     fully_shard_parallel_size: int = 1
     tensor_parallel_size: int = 1
     kv_allgather_parallel_size: int = 1
+    kcp_parallel_size: int = 1
     ulysses_parallel_size: int = 1
     context_data_parallel_size: int = 1
 
@@ -77,13 +78,27 @@ class ParallelState(metaclass=Singleton):
             (self.expert_fully_shard_parallel_size, self.expert_parallel_size),
         )
 
-        # create CDP/CP/Ulysses groups as a separate device mesh
+        if self.kcp_parallel_size > 1 and self.ulysses_parallel_size > 1:
+            raise ValueError("KCP and Ulysses cannot be enabled together.")
+        if self.kcp_parallel_size > 1 and self.kv_allgather_parallel_size > 1:
+            raise ValueError("KCP and KV-AllGather cannot be enabled together.")
+
+        if self.kcp_parallel_size > 1:
+            cp_mesh_name = 'kcp'
+            cp_parallel_size = self.kcp_parallel_size
+            cp_mesh_dims = ('kcp',)
+        else:
+            cp_mesh_name = 'ulysses'
+            cp_parallel_size = self.ulysses_parallel_size
+            cp_mesh_dims = ('kvallgather', 'ulysses')
+
+        # Create CDP and the active CP strategy as a separate device mesh.
         self.context_data_parallel_size = self._create_mesh(
-            ('data', 'kvallgather', 'ulysses', 'ctp'),
-            (self.kv_allgather_parallel_size, self.ulysses_parallel_size, self.tensor_parallel_size),
+            ('data', 'kvallgather', cp_mesh_name, 'ctp'),
+            (self.kv_allgather_parallel_size, cp_parallel_size, self.tensor_parallel_size),
         )
 
-        self.add_sub_device_mesh(('kvallgather', 'ulysses'), 'cp')
+        self.add_sub_device_mesh(cp_mesh_dims, 'cp')
         self.add_sub_device_mesh(('dp', 'fsdp'), 'dp_fsdp', flatten=False)
         self.add_sub_device_mesh(('edp', 'efsdp'), 'edp_efsdp', flatten=False)
 

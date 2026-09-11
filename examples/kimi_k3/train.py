@@ -47,6 +47,10 @@ class KimiK3Trainer(BaseTrainer):
             return super().build_tokenizer()
 
     def build_model(self):
+        from fsdp_turbo.modules.kcp import _ensure_triton_driver
+
+        _ensure_triton_driver()
+
         from transformers import AutoModel
 
         print_rank(logger.info, "> Building KimiK3 Model...")

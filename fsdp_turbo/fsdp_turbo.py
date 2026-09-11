@@ -10,6 +10,9 @@ from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_context_parallel im
 from fsdp_turbo.distributed.context_parallel.kv_allgather.kv_allgather_context_parallel import (
     kv_allgather_context_parallelize_modules,
 )
+from fsdp_turbo.distributed.context_parallel.kcp.kcp_context_parallel import (
+    kcp_context_parallelize_modules,
+)
 from fsdp_turbo.distributed.context_parallel.patch import apply_cp_loss_patches
 from fsdp_turbo.memory.recompute.recompute import recompute_modules
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
@@ -53,6 +56,8 @@ class FSDPTurbo(torch.nn.Module):
 
     def apply_cp_modules(self):
         cp_plan = self.config.distributed.cp_plan
+        ulysses_enabled = self.config.distributed.ulysses_parallel_size > 1
+        kcp_enabled = self.config.distributed.kcp_parallel_size > 1
         if self.parallel_state.get_kvallgather_group_size() > 1:
             self.model = kv_allgather_context_parallelize_modules(
                 self.model,
@@ -60,15 +65,22 @@ class FSDPTurbo(torch.nn.Module):
                 cp_plan,
             )
 
-        if self.parallel_state.get_ulysses_group_size() > 1:
+        if ulysses_enabled:
             self.model = ulysses_context_parallelize_modules(
                 self.model,
                 self.parallel_state.get_ulysses_group(),
                 cp_plan,
             )
 
+        if kcp_enabled:
+            self.model = kcp_context_parallelize_modules(
+                self.model,
+                self.parallel_state.get_kcp_group(),
+                cp_plan,
+            )
+
         # Attention wrappers compose on their own axes. A causal-LM loss must
-        # instead see the complete KV x Ulysses domain and is installed once.
+        # instead see the complete context-parallel domain and is installed once.
         if self.parallel_state.get_cp_group_size() > 1:
             apply_cp_loss_patches(cp_plan.loss_function_patches, self.parallel_state.get_cp_group())
 

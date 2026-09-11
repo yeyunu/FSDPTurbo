@@ -73,6 +73,9 @@ distributed:
   fully_shard_parallel_size: 16
   tensor_parallel_size: 1
   ulysses_parallel_size: 2  # Ulysses CP: split sequence across 2 ranks
+  # KCP is disabled by default. To enable it, set this value above 1 and
+  # set ulysses_parallel_size to 1 because KCP and Ulysses are mutually exclusive.
+  kcp_parallel_size: 1
   expert_parallel_size: 16
   expert_fully_shard_parallel_size: 1
   expert_data_parallel_size: 1
@@ -116,7 +119,15 @@ distributed:
 
   # --- Context Parallel Plan ---
   cp_plan:
+    # Only the patch set whose parallel size is greater than 1 is applied.
     ulysses_function_patches:
+      - target_functions:
+          - modeling_kimi_linear.eager_attention_forward
+        type: full_attention
+      - target_functions:
+          - modeling_kimi_linear.KimiDeltaAttention.forward
+        type: kda
+    kcp_function_patches:
       - target_functions:
           - modeling_kimi_linear.eager_attention_forward
         type: full_attention

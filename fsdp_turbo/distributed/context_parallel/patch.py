@@ -82,17 +82,27 @@ def apply_gdn_patches(model, spec, label):
 
 
 def apply_kda_patches(model, spec, group, label):
-    """Install a group-bound Ulysses forward on configured Kimi KDA layers."""
+    """Install the group-bound forward selected by the patch field."""
     if model is None:
         raise RuntimeError(f"[Context Parallel/{label}] KDA patches require a model.")
 
-    from fsdp_turbo.modules.kda import get_ulysses_kda_forward
     from fsdp_turbo.utils.patch import patch_model_members, resolve_class_member
+
+    if label == "Ulysses":
+        from fsdp_turbo.modules.kda import get_ulysses_kda_forward
+
+        forward_factory = get_ulysses_kda_forward
+    elif label == "KCP":
+        from fsdp_turbo.distributed.context_parallel.kcp.kda_state import get_fla_state_kda_forward
+
+        forward_factory = get_fla_state_kda_forward
+    else:
+        raise ValueError(f"KDA patches are not supported in the {label!r} patch field.")
 
     for target in spec["target_functions"]:
         target_class, member_name = resolve_class_member(target)
         original = getattr(target_class, member_name)
-        replacement = get_ulysses_kda_forward(original, group)
+        replacement = forward_factory(original, group)
         matched = patch_model_members(model, target, replacement)
         if not matched:
             raise RuntimeError(f"[Context Parallel/{label}] KDA patch target did not match any module: {target!r}.")

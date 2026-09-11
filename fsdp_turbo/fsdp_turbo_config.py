@@ -131,6 +131,7 @@ class TPPlanConfig:
 @dataclass
 class CPPlanConfig:
     ulysses_function_patches: List[Dict[str, Any]] = field(default_factory=list)
+    kcp_function_patches: List[Dict[str, Any]] = field(default_factory=list)
     kv_allgather_function_patches: List[Dict[str, Any]] = field(default_factory=list)
     loss_function_patches: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -174,6 +175,7 @@ class DistributedConfig:
     tp_plan: TPPlanConfig = None
 
     kv_allgather_parallel_size: int = 1
+    kcp_parallel_size: int = 1
     ulysses_parallel_size: int = 1
     cp_plan: CPPlanConfig = None
 
@@ -336,8 +338,22 @@ class FSDPTurboConfig:
         )
 
     def validate_cp_config(self):
+        kcp_parallel_size = self.distributed.kcp_parallel_size
+        ulysses_parallel_size = self.distributed.ulysses_parallel_size
+        for field_name, size in (
+            ("kcp_parallel_size", kcp_parallel_size),
+            ("ulysses_parallel_size", ulysses_parallel_size),
+        ):
+            if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+                raise ValueError(f"distributed.{field_name} must be a positive integer; got {size!r}.")
+
         self.distributed.cp_plan = CPPlanConfig() if self.distributed.cp_plan is None else self.distributed.cp_plan
-        for field_name in ("ulysses_function_patches", "kv_allgather_function_patches", "loss_function_patches"):
+        for field_name in (
+            "ulysses_function_patches",
+            "kcp_function_patches",
+            "kv_allgather_function_patches",
+            "loss_function_patches",
+        ):
             patches = getattr(self.distributed.cp_plan, field_name)
             if patches is None:
                 patches = []
@@ -362,11 +378,40 @@ class FSDPTurboConfig:
                 patch_type = patch.get("type")
                 if not isinstance(patch_type, str) or not patch_type:
                     raise ValueError(f"distributed.cp_plan.{field_name} entries must set type.")
-                normalized.append({**patch, "target_functions": targets})
+                normalized_patch = {**patch, "target_functions": targets}
+                if patch_type == "kda":
+                    if field_name not in ("ulysses_function_patches", "kcp_function_patches"):
+                        raise ValueError(
+                            "KDA context-parallel patches must use ulysses_function_patches or kcp_function_patches."
+                        )
+                normalized.append(normalized_patch)
             setattr(self.distributed.cp_plan, field_name, normalized)
 
-        if self.distributed.ulysses_parallel_size > 1 and not self.distributed.cp_plan.ulysses_function_patches:
-            raise ValueError("distributed.cp_plan.ulysses_function_patches must be set when Ulysses CP is enabled.")
+        if kcp_parallel_size > 1 and ulysses_parallel_size > 1:
+            raise ValueError(
+                "distributed.kcp_parallel_size and distributed.ulysses_parallel_size cannot be enabled together; "
+                "KCP already applies Ulysses to MLA on the KCP sequence group."
+            )
+        if kcp_parallel_size > 1:
+            if not self.distributed.cp_plan.kcp_function_patches:
+                raise ValueError("distributed.cp_plan.kcp_function_patches must be set when KCP is enabled.")
+            if self.distributed.tensor_parallel_size != 1:
+                raise ValueError(
+                    "KDA state context parallelism requires distributed.tensor_parallel_size == 1; "
+                    f"got {self.distributed.tensor_parallel_size}."
+                )
+            if self.distributed.kv_allgather_parallel_size != 1:
+                raise ValueError(
+                    "KDA state context parallelism requires distributed.kv_allgather_parallel_size == 1; "
+                    f"got {self.distributed.kv_allgather_parallel_size}."
+                )
+            if self.data.batch_size != 1:
+                raise ValueError(
+                    "KDA state context parallelism requires micro batch size 1 "
+                    f"(data.batch_size == 1); got {self.data.batch_size}."
+                )
+        if ulysses_parallel_size > 1 and not self.distributed.cp_plan.ulysses_function_patches:
+            raise ValueError("distributed.cp_plan.ulysses_function_patches must be set when Ulysses is enabled.")
         if (
             self.distributed.kv_allgather_parallel_size > 1
             and not self.distributed.cp_plan.kv_allgather_function_patches
