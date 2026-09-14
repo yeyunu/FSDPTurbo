@@ -1,0 +1,80 @@
+# 全分片数据并行（FSDP2）
+
+FSDPTurbo的核心是基于PyTorch FSDP2的全分片数据并行：模型参数、梯度和优化器状态均按DeviceMesh分片存储，前向时按需AllGather参数、反向时ReduceScatter梯度，大幅降低单卡显存占用。
+
+## 基础用法
+
+通过Python API配置并行计划，并将FSDPTurbo应用到模型：
+
+```python
+from fsdp_turbo.fsdp_turbo import FSDPTurbo
+from fsdp_turbo.fsdp_turbo_config import (
+    DistributedConfig,
+    FSDPPlanConfig,
+    FSDPTurboConfig,
+)
+
+config = FSDPTurboConfig(
+    distributed=DistributedConfig(
+        fully_shard_parallel_size=8,
+        fsdp_plan=FSDPPlanConfig(
+            param_dtype="bf16",
+            reduce_dtype="fp32",
+            num_to_forward_prefetch=1,
+            num_to_backward_prefetch=1,
+        ),
+    ),
+)
+model = FSDPTurbo(config, model)
+```
+
+对应YAML配置：
+
+```yaml
+distributed:
+  fully_shard_parallel_size: 8
+  fsdp_plan:
+    apply_modules:
+      model.layers.{*}: {}
+      model.embed_tokens: {}
+      lm_head: {}
+    param_dtype: "bf16"
+    reduce_dtype: "fp32"
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+```
+
+## 主要能力
+
+### 混合精度
+
+通过`param_dtype` / `reduce_dtype` / `output_dtype`分别控制前向计算、梯度归约与输出精度。典型配置为`param_dtype: bf16` + `reduce_dtype: fp32`，兼顾训练速度与数值稳定性。
+
+### 通信预取
+
+- `num_to_forward_prefetch`：前向时提前预取后续N层的全量参数，隐藏AllGather通信。
+- `num_to_backward_prefetch`：反向时提前预取后续N层参数，隐藏通信。
+- `hook_modules`：指定通信挂钩模块（如`model.language_model.layers.{*}`），实现细粒度通信调度。
+
+### CPU Offload
+
+显存不足时，可开启参数与梯度的CPU卸载：
+
+```yaml
+fsdp_plan:
+  cpu_offload: true    # 参数/梯度卸载到 CPU，进一步降低显存占用
+  pin_memory: true
+```
+
+### 选择性分片
+
+- `apply_modules`：仅对指定模块做FSDP2分片，支持`model.layers.{*}`层级通配符。
+- `ignored_modules`：排除指定模块（如冻结的视觉编码器）。
+
+### 自定义实现路径
+
+`fsdp_implementation: native`使用PyTorch原生FSDP2；`fsdp_implementation: custom`使用FSDPTurbo自定义实现，提供更细的通信调度能力。
+
+## 断点续训
+
+通过`checkpoint`配置段控制权重与优化器状态的保存/恢复，详见[checkpoint_resume.md](./checkpoint_resume.md)。

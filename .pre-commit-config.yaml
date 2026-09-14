@@ -16,6 +16,7 @@ repos:
       - id: check-yaml
         args: ["--allow-multiple-documents"]
       - id: check-added-large-files
+        exclude: ^LICENSES/|\.(html|csv|svg)$|^docs/zh/figures/
       - id: check-merge-conflict
       - id: detect-private-key
       - id: check-json

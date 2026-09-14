@@ -202,7 +202,7 @@ class ChunkBatchPlanConfig:
         For Qwen-style decoder layers, a typical plan is:
             apply_modules=["model.layers.{*}"]
             batch_dim=0
-            chunk_arg_indexs=[0]
+            chunk_arg_indexes=[0]
             chunk_kwarg_names=["hidden_states", "attention_mask"]
     """
 
@@ -212,7 +212,7 @@ class ChunkBatchPlanConfig:
     # Tensor dimension that represents batch. HF decoder layers usually use 0.
     batch_dim: int = 0
     # Positional forward arguments that should be sliced by batch.
-    chunk_arg_indexs: Optional[List[int]] = None
+    chunk_arg_indexes: Optional[List[int]] = None
     # Keyword forward arguments that should be sliced by batch.
     chunk_kwarg_names: Optional[List[str]] = None
 
@@ -508,10 +508,10 @@ class FSDPTurboConfig:
         self.memory.chunk_batch_plan.apply_modules = (
             [] if self.memory.chunk_batch_plan.apply_modules is None else self.memory.chunk_batch_plan.apply_modules
         )
-        self.memory.chunk_batch_plan.chunk_arg_indexs = (
+        self.memory.chunk_batch_plan.chunk_arg_indexes = (
             []
-            if self.memory.chunk_batch_plan.chunk_arg_indexs is None
-            else self.memory.chunk_batch_plan.chunk_arg_indexs
+            if self.memory.chunk_batch_plan.chunk_arg_indexes is None
+            else self.memory.chunk_batch_plan.chunk_arg_indexes
         )
         self.memory.chunk_batch_plan.chunk_kwarg_names = (
             []
@@ -520,9 +520,9 @@ class FSDPTurboConfig:
         )
         if not self.memory.chunk_batch_plan.apply_modules:
             raise ValueError("chunk_batch_plan.apply_modules must not be empty when chunk_batch is enabled.")
-        if not self.memory.chunk_batch_plan.chunk_arg_indexs and not self.memory.chunk_batch_plan.chunk_kwarg_names:
+        if not self.memory.chunk_batch_plan.chunk_arg_indexes and not self.memory.chunk_batch_plan.chunk_kwarg_names:
             raise ValueError(
-                "chunk_batch_plan must specify chunk_arg_indexs or chunk_kwarg_names when chunk_batch is enabled."
+                "chunk_batch_plan must specify chunk_arg_indexes or chunk_kwarg_names when chunk_batch is enabled."
             )
 
     def validate_swap_activation_config(self):

@@ -190,7 +190,7 @@ def get_complete_custom_config():
             ep_plan=EPPlanConfig(
                 apply_modules=['model.language_model.layers.{*}.mlp.experts'],
                 dispatcher='fused',
-                apply_efsdp_modules=['model.language_model.layers.{*}.mlp'],
+                apply_efsdp_modules=['model.language_model.layers.{*}.mlp.experts'],
             ),
         ),
         memory=MemoryConfig(

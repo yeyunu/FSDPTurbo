@@ -66,7 +66,7 @@ def apply_chunkmbs_module(chunk_mbs_modules, chunkmbs_cfg):
         module.forward = chunk_mbs_forward(
             chunk_mbs=chunkmbs_cfg.chunk_mbs,
             batch_dim=chunkmbs_cfg.batch_dim,
-            chunk_arg_indexs=chunkmbs_cfg.chunk_arg_indexs,
+            chunk_arg_indexes=chunkmbs_cfg.chunk_arg_indexes,
             chunk_kwarg_names=chunkmbs_cfg.chunk_kwarg_names,
         )(module.forward)
 
@@ -100,7 +100,7 @@ def _slice_batch_recursive(data: Any, start: int, end: int, batch_dim: int = 0) 
 def chunk_mbs_forward(
     chunk_mbs: int = 1,
     batch_dim: int = 0,
-    chunk_arg_indexs: Optional[List[int]] = None,
+    chunk_arg_indexes: Optional[List[int]] = None,
     chunk_kwarg_names: Optional[List[str]] = None,
 ):
     """Build a decorator that runs a module forward by batch chunks.
@@ -116,13 +116,13 @@ def chunk_mbs_forward(
         If ``full_batch_size == 4`` and ``chunk_mbs == 4``, no chunking is
         needed and the original forward is called once.
 
-    ``chunk_arg_indexs`` and ``chunk_kwarg_names`` define which forward inputs
+    ``chunk_arg_indexes`` and ``chunk_kwarg_names`` define which forward inputs
     must be sliced. For a HuggingFace decoder layer, ``hidden_states`` and
     ``attention_mask`` often both carry a batch dimension, so they must be
     sliced consistently. Slicing only ``hidden_states`` while keeping the full
     ``attention_mask`` can produce a shape mismatch such as batch 1 vs mask 4.
     """
-    chunk_arg_indexs = [] if chunk_arg_indexs is None else chunk_arg_indexs
+    chunk_arg_indexes = [] if chunk_arg_indexes is None else chunk_arg_indexes
     chunk_kwarg_names = [] if chunk_kwarg_names is None else chunk_kwarg_names
 
     def decorator(forward_func):
@@ -132,8 +132,8 @@ def chunk_mbs_forward(
             # Positional inputs are checked first to support calls like
             # layer(hidden_states, attention_mask=...), then keyword inputs are
             # used for calls like layer(hidden_states=hidden_states, ...).
-            if chunk_arg_indexs and len(chunk_arg_indexs) > 0 and len(args) > chunk_arg_indexs[0]:
-                full_batch_size = args[chunk_arg_indexs[0]].shape[batch_dim]
+            if chunk_arg_indexes and len(chunk_arg_indexes) > 0 and len(args) > chunk_arg_indexes[0]:
+                full_batch_size = args[chunk_arg_indexes[0]].shape[batch_dim]
             elif chunk_kwarg_names and len(chunk_kwarg_names) > 0 and chunk_kwarg_names[0] in kwargs:
                 full_batch_size = kwargs[chunk_kwarg_names[0]].shape[batch_dim]
             else:
@@ -155,7 +155,7 @@ def chunk_mbs_forward(
                 # without a batch dimension, so they are forwarded unchanged.
                 micro_args = []
                 for arg_idx, arg in enumerate(args):
-                    if arg_idx in chunk_arg_indexs:
+                    if arg_idx in chunk_arg_indexes:
                         micro_args.append(_slice_batch_recursive(arg, start, end, batch_dim))
                     else:
                         micro_args.append(arg)
@@ -179,8 +179,7 @@ def chunk_mbs_forward(
                 return torch.cat(outputs, dim=batch_dim)
             if isinstance(outputs[0], (tuple, list)):
                 return type(outputs[0])(
-                    torch.cat([out[idx] for out in outputs], dim=batch_dim)
-                    for idx in range(len(outputs[0]))
+                    torch.cat([out[idx] for out in outputs], dim=batch_dim) for idx in range(len(outputs[0]))
                 )
             raise TypeError(f"Unsupported output type: {type(outputs[0])}")
 

@@ -19,6 +19,7 @@ NNODES=${NNODES:-1}
 GPUS_PER_NODE=${GPUS_PER_NODE:-16}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 MASTER_PORT=${MASTER_PORT:-29500}
+NODE_RANK=${NODE_RANK:-0}
 
 # --- Training Arguments ---
 CONFIG_FILE=${CONFIG_FILE:-"config.yaml"}
@@ -33,12 +34,14 @@ echo "  NNODES: $NNODES"
 echo "  GPUS_PER_NODE: $GPUS_PER_NODE"
 echo "  MASTER_ADDR: $MASTER_ADDR"
 echo "  MASTER_PORT: $MASTER_PORT"
+echo "  NODE_RANK: $NODE_RANK"
 echo "  CONFIG: $CONFIG_FILE"
 echo "  NUM_HIDDEN_LAYERS: ${NUM_HIDDEN_LAYERS:-full}"
 echo "============================================================"
 
 torchrun \
     --nnodes=$NNODES \
+    --node_rank=$NODE_RANK \
     --nproc_per_node=$GPUS_PER_NODE \
     --master_addr=$MASTER_ADDR \
     --master_port=$MASTER_PORT \

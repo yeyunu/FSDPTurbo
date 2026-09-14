@@ -137,7 +137,7 @@ def get_complete_custom_config():
             chunk_mbs=CHUNK_MBS,
             apply_modules=['model.layers.{*}'],
             batch_dim=CHUNK_BATCH_DIM,
-            chunk_arg_indexs=[0],
+            chunk_arg_indexes=[0],
             chunk_kwarg_names=['hidden_states', 'attention_mask'],
         )
 

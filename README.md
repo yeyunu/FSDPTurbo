@@ -50,9 +50,9 @@ FSDPTurbo 是一个兼具高性能与易用性的分布式训练加速库，基�
 
 ### 环境要求
 
-- Python >= 3.11
-- PyTorch >= 2.9.0, < 2.12.0
-- [torch\_npu](https://gitee.com/ascend/pytorch) >= 2.9.0, < 2.12.0
+- Python >= 3.10（推荐3.11及以上）
+- PyTorch >= 2.9.0
+- [torch\_npu](https://gitee.com/ascend/pytorch) >= 2.9.0
 
 ### 从源码安装
 

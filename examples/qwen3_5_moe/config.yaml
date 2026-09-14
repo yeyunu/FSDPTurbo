@@ -125,7 +125,7 @@ distributed:
       - model.language_model.layers.{*}.mlp.experts
     dispatcher: "fused"
     apply_efsdp_modules:
-      - model.language_model.layers.{*}.mlp
+      - model.language_model.layers.{*}.mlp.experts
 
 # --- Module Patch Plan ---
 module_patches:

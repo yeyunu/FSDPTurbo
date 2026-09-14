@@ -119,7 +119,7 @@ memory:
     apply_modules:
       - model.layers.{*}
     batch_dim: 0
-    chunk_arg_indexs: [0]
+    chunk_arg_indexes: [0]
     chunk_kwarg_names: ["hidden_states", "attention_mask", "input_ids"]
 
 # --- Quantization Configuration ---
