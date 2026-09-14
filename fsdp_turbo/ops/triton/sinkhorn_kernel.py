@@ -75,11 +75,12 @@ def _hc_split_sinkhorn_kernel_part2(
 
     pid_comb_off = pids[:, None] * (hc_mult * BLOCK_ALIGN)
 
-    comb = tl.load(comb_tmp_ptr + pid_comb_off + lin[None, :], mask=pid_mask[:, None])
+    comb = tl.load(comb_tmp_ptr + pid_comb_off + lin[None, :], mask=pid_mask[:, None], other=0.0)
     comb = comb.reshape(group, hc_mult, BLOCK_ALIGN)
 
     row_max = tl.max(comb, axis=2)
     comb = tl.exp(comb - row_max[:, :, None])
+    comb = tl.where(pid_mask[:, None, None], comb, 0.0)
 
     for _ in range(sinkhorn_iters):
         row_sum = tl.sum(comb, axis=2)
@@ -251,12 +252,12 @@ def hc_split_sinkhorn_backward_kernel_part2(
     mask_val = col_mask[None, :, :]
     pid_feat_off = pids[:, None] * hc_mult * BLOCK_ALIGN
 
-    comb_slice_flat = tl.load(mixes_ptr + pid_feat_off + arange_val)
+    comb_slice_flat = tl.load(mixes_ptr + pid_feat_off + arange_val, mask=pid_mask[:, None], other=0.0)
     comb_slice = comb_slice_flat.reshape(group, hc_mult, BLOCK_ALIGN)
 
     scale_comb = tl.load(hc_scale_ptr + 2)
 
-    comb_init = tl.load(comb_tmp_ptr + pid_feat_off + arange_val)
+    comb_init = tl.load(comb_tmp_ptr + pid_feat_off + arange_val, mask=pid_mask[:, None], other=0.0)
     comb_init = comb_init.reshape(group, hc_mult, BLOCK_ALIGN)
 
     row_max = tl.max(comb_init, axis=2).reshape(group, hc_mult, 1)
@@ -264,7 +265,7 @@ def hc_split_sinkhorn_backward_kernel_part2(
 
     row_sum_list = tl.full((sinkhorn_iters, group, hc_mult, 1), 0.0, dtype=tl.float32)
     col_sum_list = tl.full((sinkhorn_iters, group, 1, BLOCK_ALIGN), 0.0, dtype=tl.float32)
-    K = exp_comb
+    K = tl.where(pid_mask[:, None, None], exp_comb, 0.0)
 
     for i in range(sinkhorn_iters):
         row_sum = tl.sum(K, axis=2).reshape(group, hc_mult, 1)
@@ -289,7 +290,7 @@ def hc_split_sinkhorn_backward_kernel_part2(
         )
         K = K_col
 
-    grad_comb_flat = tl.load(grad_comb_ptr + pid_feat_off + arange_val)
+    grad_comb_flat = tl.load(grad_comb_ptr + pid_feat_off + arange_val, mask=pid_mask[:, None], other=0.0)
     dK = grad_comb_flat.reshape(group, hc_mult, BLOCK_ALIGN)
 
     for j in range(sinkhorn_iters):
