@@ -22,9 +22,10 @@ from fsdp_turbo.fsdp_turbo_config import (
     TPPlanConfig,
 )
 from fsdp_turbo.quantization.cache import clear_weight_cache
+from fsdp_turbo.training.clip_grads import compute_grad_norm
 from fsdp_turbo.utils.device import set_accelerator_compatible
 from fsdp_turbo.utils.log import set_log_level
-from fsdp_turbo.utils.model import set_num_hidden_layers
+from fsdp_turbo.utils.model import init_submodule_weights, set_num_hidden_layers
 from fsdp_turbo.utils.random import set_seed
 
 
@@ -42,7 +43,7 @@ BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '1'))
 MAX_LENGTH = int(os.environ.get('MAX_LENGTH', '512'))
 NUM_WORKERS = int(os.environ.get('NUM_WORKERS', '0'))
 LR = 1e-4
-NUM_STEPS = int(os.environ.get('NUM_STEPS', '3'))
+NUM_STEPS = int(os.environ.get('NUM_STEPS', '10'))
 # Reduce language-model layers and randomly initialize (CI mode, no weights).
 NUM_HIDDEN_LAYERS = int(os.environ.get('NUM_HIDDEN_LAYERS', '4'))
 
@@ -97,13 +98,6 @@ def get_model_processor(config):
             torch_dtype=torch.bfloat16,
         )
 
-    model.to(dtype=config.model.torch_dtype)
-    parameter_dtypes = {parameter.dtype for parameter in model.parameters()}
-    if parameter_dtypes != {config.model.torch_dtype}:
-        raise RuntimeError(
-            f'Kimi-K3 parameters must have a uniform dtype before FSDP wrapping, but found {parameter_dtypes}.'
-        )
-
     processor = AutoProcessor.from_pretrained(
         config.model.tokenizer_name_or_path,
         trust_remote_code=True,
@@ -134,6 +128,37 @@ def get_dataloader(processor):
     from fsdp_turbo.training.dataloader import build_dataloader
 
     return build_dataloader(get_data_config(), tokenizer=processor.tokenizer, processor=processor)
+
+
+def initialize_materialized_model(model, dtype):
+    """Deterministically initialize a Kimi-K3 model after ``to_empty``."""
+    # Constructors run on meta in this ST, so constructor-time initializers do
+    # not populate the parameters materialized later by ``to_empty``. Re-run
+    # local reset hooks first for custom MoE, convolution, router, and vision
+    # parameters, then apply each pretrained submodel's canonical initializer.
+    for module in model.modules():
+        reset_parameters = getattr(module, 'reset_parameters', None)
+        if callable(reset_parameters):
+            reset_parameters()
+
+    init_submodule_weights(model.language_model, name='language_model')
+    init_submodule_weights(model.vision_tower, name='vision_tower')
+    init_submodule_weights(model.mm_projector, name='mm_projector')
+
+    # Kimi's RMSNorm modules and KDA state parameters have no reset hook and
+    # are not covered by the generic Linear/Embedding initializers.
+    for module in model.modules():
+        if type(module).__name__ in {'KimiRMSNorm', 'KimiK_3_MoeRMSNormGated'}:
+            torch.nn.init.ones_(module.weight)
+        elif type(module).__name__ == 'KimiDeltaAttention':
+            torch.nn.init.uniform_(module.A_log, 1, 16)
+            module.A_log.data.log_()
+            torch.nn.init.zeros_(module.dt_bias)
+        elif type(module).__name__ == 'KimiMoEGate':
+            torch.nn.init.zeros_(module.e_score_correction_bias)
+
+    model.tie_weights()
+    model.to(dtype=dtype)
 
 
 # ============================================================
@@ -202,15 +227,18 @@ def train_step(model, batch, optimizer):
     loss = outputs.loss
     if loss is None:
         raise RuntimeError('Kimi-K3 did not return a loss; ensure the batch contains labels.')
-
-    if torch.accelerator.current_device_index() == 0:
-        print(f'[Rank {torch.accelerator.current_device_index()}] Loss: {loss.item()}')
+    if not torch.isfinite(loss).all().item():
+        raise FloatingPointError(f'Kimi-K3 produced a non-finite loss: {loss.detach().float().item()}.')
 
     loss.backward()
+    grad_norm = compute_grad_norm(list(model.parameters()))
+    if not torch.isfinite(torch.tensor(grad_norm)).item():
+        raise FloatingPointError(f'Kimi-K3 produced a non-finite gradient norm: {grad_norm}.')
+
     optimizer.step()
     clear_weight_cache()
     model.zero_grad()
-    return loss
+    return loss, grad_norm
 
 
 def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, enable_profiler=False):
@@ -224,8 +252,16 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
         print(f'{"=" * 60}\n')
 
     model, processor = get_model_processor(config)
-    model = FSDPTurbo(config, model)
     model.to_empty(device='npu')
+    initialize_materialized_model(model, config.model.torch_dtype)
+
+    parameter_dtypes = {parameter.dtype for parameter in model.parameters()}
+    if parameter_dtypes != {config.model.torch_dtype}:
+        raise RuntimeError(
+            f'Kimi-K3 parameters must have a uniform dtype before FSDP wrapping, but found {parameter_dtypes}.'
+        )
+
+    model = FSDPTurbo(config, model)
     dataloader = get_dataloader(processor)
 
     if torch.accelerator.current_device_index() == 0:
@@ -265,7 +301,7 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
             print(f'[Rank {torch.accelerator.current_device_index()}] start step {step}')
 
             step_start = time.perf_counter()
-            loss = train_step(model, batch, optimizer)
+            loss, grad_norm = train_step(model, batch, optimizer)
             torch.npu.synchronize()
             step_time = time.perf_counter() - step_start
 
@@ -278,6 +314,7 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
                     f'[Rank {torch.accelerator.current_device_index()}] step {step} '
                     f'step time: {step_time:.4f}s '
                     f'loss: {loss.item():.4f} '
+                    f'grad norm: {grad_norm:.4f} '
                     f'memory: {torch.npu.memory_allocated() / 1024**3:.4f} GB '
                     f'max memory: {torch.npu.max_memory_allocated() / 1024**3:.4f} GB'
                 )

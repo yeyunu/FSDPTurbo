@@ -1,6 +1,6 @@
 # FSDPTurbo 精度/性能基线看护用例说明
 
-本目录维护 FSDPTurbo 的系统测试（ST）基线用例，覆盖 Qwen3.5 dense / MoE，对**精度（loss / grad norm）、性能（单步时间）、显存**做回归看护。机制对齐 MindSpeed-Bridge 的 ST 模式：跑训练脚本 → 解析日志为 JSON → 与提交的基线 JSON 比对，超差则用例失败。
+本目录维护 FSDPTurbo 的系统测试（ST）基线用例，覆盖 Qwen3.5 dense / MoE 和 Kimi-K3，对**精度（loss / grad norm）、性能（单步时间）、显存**做回归看护。机制对齐 MindSpeed-Bridge 的 ST 模式：跑训练脚本 → 解析日志为 JSON → 与提交的基线 JSON 比对，超差则用例失败。
 
 ## 目录结构
 
@@ -33,6 +33,7 @@ tests/system_tests/
     ├── run_test_qwen3.json
     ├── run_test_qwen3_5.json
     ├── run_test_qwen3_5_moe.json
+    ├── run_test_kimi_k3.json
     └── run_test_deepseekv4.json
 ```
 
@@ -102,7 +103,7 @@ ST 编排逻辑内联在 `ci/MindSpeed_FSDPTurbo_ut.sh` 的 `run_testcase` 函�
 | Qwen3 | `qwen3/run_test_qwen3.sh` / `test_qwen3.py` | Qwen3-30B-A3B | 否（全层真实权重） | FSP=4, TP=2, EP=8, EFP=1 | 10 |
 | Qwen3.5 dense | `qwen3.5/run_test_qwen3_5.sh` / `test_qwen3_5.py` | Qwen3.5-27B | 4 | FSP=4, TP=1, ULYSSES=2 | 10 |
 | Qwen3.5-MoE | `qwen3.5_moe/run_test_qwen3_5_moe.sh` / `test_qwen3_5_moe.py` | Qwen3.5-35B-A3B | 4 | FSP=4, TP=1, ULYSSES=2, EP=8, EFP=1 | 10 |
-| Kimi-K3 | `kimi_k3/run_test_kimi_k3.sh` / `test_kimi_k3.py` | Kimi-K3 | 4 | FSP=8, TP=1, EP=8, EFP=1 | 3 |
+| Kimi-K3 | `kimi_k3/run_test_kimi_k3.sh` / `test_kimi_k3.py` | Kimi-K3 | 4 | FSP=8, TP=1, EP=8, EFP=1 | 10 |
 | DeepSeekV4 | `deepseekv4/run_test_deepseekv4.sh` / `test_deepseekv4.py` | DeepSeekV4-4L | 4 | FSP=8, TP=1, EP=1 | 10 |
 
 ### DeepSeekV4 CI 基线用例
@@ -147,7 +148,7 @@ Qwen3 为**全层真实权重用例**：`AutoModelForCausalLM.from_pretrained` �
 
 ## 补充/更新基线
 
-三个用例的基线 JSON 已从真实 8-NPU CI 运行填充（loss/grad norm/时间/显存均有值，门禁已激活）。需要重新生成或更新时，推荐用**多次运行取中位数**，抗 run-to-run 抖动（尤其 step time）：
+用例的基线 JSON 已从真实 8-NPU CI 运行填充（loss/grad norm/时间/显存均有值，门禁已激活）。需要重新生成或更新时，推荐用**多次运行取中位数**，抗 run-to-run 抖动（尤其 step time）：
 
 1. 在 CI/备用环境多次跑：`bash tests/system_tests/model/<name>/run_test_<name>.sh`（每次日志落到 `run_logs/run_test_<name>.log`；多跑时改名保留，如 `.run0/.run1/.run2`）。
 2. 用 `acquire_json.py` 把多条日志合成**中位数基线**（loss/grad/time 逐步取中位数、memo per-rank 取中位数）：

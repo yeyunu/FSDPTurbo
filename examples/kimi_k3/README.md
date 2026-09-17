@@ -77,6 +77,10 @@ distributed:
 head 数。图文融合后的序列长度不必手动对齐 CP 并行度，forward 会在切分前自动向右
 padding，并通过 `attention_mask` 排除 padding token。
 
+## 环境依赖
+
+在 A5 服务器上执行 Kimi K3 预训练前，需要先下载并安装 `mindspeed_ops` 库（https://gitcode.com/Ascend/MindSpeed-Ops）。
+
 ## 启动训练
 
 先按实际环境修改 `config.yaml` 中的模型、数据集和并行度，然后运行：
