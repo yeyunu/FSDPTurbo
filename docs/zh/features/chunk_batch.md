@@ -35,6 +35,20 @@ memory:
 >
 > 开启`chunk_batch`时必须指定`chunk_arg_indexes`或`chunk_kwarg_names`，否则启动时会报配置校验错误。
 
+## 与上下文并行（CP）的关系
+
+微批次切分与CP**不兼容，不能同时开启**，当前实现不支持二者组合使用。
+
+两者虽然都在大batch / 长序列场景下缓解显存压力，但切分路径相互冲突：
+
+- CP开启后，模型主干forward被替换为CP感知实现，输入在进入decoder层前已沿**序列维**切分到各CP rank，注意力计算也被替换为CP感知版本，通过跨rank通信交换序列/头维信息（如Ulysses的all-to-all），并依据本rank的局部输入重建全局因果掩码。
+- 微批次切分则包装decoder层的forward（见`fsdp_turbo/memory/chunk_batch/chunk_batch.py`），将输入沿**batch维**切片逐块执行，输出再拼接回原形状。
+- 两种机制都以接管forward入口的方式生效，叠加后序列切分、掩码重建、跨rank通信与输出拼接所依赖的形状约定不再被保证，当前实现未提供组合适配。
+
+> [!WARNING]
+>
+> 与Chunk Loss不同（开启CP后设置`enable_chunk_loss`会直接报错），微批次切分与CP同时开启**没有启动或前向阶段的显式校验**，不会立刻报错，但行为未定义，务必避免该配置组合。
+
 ## 适用场景
 
 - 大batch size训练时单层前向显存峰值过高
