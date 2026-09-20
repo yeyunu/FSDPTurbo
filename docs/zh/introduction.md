@@ -6,7 +6,7 @@ FSDPTurbo是一个兼具高性能与易用性的分布式训练加速库，基�
 
 FSDPTurbo基于PyTorch FSDP2（DTensor全分片数据并行）构建，直接对接HuggingFace Transformers生态：用户使用原生`AutoModel`加载模型后，仅需一行`FSDPTurbo(config, model)`即可完成并行化改造，显著降低大模型分布式训练的接入成本。
 
-FSDPTurbo面向昇腾NPU与GPU，从并行优化、内存优化、量化加速三个方面对大模型训练进行优化。
+FSDPTurbo面向昇腾NPU，从并行优化、内存优化、量化加速三个方面对大模型训练进行优化。
 
 ## FSDPTurbo架构
 
@@ -15,40 +15,40 @@ FSDPTurbo面向昇腾NPU与GPU，从并行优化、内存优化、量化加速�
 各模块职责：
 
 - **分布式并行（`Distributed`）**
-    - **FSDP（`fully_shard_parallel/`）**：全分片数据并行，基于PyTorch FSDP2 API实现，支持混合精度训练、前向/反向预取、选择性模块分片，并提供`custom`自定义实现路径。
-    - **EFSDP**：专家FSDP，对EP切分后的专家参数进一步全分片，通过`apply_efsdp_modules`配置。
-    - **EP（`expert_parallel/`）**：专家并行，面向MoE模型，支持多种dispatcher（`eager`、`fused`、`mc2`、`domino`）以及自定义EP forward。
-    - **TP（`tensor_parallel/`）**：张量并行，支持列并行、行并行与序列并行，集成DTensor。
-    - **CP（`context_parallel/`）**：上下文并行，Ulysses风格，支持长序列训练。
-    - **parallel_state（`parallel_state.py`）**：全局并行状态管理，统一管理多维并行设备网格（DeviceMesh）。
+    - **FSDP**：基于PyTorch FSDP2 API实现，支持混合精度训练、前向/反向预取、选择性模块分片，并提供`custom`自定义实现路径。
+    - **EFSDP**：对EP切分后的专家参数进一步全分片，通过`apply_efsdp_modules`配置。
+    - **EP**：面向MoE模型，支持多种dispatcher（`eager`、`fused`、`mc2`、`domino`）以及自定义EP forward。
+    - **TP**：支持列并行、行并行与序列并行，集成DTensor。
+    - **CP**：Ulysses风格，支持长序列训练。
+    - **parallel_state**：全局并行状态管理，统一管理多维并行设备网格（DeviceMesh）。
 - **内存优化（`Memory`）**
-    - **Recompute（`recompute/`）**：激活重计算，梯度检查点，前向不保存部分模块激活、反向重算，降低激活内存占用。
-    - **ChunkLoss（`chunk_loss/`）**：分块损失计算，损失计算分块处理，适用于大词表模型。
-    - **SwapActivation（`swap_activation/`）**：激活值交换，异步将激活值卸载到CPU内存。
-    - **SwapOptimizer（`swap_optimizer/`）**：优化器状态交换，将优化器状态卸载到CPU，减少显存占用。
+    - **Recompute**：梯度检查点，降低激活内存占用。
+    - **ChunkLoss**：损失计算分块处理，适用于大词表模型。
+    - **SwapActivation**：异步将激活值卸载到CPU内存。
+    - **SwapOptimizer**：将优化器状态卸载到CPU，减少显存占用。
 - **量化加速（`Quant`）**
-    - **Converter（`converter/`）**：模型转换框架，轻松在模型中部署量化。
+    - **Converter**：模型转换框架，轻松在模型中部署量化。
     - **QuantWeight**：分块量化，可配置块大小，实现细粒度控制。
-    - **MXFP8（`mx_formats/`）**：MXFP8量化，支持E4M3、E5M2与HIF8（华为hifloat8）格式。
-    - **QAT（`qat/`）**：量化感知训练，当前提供W8A16方案（`w8a16/`），覆盖Linear与GMM。
+    - **MXFP8**：支持E4M3、E5M2与HIF8（华为hifloat8）格式。
+    - **QAT**：当前提供W8A16方案，覆盖Linear与GMM。
 - **通用工具与训练辅助（`Utils`）**
-    - **Accelerator（`device.py`）**：加速器适配层，统一NPU/CUDA设备访问（`torch.accelerator`委托），自动返回对应通信后端（HCCL/NCCL）。
-    - **MetaInit（`model.py`）**：模块权重初始化，对子模块执行`_init_weights`或通用随机初始化。
-    - **CkptManager（`checkpoint.py`）**：断点管理器（`Checkpointer`），负责权重与优化器状态的保存/恢复。
-    - **BaseDataLoader（`dataloader.py`）**：数据加载，构建文本/多模态数据集的DataLoader。
-    - **BaseTokenizer（`tokenizer_factory.py`）**：分词器构建工厂，支持HuggingFace加载与自定义注册。
+    - **Accelerator**：加速器适配层，统一NPU设备访问（`torch.accelerator`委托），自动返回对应通信后端（HCCL）。
+    - **MetaInit**：模块权重初始化，对子模块执行`_init_weights`或通用随机初始化。
+    - **CkptManager**：断点管理器（`Checkpointer`），负责权重与优化器状态的保存/恢复。
+    - **BaseDataLoader**：数据加载，构建文本/多模态数据集的DataLoader。
+    - **BaseTokenizer**：分词器构建工厂，支持HuggingFace加载与自定义注册。
 - **自定义模块（`Modules`）**
-    - **GDN（`gated_delta_net.py`）**：GatedDeltaNet线性注意力模块。
-    - **KDA（`kda.py`）**：Kimi Delta Attention（KDA）模块，含Ulysses上下文并行支持。
-    - **ShortConv（`short_conv.py`）**：短卷积模块。
-    - **RMSNorm（`rms_norm.py`）**：RMSNorm归一化模块。
+    - **GDN**：GatedDeltaNet线性注意力模块。
+    - **KDA**：Kimi Delta Attention（KDA）模块，含Ulysses上下文并行支持。
+    - **ShortConv**：短卷积模块。
+    - **RMSNorm**：归一化模块。
 - **后端算子（`Ops`）**
-    - 按设备后端组织（`npu/`、`cuda/`、`cpu/`、`triton/`），基于统一注册机制（`registry.py`）自动分发。
-    - **GMM（`grouped_matmul.py`）**：分组矩阵乘，MoE专家计算核心算子。
-    - **Permute（`permute.py`）**：token/专家重排，MoE dispatch/combine配套。
-    - **Conv1d（`causal_conv1d.py`）**：因果一维卷积，短卷积模块配套。
-    - **Sinkhorn（`sinkhorn.py`）**：HC-Split Sinkhorn算法，MoE路由归一化。
-    - **MxGMM（`mx_grouped_matmul.py`）**：MXFP8低精度分组矩阵乘，量化MoE路径。
+    - 按设备后端组织（`npu/`、`cpu/`、`triton/`），基于统一注册机制（`registry.py`）自动分发。
+    - **GMM**：分组矩阵乘，MoE专家计算核心算子。
+    - **Permute**：token/专家重排，MoE dispatch/combine配套。
+    - **Conv1d**：因果一维卷积，短卷积模块配套。
+    - **Sinkhorn**：HC-Split Sinkhorn算法，MoE路由归一化。
+    - **MxGMM**：MXFP8低精度分组矩阵乘，量化MoE路径。
 
 ![FSDPTurbo架构图](figures/introduction/architecture_fsdpturbo.png)
 

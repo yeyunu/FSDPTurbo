@@ -6,11 +6,11 @@
 
 - **环境准备**：安装FSDPTurbo及其依赖
 - **模型和数据集准备**：获取Qwen3.5-27B模型权重与训练数据
-- **启动训练任务**：在NPU/GPU上进行模型预训练和微调
+- **启动训练任务**：在NPU上进行模型预训练和微调
 
 > [!NOTE]
 >
-> FSDPTurbo支持昇腾NPU与GPU，要求单卡显存满足模型规模需求，详见[模型支持列表](../models/supported_models.md)。
+> FSDPTurbo支持昇腾NPU，要求单卡显存满足模型规模需求，详见[模型支持列表](../models/supported_models.md)。
 >
 > 本文档为 **快速入门跟练教程**。若需更换模型或注册自定义数据集，请参考 [模型适配指南](../develop/model_adaptation.md)。
 >

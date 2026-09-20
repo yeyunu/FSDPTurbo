@@ -1,6 +1,6 @@
 # FSDPTurbo软件安装
 
-本文主要向用户介绍如何基于PyTorch框架快速完成FSDPTurbo（分布式训练加速库）的安装。FSDPTurbo支持昇腾NPU与GPU双后端，请根据实际硬件环境选择对应的安装路径。
+本文主要向用户介绍如何基于PyTorch框架快速完成FSDPTurbo（分布式训练加速库）的安装。
 
 ## 硬件配套和支持的操作系统
 
@@ -8,7 +8,7 @@
 
 |产品|是否支持|
 |--|:-:|
-|Ascend 950系列产品|√|
+|Ascend 950PR&950DT系列产品|√|
 |Atlas A3训练系列产品|√|
 |Atlas A3推理系列产品|x|
 |Atlas A2训练系列产品|√|
@@ -16,7 +16,6 @@
 |Atlas 200I/500 A2推理产品|x|
 |Atlas推理系列产品|x|
 |Atlas训练系列产品|x|
-|NVIDIA GPU（Ampere架构及以上，需支持BF16，如A100、H100）|√|
 
 > [!NOTE]
 >
@@ -24,7 +23,6 @@
 
 - 各NPU硬件产品对应物理机部署场景支持的操作系统请参考[兼容性查询助手](https://www.hiascend.com/hardware/compatibility)。
 - 各NPU硬件产品对应虚拟机及容器部署场景支持的操作系统请参考《CANN软件安装》的“[操作系统兼容性说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum)”章节。
-- GPU环境需安装与PyTorch配套的CUDA驱动，支持的操作系统请参考[NVIDIA CUDA兼容性文档](https://docs.nvidia.com/cuda/cuda-compatibility/)。
 
 ## 安装前准备
 
@@ -35,7 +33,7 @@
 |依赖|版本要求|说明|
 |--|--|--|
 |Python|>= 3.10|最低安装版本3.10（见`pyproject.toml`），推荐3.11及以上版本|
-|PyTorch|>= 2.9.0|NPU与GPU环境通用|
+|PyTorch|>= 2.9.0|NPU环境|
 |torch_npu|>= 2.9.0|仅NPU环境，参考[torch_npu仓库](https://gitee.com/ascend/pytorch)|
 |triton|>= 3.5.0|随FSDPTurbo自动安装|
 |triton-ascend|>= 3.2.2|仅NPU环境需要，建议提前单独安装配套版本，参见[源码安装](#源码安装)步骤4|
@@ -43,9 +41,7 @@
 
 > [!NOTE]
 >
-> 示例验证的版本组合：
-> - GPU环境：`torch==2.10.0, torchvision==0.25.0, transformers==5.15.0`。
-> - NPU环境：`torch==2.10.0, torch_npu==2.10.0, torchvision==0.25.0, transformers==5.15.0`。
+> 示例验证的版本组合：`torch==2.10.0, torch_npu==2.10.0, torchvision==0.25.0, transformers==5.15.0`。
 
 NPU环境下，安装FSDPTurbo前需先在宿主机完成固件与驱动的安装。请单击[固件与驱动](https://www.hiascend.com/hardware/firmware-drivers)，并根据引导完成固件与驱动的安装。
 
@@ -88,18 +84,14 @@ FSDPTurbo当前仅支持源码安装。请参考如下操作获取对应源码�
 
    以上命令以CANN离线安装场景未指定安装路径为例，给出了不同用户的默认安装路径及对应的配置环境变量的命令。若用户指定安装路径或使用其他安装方式，请参考《[CANN软件安装](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/softwareinst/instg/instg_0000.html)》查阅对应的配置环境变量的命令。
 
-   GPU环境跳过本步骤。
-
 3. 安装PyTorch及NPU插件
 
-   - NPU环境：根据引导安装配套版本的PyTorch以及TorchNPU，具体请参考《[TorchNPU快速安装](https://www.hiascend.com/developer/software/ai-frameworks/pytorch/download?versionId=175&ids=89dda9ba9de741349efa03687a487678%2C98%2C107%2C1%2C6%2C177%2C)》。
+   根据引导安装配套版本的PyTorch以及TorchNPU，具体请参考《[TorchNPU快速安装](https://www.hiascend.com/developer/software/ai-frameworks/pytorch/download?versionId=175&ids=89dda9ba9de741349efa03687a487678%2C98%2C107%2C1%2C6%2C177%2C)》。
 
-     > [!NOTE]
-     >
-     > - 更多TorchNPU插件版本请单击[Link](https://gitcode.com/ascend/pytorch/releases)。
-     > - TorchNPU相关文档请参见《[TorchNPU使用导读](https://www.hiascend.com/document/detail/zh/Pytorch/latest/index/index.html)》。
-
-   - GPU环境：请参考[PyTorch官网](https://pytorch.org/get-started/locally/)安装配套版本的PyTorch，并确保CUDA版本与驱动匹配。
+   > [!NOTE]
+   >
+   > - 更多TorchNPU插件版本请单击[Link](https://gitcode.com/ascend/pytorch/releases)。
+   > - TorchNPU相关文档请参见《[TorchNPU使用导读](https://www.hiascend.com/document/detail/zh/Pytorch/latest/index/index.html)》。
 
 4. （仅NPU环境）安装Triton-Ascend
 
@@ -124,10 +116,8 @@ FSDPTurbo当前仅支持源码安装。请参考如下操作获取对应源码�
    基础依赖（torch、torchvision、transformers、datasets、triton等）将随上述命令自动安装。如需使用以下扩展能力，可安装对应的可选依赖：
 
    ```shell
-   # NPU环境：安装fla-core、flash-linear-attention等线性注意力相关依赖（训练Kimi K3等采用线性注意力结构的模型时需要）
+   # 安装fla-core、flash-linear-attention等线性注意力相关依赖（训练Kimi K3等采用线性注意力结构的模型时需要）
    pip3 install -e ".[npu]"
-   # GPU环境：安装transformer-engine（FP8量化训练时需要）
-   pip3 install -e ".[gpu]"
    ```
 
    > [!NOTE]
@@ -151,13 +141,6 @@ NPU环境下，可进一步确认NPU与torch_npu状态：
 npu-smi info
 # 确认torch_npu是否可用，输出True表示正常
 python -c "import torch; import torch_npu; print(torch.npu.is_available())"
-```
-
-GPU环境下，可确认CUDA状态：
-
-```bash
-# 输出True表示正常
-python -c "import torch; print(torch.cuda.is_available())"
 ```
 
 > [!NOTE]

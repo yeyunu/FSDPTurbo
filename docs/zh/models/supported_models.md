@@ -15,7 +15,7 @@ FSDPTurbo与模型结构解耦，理论上支持各类基于Transformer架构的
 
 > [!NOTE]
 >
-> - 仓库支持**Ascend 950系列产品**、**Atlas A3训练系列产品**、**Atlas A2训练系列产品和NVIDIA GPU（Ampere架构及以上，需支持BF16，如A100、H100）**，可通过[硬件信息查询](https://www.hiascend.com/cann/download)获取NPU产品信息。并且要求单NPU的片上内存为64GB及以上，[安装驱动固件](../training/install_guide.md)后可通过`npu-smi info`查看单NPU的片上内存容量；GPU环境要求单卡显存满足模型规模需求。
+> - 仓库支持**Ascend 950PR&950DT系列产品**、**Atlas A3训练系列产品**和**Atlas A2训练系列产品**，可通过[硬件信息查询](https://www.hiascend.com/cann/download)获取NPU产品信息。并且要求单NPU的片上内存为64GB及以上，[安装驱动固件](../training/install_guide.md)后可通过`npu-smi info`查看单NPU的片上内存容量。
 > - 各训练示例的默认集群规模见上表"集群规模"列，在`examples/*/run.sh`中通过`NNODES`与`GPUS_PER_NODE`设置，其中`NNODES`指代机器数量，`GPUS_PER_NODE`指代每台机器上的卡数。若实际卡数不同，需相应调整`distributed`下的并行度参数。
 > - 如无法顺利访问Hugging Face社区下载权重资源，推荐前往[ModelScope](https://www.modelscope.cn/models)下载权重，需关注待下载文件的正确性和安全性。
 

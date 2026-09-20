@@ -28,8 +28,7 @@
 >
 > - 示例验证版本组合：`torch==2.10.0`、`torchvision==0.25.0`、`transformers==5.15.0`；NPU环境另含`torch_npu==2.10.0`。
 > - torchvision为随FSDPTurbo自动安装的基础依赖，仅多模态（图文）训练需要，纯文本训练不使用；若环境中已安装PyTorch，安装torchvision时需选择与该PyTorch配套的版本（如`torch==2.10.0`对应`torchvision==0.25.0`），否则pip可能因依赖解析变更已安装的PyTorch版本。
-> - TorchNPU与Triton-Ascend仅NPU环境需要；GPU环境无需上述两者，需安装与PyTorch配套的CUDA驱动。
-> - NPU环境支持的产品：Ascend 950系列、Atlas A3训练系列、Atlas A2训练系列；GPU环境支持Ampere架构及以上且支持BF16的NVIDIA GPU。硬件与软件配套详情参见[软件安装](./training/install_guide.md)。
+> - 支持的产品：Ascend 950PR&950DT系列、Atlas A3训练系列、Atlas A2训练系列。硬件与软件配套详情参见[软件安装](./training/install_guide.md)。
 
 ## 更新说明
 
@@ -42,7 +41,6 @@
 | 量化训练 | MXFP8（E4M3/E5M2/HIF8）与分块量化、W8A16量化感知训练、低精度AllGather | 降低显存占用并提升训练速度 |
 | 断点续训 | 基于PyTorch分布式Checkpoint（DCP）的权重与优化器状态保存/恢复 | 支持故障恢复与长周期训练 |
 | HuggingFace原生兼容 | `FSDPTurbo(config, model)`一行完成并行化改造，模型经Transformers原生接口加载 | 降低大模型分布式训练接入成本 |
-| 双后端支持 | 昇腾NPU与GPU，算子统一注册、按设备自动分发 | 一套代码适配多种硬件 |
 
 ### 新增模型支持
 

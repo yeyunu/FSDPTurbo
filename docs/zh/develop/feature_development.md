@@ -12,7 +12,7 @@ FSDPTurbo采用**配置驱动**的特性管理架构：特性以YAML配置为入
 | `FSDPTurbo` | `fsdp_turbo/fsdp_turbo.py` | 主入口，按固定顺序对模型应用各特性 |
 | `apply_module_patches` / `patch_namespace_members` | `fsdp_turbo/utils/patch.py` | 函数/方法级替换，幂等安装 |
 | `module_name_match` | `fsdp_turbo/utils/str_match.py` | 模块名通配符匹配 |
-| `register_op` / `dispatch_op` | `fsdp_turbo/ops/registry.py` | 多后端（CPU/NPU/CUDA）算子注册与分发 |
+| `register_op` / `dispatch_op` | `fsdp_turbo/ops/registry.py` | 多后端（CPU/NPU）算子注册与分发 |
 
 开发者只需新增一个配置项 + 一个模块变换函数，并在`FSDPTurbo`中接入，即可添加新特性。
 
@@ -191,7 +191,7 @@ module_patches:
 
 ## 多后端算子开发
 
-涉及设备相关算子的特性（如MoE grouped matmul），使用算子注册表实现CPU/NPU/CUDA多后端：
+涉及设备相关算子的特性（如MoE grouped matmul），使用算子注册表实现CPU/NPU多后端：
 
 ```python
 # fsdp_turbo/ops/npu/grouped_matmul.py
@@ -211,7 +211,7 @@ output = dispatch_op('grouped_matmul', inputs, m_split, weights)
 
 说明：
 
-- 算子按设备组织在`fsdp_turbo/ops/{cpu,npu,cuda,triton}/`目录下，同名算子各目录一份实现。
+- 算子按设备组织在`fsdp_turbo/ops/{cpu,npu,triton}/`目录下，同名算子各目录一份实现。
 - **CPU实现必须提供**：既是正确性参考实现（单测基线），也是无加速后端时的fallback——`get_op`在目标设备未注册时自动回退CPU实现并打印一次告警。
 - 自定义autograd算子（如`fsdp_turbo/ops/npu/grouped_matmul_mc2.py`的`AllToAllGroupedMatmul`）应继承`torch.autograd.Function`，再通过注册表暴露统一的dispatch入口。
 
@@ -224,7 +224,7 @@ output = dispatch_op('grouped_matmul', inputs, m_split, weights)
 - 快速失败：模块匹配、patch目标匹配失败时立即抛错，禁止静默跳过。
 - 保持模块实例：变换只包装`forward`或修改属性，不替换模块对象，保证权重加载与FSDP遍历兼容。
 - 应用顺序：所有依赖原始模块结构的变换必须在`apply_fsdp_modules`之前；FSDP2分片必须最后执行。
-- 延迟导入：仅在特性分支内部import重量级依赖（如NPU/CUDA扩展），避免未启用特性时引入副作用。
+- 延迟导入：仅在特性分支内部import重量级依赖（如NPU扩展），避免未启用特性时引入副作用。
 
 ### 创建新特性的Checklist
 
@@ -249,7 +249,7 @@ output = dispatch_op('grouped_matmul', inputs, m_split, weights)
 │   └── [ ] 确认插入位置在 FSDP2 分片之前
 ├── 设备算子（如涉及）
 │   ├── [ ] 注册 CPU 参考实现
-│   └── [ ] 注册 NPU/CUDA 加速实现
+│   └── [ ] 注册 NPU 加速实现
 └── 测试验证
     ├── [ ] 配置解析与校验单测
     ├── [ ] 模块匹配/变换单测（CPU 实现作为基线）

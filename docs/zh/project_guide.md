@@ -58,7 +58,6 @@ fsdp_turbo/
  ├── modules/                   # 通用模型组件
  ├── ops/                       # 多后端算子
  │   ├── npu/                   # NPU后端实现
- │   ├── cuda/                  # CUDA后端实现
  │   ├── cpu/                   # CPU实现
  │   └── triton/                # Triton kernel实现
  ├── quantization/              # 量化训练
@@ -86,7 +85,7 @@ fsdp_turbo/
 - `memory/`：显存优化手段，包含激活重计算、激活值交换、优化器状态交换、微批次切分与分块损失计算。
 - `models/`：内置模型实现（Qwen3.5、Qwen3.5-MoE、Kimi K3等）。
 - `modules/`：通用模型组件（RMSNorm、KDA、GatedDeltaNet、HyperConnection、短卷积等）。
-- `ops/`：按设备后端组织的算子实现（`npu/`、`cuda/`、`cpu/`、`triton/`），经`registry.py`统一注册，按运行设备自动分发。
+- `ops/`：按设备后端组织的算子实现（`npu/`、`cpu/`、`triton/`），经`registry.py`统一注册，按运行设备自动分发。
 - `quantization/`：量化训练，包含MXFP8格式算子、W8A16量化感知训练与模块量化转换器。
 - `training/`：训练生命周期管理，包含训练主循环、checkpoint保存恢复、数据加载、训练监控、性能数据采集，以及模型/优化器/调度器/分词器工厂。
 - `utils/`：设备、精度、日志、patch等通用工具。
@@ -125,7 +124,7 @@ FSDPTurbo提供了一套兼具高性能与易用性的大模型分布式训练�
 - **易接入**：基于PyTorch FSDP2构建，直接对接HuggingFace Transformers生态，`FSDPTurbo(config, model)`一行完成并行化改造
 - **显存优化**：提供激活重计算、分块损失、激活值交换、优化器状态交换等手段，支持低显存大模型训练
 - **量化加速**：支持MXFP8量化格式、分块量化与量化感知训练（QAT），兼容专家并行路径
-- **多后端支持**：面向昇腾NPU与GPU，算子按设备统一注册、自动分发
+- **多后端支持**：面向昇腾NPU，算子按设备统一注册、自动分发
 - **开箱即用**：提供Qwen、Kimi、DeepSeek等主流模型的训练示例脚本与配置
 
 项目通过清晰的目录结构、完善的文档体系与丰富的示例脚本，帮助开发者高效地进行大模型分布式训练工作。
