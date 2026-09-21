@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2026, The HuggingFace Inc. Team. All rights reserved.
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -30,7 +33,7 @@ class HyperConnection(nn.Module):
             hc_base=self.base,
             hc_mult=self.hc_mult,
             sinkhorn_iters=self.sinkhorn_iters,
-            eps=self.eps
+            eps=self.eps,
         )
 
         collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)

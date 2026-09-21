@@ -1,4 +1,6 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2026, The HuggingFace Inc. Team. All rights reserved.
+
 import torch
 
 from fsdp_turbo.ops.registry import register_op
