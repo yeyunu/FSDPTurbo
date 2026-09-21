@@ -13,7 +13,7 @@
   <tbody>
     <tr>
       <td rowspan="4">并行特性</td>
-      <td><a href="./fully_shard_parallel.md">全分片数据并行（FSDP2）</a></td>
+      <td><a href="./fully_shard_parallel.md">全分片数据并行</a></td>
       <td>基于PyTorch FSDP2，参数/梯度/优化器状态全分片，支持混合精度与预取</td>
     </tr>
     <tr>

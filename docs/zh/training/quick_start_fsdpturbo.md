@@ -10,11 +10,11 @@
 
 > [!NOTE]
 >
-> FSDPTurbo支持昇腾NPU，要求单卡显存满足模型规模需求，详见[模型支持列表](../models/supported_models.md)。
+> - FSDPTurbo支持 <term>Ascend 950PR&950DT系列产品</term>、<term>Atlas A3训练系列产品</term> 和 <term>Atlas A2训练系列产品</term>，要求单卡显存满足模型规模需求，详见[模型支持列表](../models/supported_models.md)。
 >
-> 本文档为 **快速入门跟练教程**。若需更换模型或注册自定义数据集，请参考 [模型适配指南](../develop/model_adaptation.md)。
+> - 本文档为 **快速入门跟练教程**。若需更换模型或注册自定义数据集，请参考 [模型适配指南](../develop/model_adaptation.md)。
 >
-> 当前Qwen3.5-27B的示例脚本中`GPUS_PER_NODE=16`表示需要16张卡，如果实际情况低于此配置，需相应调整并行度参数，否则可能遇到OOM（Out Of Memory，内存不足）问题。
+> - 当前Qwen3.5-27B的示例脚本中`GPUS_PER_NODE=16`表示需要16张卡，如果实际情况低于此配置，需相应调整并行度参数，否则可能遇到OOM（Out Of Memory，内存不足）问题。
 
 开发者入门基础：
 
@@ -26,13 +26,7 @@
 
 ### 环境搭建
 
-基于PyTorch框架，环境搭建请参考[软件安装](./install_guide.md)。
-
-NPU环境下训练前需加载CANN环境：
-
-```shell
-source /usr/local/Ascend/cann/set_env.sh
-```
+环境搭建请参考[软件安装](./install_guide.md)。
 
 ### 模型权重准备
 

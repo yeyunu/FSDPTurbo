@@ -21,29 +21,14 @@
 >
 > 本节表格中“√”代表支持，“x”代表不支持。
 
-- 各NPU硬件产品对应物理机部署场景支持的操作系统请参考[兼容性查询助手](https://www.hiascend.com/hardware/compatibility)。
-- 各NPU硬件产品对应虚拟机及容器部署场景支持的操作系统请参考《CANN软件安装》的“[操作系统兼容性说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum)”章节。
+- 各硬件产品对应物理机部署场景支持的操作系统请参考[兼容性查询助手](https://www.hiascend.com/hardware/compatibility)。
+- 各硬件产品对应虚拟机及容器部署场景支持的操作系统请参考《CANN软件安装》的“[操作系统兼容性说明](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/softwareinst/instg/instg_0101.html?OS=openEuler&InstallType=netyum)”章节。
 
 ## 安装前准备
 
-请根据硬件环境准备配套的软件版本，FSDPTurbo依赖的软件及版本要求如[表2](#table2)所示。
+请参见《版本说明》中的“[相关产品版本配套说明](../release_notes_fsdpturbo.md#相关产品版本配套说明)”章节，下载安装对应的软件版本。
 
-**表2**软件依赖版本要求
-
-|依赖|版本要求|说明|
-|--|--|--|
-|Python|>= 3.10|最低安装版本3.10（见`pyproject.toml`），推荐3.11及以上版本|
-|PyTorch|>= 2.9.0|NPU环境|
-|torch_npu|>= 2.9.0|仅NPU环境，参考[torch_npu仓库](https://gitee.com/ascend/pytorch)|
-|triton|>= 3.5.0|随FSDPTurbo自动安装|
-|triton-ascend|>= 3.2.2|仅NPU环境需要，建议提前单独安装配套版本，参见[源码安装](#源码安装)步骤4|
-|transformers|>= 5.2.0|示例验证版本：5.15.0|
-
-> [!NOTE]
->
-> 示例验证的版本组合：`torch==2.10.0, torch_npu==2.10.0, torchvision==0.25.0, transformers==5.15.0`。
-
-NPU环境下，安装FSDPTurbo前需先在宿主机完成固件与驱动的安装。请单击[固件与驱动](https://www.hiascend.com/hardware/firmware-drivers)，并根据引导完成固件与驱动的安装。
+请单击[固件与驱动](https://www.hiascend.com/hardware/firmware-drivers)，并根据引导完成固件与驱动的安装。
 
 > [!NOTICE]
 >
@@ -66,7 +51,7 @@ FSDPTurbo当前仅支持源码安装。请参考如下操作获取对应源码�
    conda activate fsdpturbo
    ```
 
-2. （仅NPU环境）安装CANN
+2. 安装CANN
 
    安装配套版本的NPU驱动固件、CANN软件并配置CANN环境变量，具体请参考《[CANN快速安装](https://www.hiascend.com/cann/download?versionId=783&ids=d806%2Ch0501%2Ch0601%2Ch0703)》。
 
@@ -84,7 +69,7 @@ FSDPTurbo当前仅支持源码安装。请参考如下操作获取对应源码�
 
    以上命令以CANN离线安装场景未指定安装路径为例，给出了不同用户的默认安装路径及对应的配置环境变量的命令。若用户指定安装路径或使用其他安装方式，请参考《[CANN软件安装](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/latest/softwareinst/instg/instg_0000.html)》查阅对应的配置环境变量的命令。
 
-3. 安装PyTorch及NPU插件
+3. 安装PyTorch及TorchNPU
 
    根据引导安装配套版本的PyTorch以及TorchNPU，具体请参考《[TorchNPU快速安装](https://www.hiascend.com/developer/software/ai-frameworks/pytorch/download?versionId=175&ids=89dda9ba9de741349efa03687a487678%2C98%2C107%2C1%2C6%2C177%2C)》。
 
@@ -93,7 +78,7 @@ FSDPTurbo当前仅支持源码安装。请参考如下操作获取对应源码�
    > - 更多TorchNPU插件版本请单击[Link](https://gitcode.com/ascend/pytorch/releases)。
    > - TorchNPU相关文档请参见《[TorchNPU使用导读](https://www.hiascend.com/document/detail/zh/Pytorch/latest/index/index.html)》。
 
-4. （仅NPU环境）安装Triton-Ascend
+4. 安装Triton-Ascend
 
    安装配套版本的Triton-Ascend，请参考[Triton-Ascend安装指南](https://triton-ascend.readthedocs.io/zh-cn/latest/installation_guide.html#id1)，获取配套版本的Triton-Ascend安装指令。可参考如下安装命令：
 
@@ -122,7 +107,7 @@ FSDPTurbo当前仅支持源码安装。请参考如下操作获取对应源码�
 
    > [!NOTE]
    >
-   > - NPU环境下，`[npu]`可选依赖包含torch_npu。若已按步骤3安装配套版本的TorchNPU，pip将跳过已满足的依赖，不会重复安装或变更版本。
+   > - `[npu]`可选依赖包含torch_npu。若已按步骤3安装配套版本的TorchNPU，pip将跳过已满足的依赖，不会重复安装或变更版本。
    > - torchvision为自动安装的基础依赖，仅多模态（图文）训练需要：纯文本训练不使用，安装后如无需要可执行`pip uninstall torchvision`移除。
    > - 若环境中已安装PyTorch，安装torchvision时需选择与该PyTorch配套的版本（如`torch==2.10.0`对应`torchvision==0.25.0`），否则pip可能因依赖解析变更已安装的PyTorch版本。
 
@@ -134,7 +119,7 @@ FSDPTurbo当前仅支持源码安装。请参考如下操作获取对应源码�
 python -c "import fsdp_turbo; print(fsdp_turbo.__file__)"
 ```
 
-NPU环境下，可进一步确认NPU与torch_npu状态：
+可进一步确认NPU与TorchNPU状态：
 
 ```bash
 # 确认NPU是否可以正常使用
@@ -145,6 +130,6 @@ python -c "import torch; import torch_npu; print(torch.npu.is_available())"
 
 > [!NOTE]
 >
-> NPU环境下，每个新终端执行训练任务前，需先加载CANN环境变量（参见[源码安装](#源码安装)步骤2）。更多训练相关环境变量说明请参考[环境变量说明](../features/environment_variable.md)。
+> 每个新终端执行训练任务前，需先加载CANN环境变量（参见[源码安装](#源码安装)步骤2）。更多训练相关环境变量说明请参考[环境变量说明](../features/environment_variable.md)。
 
 安装成功后，可参考[快速入门](./quick_start_fsdpturbo.md)启动第一个训练任务。

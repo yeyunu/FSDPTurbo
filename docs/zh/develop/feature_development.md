@@ -32,7 +32,7 @@ FSDPTurbo采用**配置驱动**的特性管理架构：特性以YAML配置为入
 | 8 | 微批次切分 | chunk_batch包装forward |
 | 9 | FSDP2分片 | `fully_shard`包装，必须最后执行 |
 
-> **Note**
+> [!NOTE]
 > 新增特性时需确认插入位置：所有依赖原始模块结构的变换必须在FSDP2分片之前；`module_patches`在FSDP之前应用，目标不匹配会直接报错。
 
 ## 开发流程
@@ -62,7 +62,7 @@ class MemoryConfig:
     chunk_batch_plan: Optional[ChunkBatchPlanConfig] = None    # 特性计划
 ```
 
-说明：
+说明如下：
 
 - 开关（`chunk_batch`）与计划（`chunk_batch_plan`）分离，未开启时零开销。
 - 配置按领域分组挂载（`distributed` / `memory` / `quantization`）。
@@ -96,7 +96,7 @@ def __post_init__(self):
     self.validate_chunk_batch_config()
 ```
 
-说明：
+说明如下：
 
 - 特性未开启时快速返回，不影响其他配置。
 - 校验错误信息包含完整字段路径（如`chunk_batch_plan.apply_modules`），便于定位YAML问题。
@@ -129,7 +129,7 @@ def get_chunkmbs_modules(modules, plan):
     return matched_modules
 ```
 
-说明：
+说明如下：
 
 - 变换函数只包装模块的`forward`，**不替换模块对象本身**，以保持参数、buffer与模块限定名不变，避免破坏权重加载与FSDP遍历。
 - 模块匹配不到时抛出`RuntimeError`，避免配置静默失效。
@@ -159,7 +159,7 @@ class FSDPTurbo(torch.nn.Module):
 
 ### 使用特性
 
-在YAML配置中开启该特性：
+在YAML配置中开启该特性，配置示例如下：
 
 ```yaml
 # examples/xxx/config.yaml
@@ -182,7 +182,7 @@ module_patches:
     replacement: fsdp_turbo.models.qwen.qwen3_5.qwen3_5_model_forward
 ```
 
-说明：
+说明如下：
 
 - `target`支持两种形式：`module.member`（模块级函数）与`module.Class.member`（类方法/属性，对该类所有实例生效）。
 - `replacement`必须是dotted path（不支持`module:name`冒号语法）。
@@ -209,7 +209,7 @@ from fsdp_turbo.ops.registry import dispatch_op
 output = dispatch_op('grouped_matmul', inputs, m_split, weights)
 ```
 
-说明：
+说明如下：
 
 - 算子按设备组织在`fsdp_turbo/ops/{cpu,npu,triton}/`目录下，同名算子各目录一份实现。
 - **CPU实现必须提供**：既是正确性参考实现（单测基线），也是无加速后端时的fallback——`get_op`在目标设备未注册时自动回退CPU实现并打印一次告警。

@@ -1,6 +1,6 @@
 # FSDPTurbo
 
-- [简介](introduction.md)
+- [FSDPTurbo简介](introduction.md)
 - [软件安装](./training/install_guide.md)
 - [特性说明]()
   - [特性列表](./features/supported_features.md)

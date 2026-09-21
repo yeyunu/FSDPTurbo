@@ -77,4 +77,4 @@ fsdp_plan:
 
 ## 断点续训
 
-通过`checkpoint`配置段控制权重与优化器状态的保存/恢复，详见[checkpoint_resume.md](./checkpoint_resume.md)。
+通过`checkpoint`配置段控制权重与优化器状态的保存/恢复，详见[断点续训](./checkpoint_resume.md)。

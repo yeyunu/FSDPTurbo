@@ -1,4 +1,4 @@
-# FSDPTurbo简介
+# 简介
 
 ## 概述
 
@@ -10,7 +10,7 @@ FSDPTurbo面向昇腾NPU，从并行优化、内存优化、量化加速三个�
 
 ## FSDPTurbo架构
 
-整体采用分层架构：用户配置经`FSDPTurbo(config, model)`一行入口编排，下接分布式并行、内存优化、量化加速三大能力域，底座为HuggingFace模型与多后端算子。
+FSDPTurbo架构关系如[图1](#架构图)所示，整体采用分层架构：用户配置经`FSDPTurbo(config, model)`一行入口编排，下接分布式并行、内存优化、量化加速三大能力域，底座为HuggingFace模型与多后端算子。
 
 各模块职责：
 
@@ -50,7 +50,9 @@ FSDPTurbo面向昇腾NPU，从并行优化、内存优化、量化加速三个�
     - **Sinkhorn**：HC-Split Sinkhorn算法，MoE路由归一化。
     - **MxGMM**：MXFP8低精度分组矩阵乘，量化MoE路径。
 
-![FSDPTurbo架构图](figures/introduction/architecture_fsdpturbo.png)
+**图 1**  FSDPTurbo架构图<a id="架构图"></a>
+
+<img src="figures/introduction/architecture_fsdpturbo.png" width="100%"/>
 
 ## 功能特性
 
