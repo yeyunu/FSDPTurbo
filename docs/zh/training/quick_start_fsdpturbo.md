@@ -32,15 +32,56 @@
 
 FSDPTurbo直接加载HuggingFace格式权重，**无需进行任何权重格式转换**；权重加载后，训练脚本会按`torch_dtype`配置对模型参数与buffer做dtype转换。获取Qwen3.5-27B权重：
 
-```shell
-# 创建一个目录存储权重文件
-mkdir -p ./model_from_hf/qwen3_5_hf
+1. 创建一个目录存储权重文件。
 
-# 方式一：huggingface-cli 下载
-huggingface-cli download Qwen/Qwen3.5-27B --local-dir ./model_from_hf/qwen3_5_hf
+    ```shell
+    mkdir -p ./model_from_hf/qwen3_5_hf
+    cd ./model_from_hf/qwen3_5_hf
+    ```
 
-# 方式二：训练配置中直接填写 "Qwen/Qwen3.5-27B"，框架自动下载
-```
+2. 通过HuggingFace或ModelScope获取模型权重文件（择一获取）。
+
+    方式一：通过HuggingFace获取
+
+    ```shell
+    wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/config.json
+    wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/generation_config.json
+    wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/merges.txt
+    wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/model.safetensors.index.json
+    # 根据model.safetensors.index.json中的权重分片列表下载全部safetensors文件
+    wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/model-00001-of-0000X.safetensors
+    wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/tokenizer.json
+    wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/tokenizer_config.json
+    wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/vocab.json
+    ```
+
+    方式二：通过ModelScope获取（国内推荐）
+
+    ```shell
+    wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/config.json
+    wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/generation_config.json
+    wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/merges.txt
+    wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/model.safetensors.index.json
+    # 根据model.safetensors.index.json中的权重分片列表下载全部safetensors文件
+    wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/model-00001-of-0000X.safetensors
+    wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/tokenizer.json
+    wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/tokenizer_config.json
+    wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/vocab.json
+    ```
+
+    > [!NOTE]
+    >
+    > 也可在训练配置中直接填写 `"Qwen/Qwen3.5-27B"`，框架自动下载。
+
+3. 利用sha256sum校验权重文件正确性和完整性。
+
+    ```shell
+    # 打开文件明细可获取sha256值，https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/model-00001-of-0000X.safetensors
+    # 或 https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/file/view/master/model-00001-of-0000X.safetensors
+    sha256sum ./model-00001-of-0000X.safetensors
+    # 对其余权重分片文件执行相同校验
+    cd ../..
+    ```
 
 完整模型目录应包含模型配置、Tokenizer配置和全部权重文件。
 
@@ -48,30 +89,21 @@ huggingface-cli download Qwen/Qwen3.5-27B --local-dir ./model_from_hf/qwen3_5_hf
 
 FSDPTurbo数据加载基于HuggingFace `datasets`实现，支持本地数据文件或HuggingFace Hub数据集，训练任务启动时完成加载与Tokenize，无需提前转换为Megatron Indexed Dataset。
 
-**预训练数据**：纯文本格式，每条样本包含`text`字段。
+获取数据集，可通过HuggingFace或ModelScope获取公开数据集（择一获取），例如Alpaca数据集（`.parquet`格式）：
 
-```json
-[
-  {"text": "训练样本文本内容..."}
-]
-```
-
-**微调数据**：支持对话格式，通过`conversation_column`指定对话列名（多模态场景），或通过`text_column`指定已拼接好的文本列（纯文本场景）。
-
-```json
-[
-  {
-    "messages": [
-      {"role": "user", "content": "请介绍一下 FSDPTurbo"},
-      {"role": "assistant", "content": "FSDPTurbo 是一个分布式训练加速库..."}
-    ]
-  }
-]
+```shell
+mkdir -p ./dataset
+cd ./dataset/
+# HuggingFace 数据集链接
+wget https://huggingface.co/datasets/tatsu-lab/alpaca/resolve/main/data/train-00000-of-00001-a09b74b3ef9c3b56.parquet
+# ModelScope 数据集链接（国内推荐）
+wget https://www.modelscope.cn/datasets/angelala00/tatsu-lab-alpaca/resolve/master/train-00000-of-00001-a09b74b3ef9c3b56.parquet
+cd ..
 ```
 
 > [!NOTE]
 >
-> 本地文件支持`.json`、`.jsonl`、`.csv`、`.parquet`、`.txt`等格式，由HuggingFace `datasets`自动识别。
+> 本地文件支持`.json`、`.jsonl`、`.csv`、`.parquet`、`.txt`等格式，由HuggingFace `datasets`自动识别。HuggingFace Hub上的数据集（`.parquet`等格式）由HuggingFace `datasets`自动识别加载。
 
 ## 启动预训练
 

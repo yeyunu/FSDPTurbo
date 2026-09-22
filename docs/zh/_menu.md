@@ -1,6 +1,6 @@
 # FSDPTurbo
 
-- [FSDPTurbo简介](introduction.md)
+- [简介](introduction.md)
 - [软件安装](./training/install_guide.md)
 - [特性说明]()
   - [特性列表](./features/supported_features.md)
@@ -15,7 +15,6 @@
     - [分块损失计算](./features/chunk_loss.md)
     - [激活值交换](./features/swap_activation.md)
     - [优化器状态交换](./features/swap_optimizer.md)
-    - [CPU卸载](./features/fully_shard_parallel.md)
     - [断点续训](./features/checkpoint_resume.md)
   - [量化特性]()
     - [MXFP8量化训练](./features/quantization.md)

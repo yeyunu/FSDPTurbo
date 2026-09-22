@@ -29,12 +29,13 @@ FSDPTurbo架构关系如[图1](#架构图)所示，整体采用分层架构：�
 - **量化加速（`Quant`）**
     - **Converter**：模型转换框架，轻松在模型中部署量化。
     - **QuantWeight**：分块量化，可配置块大小，实现细粒度控制。
-    - **MXFP8**：支持E4M3、E5M2与HIF8（华为hifloat8）格式。
+    - **MxFormat**：定义MXFP8量化格式（E4M3、E5M2、HIF8、E2M1）及配置。
     - **QAT**：当前提供W8A16方案，覆盖Linear与GMM。
 - **通用工具与训练辅助（`Utils`）**
     - **Accelerator**：加速器适配层，统一NPU设备访问（`torch.accelerator`委托），自动返回对应通信后端（HCCL）。
     - **MetaInit**：模块权重初始化，对子模块执行`_init_weights`或通用随机初始化。
     - **CkptManager**：断点管理器（`Checkpointer`），负责权重与优化器状态的保存/恢复。
+    - **BaseTrainer**：训练器基类，封装训练循环逻辑。
     - **BaseDataLoader**：数据加载，构建文本/多模态数据集的DataLoader。
     - **BaseTokenizer**：分词器构建工厂，支持HuggingFace加载与自定义注册。
 - **自定义模块（`Modules`）**
