@@ -54,7 +54,7 @@ FSDPTurbo数据加载基于HuggingFace `datasets`实现，支持本地数据文�
     ]
     ```
 
-- **对话格式（多模态）**：通过`conversation_column`指定对话列名，每条消息包含`role`和`content`字段。
+- **对话格式**：通过`conversation_column`指定对话列名，每条消息包含`role`和`content`字段，适用于指令微调与多模态微调。
 
     ```json
     [
@@ -62,6 +62,19 @@ FSDPTurbo数据加载基于HuggingFace `datasets`实现，支持本地数据文�
         "messages": [
           {"role": "user", "content": "请介绍一下 FSDPTurbo"},
           {"role": "assistant", "content": "FSDPTurbo 是一个分布式训练加速库..."}
+        ]
+      }
+    ]
+    ```
+
+    多模态场景下，在样本中添加`images`字段并在`content`中使用`<image>`占位符：
+
+    ```json
+    [
+      {
+        "messages": [
+          {"role": "user", "content": "<image>\n请描述这张图片"},
+          {"role": "assistant", "content": "这张图片展示了..."}
         ],
         "images": ["/path/to/image1.jpg"]
       }

@@ -53,6 +53,8 @@ FSDPTurbo直接加载HuggingFace格式权重，**无需进行任何权重格式�
     wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/tokenizer.json
     wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/tokenizer_config.json
     wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/vocab.json
+    wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/preprocessor_config.json
+    wget https://huggingface.co/Qwen/Qwen3.5-27B/resolve/main/chat_template.json
     ```
 
     方式二：通过ModelScope获取（国内推荐）
@@ -67,6 +69,8 @@ FSDPTurbo直接加载HuggingFace格式权重，**无需进行任何权重格式�
     wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/tokenizer.json
     wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/tokenizer_config.json
     wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/vocab.json
+    wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/preprocessor_config.json
+    wget https://www.modelscope.cn/models/Qwen/Qwen3.5-27B/resolve/master/chat_template.json
     ```
 
     > [!NOTE]
@@ -104,6 +108,10 @@ cd ..
 > [!NOTE]
 >
 > 本地文件支持`.json`、`.jsonl`、`.csv`、`.parquet`、`.txt`等格式，由HuggingFace `datasets`自动识别。HuggingFace Hub上的数据集（`.parquet`等格式）由HuggingFace `datasets`自动识别加载。
+
+> [!NOTE]
+>
+> 如需进行多模态数据集的下载、格式转换与校验，请参考 [geo3k 数据集微调实战](./geo3k_finetune_guide.md)。
 
 ## 启动预训练
 
@@ -309,4 +317,5 @@ bash run.sh
 
 - 查看更多支持模型：[模型支持列表](../models/supported_models.md)
 - 接入自定义模型：[模型适配指南](../develop/model_adaptation.md)
+- 多模态数据处理与微调：[geo3k 数据集微调实战](./geo3k_finetune_guide.md)
 - 训练性能分析：[性能数据采集](../tools/profiling.md)
