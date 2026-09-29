@@ -68,7 +68,7 @@ def _apply_modules_match(fqn: str, config, apply_attr: str, ignored_attr: str = 
         for pattern in getattr(config, ignored_attr, []):
             if module_name_match(pattern, fqn):
                 return False
-    m = re.match(r"(.*?layers\.\d+)", fqn)
+    m = re.match(r"(.*?(?:layers|blocks).\d+)", fqn)
     if m is None:
         return False
     prefix = m.group(1)

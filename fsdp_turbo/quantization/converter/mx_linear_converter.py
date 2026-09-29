@@ -5,9 +5,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from functools import partial
 from typing import Any, List
-import torch.nn as nn
+from torch import nn
 
 from fsdp_turbo.quantization.mxfp8_config import get_mxfp8linear_config
 from fsdp_turbo.quantization.converter.model_converter import register_model_converter
@@ -17,6 +16,7 @@ from fsdp_turbo.fsdp_turbo_config import QuantizeConfig
 
 class MXLinearConverter:
     """Converts the linear layers of `model` to `MXLinear`."""
+
     filter_fqns: List[str]
     mx_config: Any  # MXLinearConfig type when imported
 
@@ -32,11 +32,12 @@ class MXLinearConverter:
         """
 
         from fsdp_turbo.quantization.quantize import quantize_
+
         quantize_(
             model,
             config=self.config,
             filter_fn=module_filter_fn,
-            device=model.device,
+            device=next((p.device for p in model.parameters()), None),
         )
 
 

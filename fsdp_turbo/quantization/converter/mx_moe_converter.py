@@ -35,7 +35,7 @@ class MXMoeConverter:
             model,
             config=self.config,
             filter_fn=moe_filter_fn,
-            device=model.device,
+            device=next((p.device for p in model.parameters()), None),
             handler=_mx_gmm_transform,
         )
 

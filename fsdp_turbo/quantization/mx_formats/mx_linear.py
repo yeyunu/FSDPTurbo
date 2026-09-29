@@ -189,7 +189,9 @@ class MXLinear(torch.nn.Linear):
             else:
                 local_w = w
 
-            if local_w.size(0) % config.fsdp_world_size != 0:
+            world_size = config.fsdp_world_size
+            alignment = 64 * world_size if world_size > 1 else 1
+            if local_w.size(0) % alignment != 0:
                 mod.__class__ = MXLinear
                 mod.config = config
                 mod._mx_tensor = None
