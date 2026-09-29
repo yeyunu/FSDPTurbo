@@ -1,22 +1,22 @@
-# geo3k 数据集微调实战：下载、处理与验证
+# geo3k数据集微调实战：下载、处理与验证
 
 ## 概述
 
-本文档以 geometry3k（geo3k）几何推理数据集为例，指导开发者为 Qwen3.5 多模态模型微调准备一份小体积、开箱即用的数据集，并完成从下载、格式转换、数据校验到启动训练的全流程。geo3k 全量约 41.5 MB（2100+ 条图文样本，图片内嵌于 parquet），相比 LLaVA-Instruct-150K（对话文件 229 MB + COCO 图片 18 GB）体积小三个数量级，适合快速跑通训练链路和小规模实验。
+本文档以geometry3k（geo3k）几何推理数据集为例，指导开发者为Qwen3.5多模态模型微调准备一份小体积、开箱即用的数据集，并完成从下载、格式转换、数据校验到启动训练的全流程。geo3k全量约41.5 MB（2100+条图文样本，图片内嵌于parquet），相比LLaVA-Instruct-150K（对话文件229 MB + COCO图片18 GB）体积小三个数量级，适合快速跑通训练链路和小规模实验。
 
 主要步骤包括：
 
-- 环境准备：安装 Python 依赖
-- 数据集下载：获取 geometry3k parquet 文件
-- 数据集处理：导出内嵌图片 + 转换为 FSDPTurbo 多模态格式
-- 数据验证：校验 jsonl 可加载、图片完整、格式与目标一致
-- 启动训练：修改 config 并拉起微调任务
+- 环境准备：安装Python依赖
+- 数据集下载：获取geometry3k parquet文件
+- 数据集处理：导出内嵌图片+转换为FSDPTurbo多模态格式
+- 数据验证：校验jsonl可加载、图片完整、格式与目标一致
+- 修改训练配置：调整config适配多模态微调
 
-前置条件：FSDPTurbo 已安装、模型权重已就绪。环境搭建与模型权重准备请参考[快速入门：Qwen3.5模型预训练及微调](../quick_start_fsdpturbo.md)。
+前置条件：FSDPTurbo已安装、模型权重已就绪。环境搭建与模型权重准备请参考[快速入门：Qwen3.5模型预训练及微调](./quick_start_fsdpturbo.md)。
 
-## 一、环境准备
+## 环境准备
 
-转换脚本依赖 datasets 与 pillow，在训练环境所在虚拟环境中安装：
+转换脚本依赖datasets与pillow，在训练环境所在虚拟环境中安装：
 
 ```shell
 pip install datasets pillow
@@ -29,16 +29,16 @@ cd /path/to/FSDPTurbo
 mkdir -p dataset tools
 ```
 
-## 二、数据集下载
+## 数据集下载
 
-geometry3k 数据集已在 HuggingFace Hub 发布为 parquet 格式，train split 单文件 41.5 MB，直接 wget 即可：
+geometry3k数据集已在HuggingFace Hub发布为parquet格式，train split单文件41.5 MB，直接wget即可：
 
 ```shell
 wget -O dataset/geometry3k_train.parquet \
   https://huggingface.co/datasets/hiyouga/geometry3k/resolve/main/data/train-00000-of-00001.parquet
 ```
 
-若访问 HuggingFace 官方域名受限，将域名替换为 hf-mirror.com。
+若访问HuggingFace官方域名受限，将域名替换为hf-mirror.com。
 
 下载完成后确认文件大小：
 
@@ -47,19 +47,19 @@ ls -lh dataset/geometry3k_train.parquet
 # 预期约 41.5M
 ```
 
-数据集 schema 如下：
+数据集schema如下：
 
 | 列名 | 类型 | 说明 |
 |---|---|---|
-| images | list | 内嵌二进制图片，每条 1 张 |
-| problem | str | 问题文本，已含 `<image>` 占位符 |
+| images | list | 内嵌二进制图片，每条1张 |
+| problem | str | 问题文本，已含`<image>`占位符 |
 | answer | str | 标准答案 |
 
-## 三、数据集处理
+## 数据集处理
 
-### 3.1 转换脚本
+### 转换脚本
 
-将以下内容保存为 `tools/convert_geo3k.py`。脚本完成两件事：把 parquet 内嵌图片导出为独立 PNG 文件、把 problem/answer 组装成 FSDPTurbo 多模态分支要求的 messages 对话结构。
+将以下内容保存为`tools/convert_geo3k.py`。脚本完成两件事：把parquet内嵌图片导出为独立PNG文件、把problem/answer组装成FSDPTurbo多模态分支要求的messages对话结构。
 
 ```python
 #!/usr/bin/env python
@@ -170,7 +170,9 @@ if __name__ == "__main__":
     main()
 ```
 
-### 3.2 执行转换
+### 执行转换
+
+在FSDPTurbo根目录下执行以下命令：
 
 ```shell
 python tools/convert_geo3k.py \
@@ -190,13 +192,15 @@ python tools/convert_geo3k.py \
 生成两份产物：
 
 - `dataset/train.jsonl`：训练用对话文件
-- `dataset/geo3k_images/*.png`：2101 张独立图片文件
+- `dataset/geo3k_images/*.png`：2101张独立图片文件
 
-## 四、数据验证
+## 数据验证
 
-训练启动前务必完成两项校验，避免进入多卡后才在 dataloader 阶段报错。
+训练启动前务必完成两项校验，避免进入多卡后才在dataloader阶段报错。
 
-### 4.1 jsonl 可加载性
+### jsonl可加载性
+
+使用datasets加载转换产物，校验messages与images列是否完整：
 
 ```shell
 python -c "
@@ -211,9 +215,11 @@ print('首条图片路径:', ds[0]['images'][0])
 "
 ```
 
-预期列名为 `['messages', 'images', 'id']`，首条 user 消息以 `<image>\n` 开头。
+预期列名为`['messages', 'images', 'id']`，首条user消息以`<image>\n`开头。
 
-### 4.2 图片完整性
+### 图片完整性
+
+逐条打开jsonl引用的图片文件，确认无损坏：
 
 ```shell
 python -c "
@@ -231,7 +237,7 @@ assert bad == 0, '存在损坏图片，请重新执行转换脚本'
 "
 ```
 
-### 4.3 格式对照
+### 格式对照
 
 转换产物应与以下参考样本完全同构：
 
@@ -248,13 +254,13 @@ assert bad == 0, '存在损坏图片，请重新执行转换脚本'
 
 三个格式细节需与参考样本一致：
 
-- 占位符为 `<image>\n`（换行而非空格）
-- `images` 为绝对路径列表（单图也包在列表里）
-- 每行一个独立 JSON 对象（jsonl）
+- 占位符为`<image>\n`（换行而非空格）
+- `images`为绝对路径列表（单图也包在列表里）
+- 每行一个独立JSON对象（jsonl）
 
-## 五、修改训练配置
+## 修改训练配置
 
-编辑 `examples/qwen3_5/config.yaml`，微调阶段与预训练相比主要调整优化器学习率与数据配置：
+编辑[examples/qwen3_5/config.yaml](../../../examples/qwen3_5/config.yaml)，微调阶段与预训练相比主要调整优化器学习率与数据配置：
 
 ```yaml
 # --- 优化器配置（微调学习率更小）---
@@ -279,73 +285,25 @@ data:
   num_workers: 8
 ```
 
-模型权重、分布式、内存配置沿用快速入门文档中的默认值即可。
+模型权重、分布式、内存配置沿用快速入门文档中的默认值即可。训练启动方式（`run.sh` / `torchrun`）与训练日志验证请参考[快速入门](./quick_start_fsdpturbo.md)。
 
-## 六、启动训练
-
-### 方式一：通过 run.sh（推荐）
-
-```shell
-cd examples/qwen3_5
-
-# 8 卡环境覆盖默认的 16 卡并行度
-GPUS_PER_NODE=8 bash run.sh
-```
-
-`run.sh` 内部通过 `torchrun` 拉起训练，集群参数均可通过环境变量覆盖：`NNODES=1`、`GPUS_PER_NODE=8`、`MASTER_ADDR=127.0.0.1`、`MASTER_PORT=29500`。
-
-### 方式二：直接 torchrun
-
-```shell
-torchrun --nproc_per_node=8 --master_port=29500 examples/qwen3_5/train.py
-```
-
-注意 `nproc_per_node` 必须等于实际卡数（本文档按 8 卡配置），卡数与 `fully_shard_parallel_size` 不匹配会触发 `Expected value: [0, 8)` 类报错。
-
-### 启动前清理
-
-```shell
-rm -rf ~/.cache/huggingface/datasets    # 清理 datasets 缓存，避免脏数据
-pkill -f train.py                        # 清理历史进程
-```
-
-## 七、训练验证
-
-启动后观察 rank0 日志，正常流程依次出现：
-
-```shell
-Building Processor
-Building Qwen3.5 Model
-Building Dataloader
-```
-
-随后进入迭代并持续输出：
-
-```shell
-Step 1 | Loss: 3.316887 | Grad Norm: 70.9590 | Step Time: 3.0872s | Memory: 28.3124 GB | Peak Memory: 46.8732 GB
-Step 2 | Loss: 2.443476 | Grad Norm: 41.9860 | Step Time: 2.8145s | Memory: 28.3056 GB | Peak Memory: 46.8732 GB
-Step 3 | Loss: 2.669216 | Grad Norm: 45.3350 | Step Time: 2.7691s | Memory: 28.2988 GB | Peak Memory: 46.8732 GB
-```
-
-Loss 在前几十步内明显下降、Grad Norm 逐步收敛，即说明数据链路与训练链路均正常。训练权重保存在 `checkpoint.output_dir` 指定目录。
-
-## 八、常见问题
+## 常见问题
 
 | 报错关键字 | 原因 | 处理方式 |
 |---|---|---|
-| DatasetGenerationError | `dataset_path` 指向的 jsonl 加载失败 | 执行 4.1 节验证脚本定位 |
-| KeyError: 'messages' | jsonl 字段名与 `conversation_column` 不一致 | 改 jsonl 或改 config，保持一致 |
-| FileNotFoundError ... .png | 图片路径失效或 `image_column` 配置错误 | 执行 4.2 节校验；确认 `image_column: "images"` |
-| Expected value: [0, 8) | 进程数与卡数不匹配 | `GPUS_PER_NODE=8` 或 `--nproc_per_node=8` |
-| OOM (Out Of Memory) | 并行度不足或序列过长 | 增大 `fully_shard_parallel_size`、减小 `max_seq_length` 或 `batch_size` |
-| Loss 不下降 | 数据格式或占位符不对 | 对照 4.3 节参考样本逐字段核对 |
+| DatasetGenerationError | `dataset_path`指向的jsonl加载失败 | 执行[“jsonl可加载性”](#jsonl可加载性)一节验证脚本定位 |
+| KeyError: 'messages' | jsonl字段名与`conversation_column`不一致 | 改jsonl或改config，保持一致 |
+| FileNotFoundError ... .png | 图片路径失效或`image_column`配置错误 | 执行[“图片完整性”](#图片完整性)一节校验；确认`image_column: "images"` |
+| Expected value: [0, 8) | 进程数与卡数不匹配 | `GPUS_PER_NODE=8`或`--nproc_per_node=8` |
+| OOM (Out Of Memory) | 并行度不足或序列过长 | 增大`fully_shard_parallel_size`、减小`max_seq_length`或`batch_size` |
+| Loss不下降 | 数据格式或占位符不对 | 对照[“格式对照”](#格式对照)一节参考样本逐字段核对 |
 
 ## 附：数据集规模对比（选型参考）
 
 | 数据集 | 下载量 | 样本数 | 图片处理 | 适用场景 |
 |---|---|---|---|---|
-| geometry3k（本文档） | 41.5 MB | 2101 | 脚本一次性导出 | 快速跑通 / 小规模实验 |
+| geometry3k（本文档） | 41.5 MB | 2101 | 脚本一次性导出 | 快速跑通/小规模实验 |
 | LLaVA-Instruct-150K detail_23k | 20.5 MB + 18 GB (COCO) | 23K | 无需转换 | 更大规模图文微调 |
-| LLaVA-Instruct-150K 全量 | 229 MB + 18 GB (COCO) | 150K | 无需转换 | 正式图文训练 |
+| LLaVA-Instruct-150K全量 | 229 MB + 18 GB (COCO) | 150K | 无需转换 | 正式图文训练 |
 
-geo3k 跑通后如需扩大训练规模，可将 validation / test split（5.9 MB + 11.8 MB）以同样流程下载合并，或改用其他多模态指令数据集，转换脚本仅需调整 problem/answer 字段的取值逻辑。
+geo3k跑通后如需扩大训练规模，可将validation / test split（5.9 MB + 11.8 MB）以同样流程下载合并，或改用其他多模态指令数据集，转换脚本仅需调整problem/answer字段的取值逻辑。
