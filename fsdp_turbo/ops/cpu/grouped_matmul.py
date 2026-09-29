@@ -1,4 +1,6 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2021, OpenAI.
+
 import torch
 from fsdp_turbo.ops.registry import register_op
 
@@ -43,7 +45,7 @@ def grouped_matmul_cpu(inputs, m_split, weights):
 
         final_hidden_states[start_idx:end_idx, :] = torch.matmul(
             inputs[start_idx:end_idx, :],
-            weights[i]
+            weights[i],
         )
 
     return final_hidden_states

@@ -1,4 +1,5 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd.
+# Copyright (c) 2001-2004 Idiap Research Institute Ronan Collobert Samy Bengio Johnny Mariethoz.
 # Licensed under the Apache License, Version 2.0 (the "License");
 
 import logging

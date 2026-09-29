@@ -1,4 +1,6 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2021, OpenAI.
+
 import logging
 from collections.abc import Mapping
 from functools import wraps

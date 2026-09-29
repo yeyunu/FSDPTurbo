@@ -1,4 +1,5 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2025-2026 The Moonshot AI Team DeepSeek-AI and HuggingFace Inc. team. All rights reserved.
 """Post-fusion context-parallel forward for the remote-code Kimi K3 model."""
 
 import torch

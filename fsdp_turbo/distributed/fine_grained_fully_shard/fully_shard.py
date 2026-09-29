@@ -1,9 +1,10 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2001-2004 Idiap Research Institute Ronan Collobert Samy Bengio Johnny Mariethoz.
 
 import weakref
 from typing import Optional, Callable, Union
 
-import torch.nn as nn
+from torch import nn
 from torch.distributed._composable import contract
 from torch.distributed.tensor import DeviceMesh, Shard
 from torch.distributed.utils import _get_root_modules
@@ -67,9 +68,7 @@ def fully_shard(
     """
 
     if isinstance(module, (nn.ModuleList, nn.ModuleDict)):
-        raise ValueError(
-            f"fully_shard does not support containers that do not implement forward: {module}"
-        )
+        raise ValueError(f"fully_shard does not support containers that do not implement forward: {module}")
     mesh = mesh or _init_default_fully_shard_mesh()
     if mesh.ndim not in (1, 2):
         raise ValueError(f"fully_shard expects a 1D or 2D DeviceMesh but got {mesh}")
@@ -77,26 +76,20 @@ def fully_shard(
         mesh_info = FSDPMeshInfo(mesh, shard_mesh_dim=0)
     else:
         if mesh.mesh_dim_names is None:
-            raise AssertionError(
-                "Please init the 2D mesh for HSDP with mesh_dim_names specified"
-            )
+            raise AssertionError("Please init the 2D mesh for HSDP with mesh_dim_names specified")
         mesh_info = HSDPMeshInfo(mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
     device = _get_device_from_mesh(mesh)
-    post_forward_mesh_info = _get_post_forward_mesh_info(
-        reshard_after_forward, mesh_info
-    )
+    post_forward_mesh_info = _get_post_forward_mesh_info(reshard_after_forward, mesh_info)
 
     arg_module = module
-    modules = (
-        (module,) if isinstance(module, nn.Module) else tuple(_get_root_modules(module))
-    )
+    modules = (module,) if isinstance(module, nn.Module) else tuple(_get_root_modules(module))
     state = fully_shard.state(modules[0])  # type: ignore[attr-defined] # see [1]
 
     # Determine hook_module
     if hook_module:
         _hook_module = hook_module
     else:
-        _hook_module = (modules[0] if len(modules) > 0 else modules)
+        _hook_module = modules[0] if len(modules) > 0 else modules
 
     # Auto-increment comm_ctx_index
     if _hook_module not in HOOK_MODULE_COMM_CTX_COUNT:
@@ -106,7 +99,9 @@ def fully_shard(
 
     # Initialize state with custom parameters
     state.init(
-        modules, device, mp_policy,
+        modules,
+        device,
+        mp_policy,
         hook_module=hook_module,
         comm_ctx_index=comm_ctx_index,
     )
@@ -133,12 +128,12 @@ def fully_shard(
         managed_module._fsdp_use_orig_params = True  # type: ignore[assignment]
 
     # Place FSDP leftmost for highest priority in the method resolution order
-    for module in modules:
-        cls = module.__class__
+    for item in modules:
+        cls = item.__class__
         new_cls = _cls_to_fsdp_cls.get(cls, None)
         if not new_cls:
             dct = {"__deepcopy__": _unimplemented_deepcopy}
             new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), dct)
             _cls_to_fsdp_cls[cls] = new_cls
-        module.__class__ = new_cls
+        item.__class__ = new_cls
     return arg_module

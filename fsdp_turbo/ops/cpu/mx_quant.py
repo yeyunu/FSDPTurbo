@@ -1,4 +1,5 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2023 Habana Labs Ltd. an Intel Company.
 import math
 
 import torch

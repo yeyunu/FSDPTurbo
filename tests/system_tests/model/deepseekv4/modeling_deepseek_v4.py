@@ -1,3 +1,6 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd.
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+
 import torch
 import torch.nn.functional as F
 
