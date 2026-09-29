@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) 2001-2004 Idiap Research Institute Ronan Collobert Samy Bengio Johnny Mariethoz.
 
 from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPCommContext
 
