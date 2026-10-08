@@ -99,8 +99,10 @@ class ParallelState(metaclass=Singleton):
         )
 
         self.add_sub_device_mesh(cp_mesh_dims, 'cp')
-        self.add_sub_device_mesh(('dp', 'fsdp'), 'dp_fsdp', flatten=False)
-        self.add_sub_device_mesh(('edp', 'efsdp'), 'edp_efsdp', flatten=False)
+        # Flatten the HSDP sub-mesh to 1D when the replicate dim (dp/edp) is
+        # 1, so FSDP2 takes the pure FSDP path and avoids HSDP's extra memory.
+        self.add_sub_device_mesh(('dp', 'fsdp'), 'dp_fsdp', flatten=self.data_parallel_size == 1)
+        self.add_sub_device_mesh(('edp', 'efsdp'), 'edp_efsdp', flatten=self.expert_data_parallel_size == 1)
 
         print_rank(logger.info, f'Parallel state initialized:\n{self.__str__()}')
 
