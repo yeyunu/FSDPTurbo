@@ -14,10 +14,7 @@ import torch
 from torch import nn
 from einops import rearrange
 
-try:
-    from mindspeed_ops.api.triton.convolution import causal_conv1d
-except ModuleNotFoundError:
-    from fsdp_turbo.ops.causal_conv1d import causal_conv1d
+from fsdp_turbo.ops.causal_conv1d import causal_conv1d
 
 
 class ShortConvolution(nn.Conv1d):
@@ -35,8 +32,7 @@ class ShortConvolution(nn.Conv1d):
         backend (Optional[str], optional): Backend implementation ('triton' or 'cuda') for the decode `step` path. Defaults to 'triton'.
         device (Optional[torch.device], optional): Device to place the layer on. Defaults to None.
         dtype (Optional[torch.dtype], optional): Data type for layer parameters. Defaults to None.
-        implementation (str, optional): Implementation of the non-decode forward path,
-            'triton' (default) or 'ascendc' (AscendC fused op from fla_npu, NPU only).
+        implementation (str, optional): Retained for compatibility; backend selection is automatic.
         head_num (Optional[int], optional): Number of attention heads packed into the channel dim,
             required by the AscendC causal_conv1d op. Defaults to None (treated as 1).
         **kwargs: Additional keyword arguments (deprecated 'use_fast_conv1d' supported for compatibility)
@@ -44,12 +40,12 @@ class ShortConvolution(nn.Conv1d):
     Attributes:
         hidden_size (int): Number of channels
         activation (Optional[str]): Selected activation function
-        backend (str): Actual backend being used (may differ from input due to availability)
+        backend (str): Backend used by the decode `step` path
 
     Note:
         - Uses depthwise convolution (groups=hidden_size) for efficiency
         - Applies causal padding (kernel_size-1) to ensure no future information leakage
-        - Falls back to Triton backend if CUDA backend is unavailable
+        - Selects AscendC, Triton, or eager through the operator registry for non-decode forward
     """
 
     def __init__(
@@ -80,6 +76,8 @@ class ShortConvolution(nn.Conv1d):
         # Number of attention heads packed into the channel dim, required by the
         # AscendC causal_conv1d op. Defaults to 1 (whole channel dim as one head).
         self.head_num = head_num if head_num is not None else 1
+        if self.hidden_size % self.head_num:
+            raise ValueError(f"hidden_size ({self.hidden_size}) must be divisible by head_num ({self.head_num}).")
         if implementation not in ('triton', 'ascendc'):
             raise ValueError(
                 f"Unsupported causal conv1d implementation: {implementation}. Expected 'triton' or 'ascendc'."
@@ -176,9 +174,12 @@ class ShortConvolution(nn.Conv1d):
         if weight is None:
             weight = self.weight
 
-        if self.implementation == 'ascendc':
-            raise ValueError(f"Unsupported causal conv1d implementation: {self.implementation}. ")
-
+        channels_per_head = self.hidden_size // self.head_num
+        if weight.shape[0] % channels_per_head:
+            raise ValueError(
+                f"weight channels ({weight.shape[0]}) must be a multiple of channels_per_head ({channels_per_head})."
+            )
+        local_head_num = weight.shape[0] // channels_per_head
         return causal_conv1d(
             x=x,
             weight=rearrange(weight, "d 1 w -> w d"),
@@ -188,6 +189,7 @@ class ShortConvolution(nn.Conv1d):
             output_final_state=output_final_state,
             activation=self.activation,
             cu_seqlens=cu_seqlens,
+            head_num=local_head_num,
             **kwargs,
         )
 

@@ -1,8 +1,37 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright 2025 Bytedance Ltd. and or its affiliates
 import sys
 import types
 
 import torch
+
+
+IS_FLA_NPU_AVAILABLE = False
+try:
+    import fla_npu  # noqa: F401
+
+    IS_FLA_NPU_AVAILABLE = True
+except Exception:
+    IS_FLA_NPU_AVAILABLE = False
+
+
+IS_TRITON_AVAILABLE = False
+try:
+    import triton  # noqa: F401
+
+    IS_TRITON_AVAILABLE = True
+except Exception:
+    IS_TRITON_AVAILABLE = False
+
+
+IS_TRITON_ASCEND_KERNELS_AVAILABLE = False
+if IS_TRITON_AVAILABLE:
+    try:
+        import triton_ascend_kernels  # noqa: F401
+
+        IS_TRITON_ASCEND_KERNELS_AVAILABLE = True
+    except Exception:
+        IS_TRITON_ASCEND_KERNELS_AVAILABLE = False
 
 
 def accelerator_getattr(module, fallback_module):

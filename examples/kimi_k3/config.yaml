@@ -7,6 +7,7 @@ model:
   model_name_or_path: "moonshotai/Kimi-K3"
   tokenizer_name_or_path: "moonshotai/Kimi-K3"
   torch_dtype: "bf16"
+  attn_implementation: "flash_attention_2"
 
 # --- Optimizer Configuration ---
 optimizer:

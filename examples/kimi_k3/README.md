@@ -51,6 +51,31 @@ module_patches:
 `eager`。`full_attention` 的目标是 `eager_attention_forward`，使用其他 attention
 implementation 时该 patch 不会覆盖实际执行路径。
 
+## 使用 fla_npu AscendC 算子
+
+从 flash-linear-attention-npu 源码构建与当前 CANN/SoC 匹配的 wheel。新版仓库推荐先做
+环境预检，再生成包含 AscendC OPP 和 Python wrapper 的完整 wheel：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+python scripts/check_npu_env.py
+
+# A2/910B 使用 ascend910b；A3 使用 ascend910_93
+FLA_NPU_SOC=ascend910_93 python scripts/build_wheel.py
+python -m pip install --force-reinstall --no-cache-dir --no-deps dist/<本次生成的准确wheel文件名>.whl
+```
+
+不建议使用旧版裸 `bash build.sh` 流程构建 legacy PyTorch extension；旧
+`torchnpugen` 无法解析算子 schema 中的可选返回值 `Tensor?`。安装后确认：
+
+```bash
+python -c "import fla_npu; from fla_npu.ops.ascendc import chunk_kda_fwd, chunk_kda_bwd, causal_conv1d, causal_conv1d_bwd"
+```
+
+KDA 和 causal conv1d 不需要配置 `module_patches`。模型统一调用 FSDPTurbo 算子注册入口，
+运行时依次选择 AscendC、Triton 和 eager 实现；回退到 eager 时会输出 warning。
+当前 AscendC KDA 路径用于 `use_cache=False` 的训练，不支持 generation/cache。
+
 ## 并行度约束
 
 `torchrun` 的总进程数（world size）必须分别满足以下整除关系：

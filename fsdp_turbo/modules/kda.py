@@ -127,7 +127,7 @@ def get_ulysses_kda_forward(original_forward, group):
         key = key.view(batch_size, full_seq_len, local_num_heads, module.head_k_dim)
         value = value.view(batch_size, full_seq_len, local_num_heads, module.head_dim)
         decay = decay.view(batch_size, full_seq_len, local_num_heads, module.head_dim)
-        beta = beta.float().sigmoid()
+        beta = beta.float()
 
         head_start = rank * local_num_heads
         head_end = head_start + local_num_heads
@@ -146,7 +146,7 @@ def get_ulysses_kda_forward(original_forward, group):
             output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
-            use_beta_sigmoid_in_kernel=False,
+            use_beta_sigmoid_in_kernel=True,
             safe_gate=module.gate_lower_bound is not None,
             lower_bound=module.gate_lower_bound,
             transpose_state_layout=True,

@@ -84,23 +84,12 @@ except ImportError:
 # except ImportError:
 #     raise ImportError("Plese run `pip install -U fla-core`")
 
+from fsdp_turbo.modules.short_conv import ShortConvolution
+from fsdp_turbo.ops.kda import chunk_kda
 from fsdp_turbo.ops.rms_norm import rms_norm
+from fsdp_turbo.ops.triton.utils import tensor_cache
 from fsdp_turbo.utils.device import get_accelerator_name
 from fsdp_turbo.utils.log import print_rank
-from fsdp_turbo.ops.triton.utils import tensor_cache
-
-from fsdp_turbo.modules.short_conv import ShortConvolution
-
-try:
-    from triton_ascend_kernels.attention.fla.kda.chunk import chunk_kda
-except ImportError:
-    # Triton Ascend kernels are optional; fall back to the registered
-    # small-op implementation when they are unavailable.
-    from fsdp_turbo.ops.kda import chunk_kda
-
-    _USE_FUSED_KDA_KERNEL = False
-else:
-    _USE_FUSED_KDA_KERNEL = True
 
 
 from .configuration_kimi_k3 import KimiLinearConfig
@@ -595,16 +584,19 @@ class KimiDeltaAttention(nn.Module):
             hidden_size=projection_k_size,
             kernel_size=self.conv_size,
             activation='silu',
+            head_num=self.num_k_heads,
         )
         self.k_conv1d = ShortConvolution(
             hidden_size=projection_k_size,
             kernel_size=self.conv_size,
             activation='silu',
+            head_num=self.num_k_heads,
         )
         self.v_conv1d = ShortConvolution(
             hidden_size=projection_size,
             kernel_size=self.conv_size,
             activation='silu',
+            head_num=self.num_heads,
         )
 
         self.A_log = torch.nn.Parameter(torch.log(torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16)))
@@ -704,51 +696,25 @@ class KimiDeltaAttention(nn.Module):
         q, k = map(lambda x: rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
 
-        if not _USE_FUSED_KDA_KERNEL:
-            o, recurrent_state = chunk_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=True,
-                safe_gate=self.gate_lower_bound is not None,
-                lower_bound=self.gate_lower_bound,
-                transpose_state_layout=True,
-                cu_seqlens=cu_seqlens,
-                chunk_size=64,
-            )
-        else:
-            if get_accelerator_name() == "npu":
-                use_beta_sigmoid_in_kernel = False
-                beta = torch.sigmoid(beta)
-            else:
-                use_beta_sigmoid_in_kernel = True
-            o, recurrent_state = chunk_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
-                safe_gate=self.gate_lower_bound is not None,
-                lower_bound=self.gate_lower_bound,
-                transpose_state_layout=True,
-                cu_seqlens=cu_seqlens,
-                skip_recompute=getattr(self.config, "skip_kda_recompute", False),
-            )
+        o, recurrent_state = chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            initial_state=recurrent_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=True,
+            safe_gate=self.gate_lower_bound is not None,
+            lower_bound=self.gate_lower_bound,
+            transpose_state_layout=True,
+            cu_seqlens=cu_seqlens,
+            skip_recompute=getattr(self.config, "skip_kda_recompute", False),
+        )
 
         if cache_params is not None:
             cache_params.recurrent_states[self.layer_idx] = recurrent_state

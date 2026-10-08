@@ -55,10 +55,11 @@ class KimiK3Trainer(BaseTrainer):
 
         print_rank(logger.info, "> Building KimiK3 Model...")
         model_config = AutoConfig.from_pretrained(self.config.model.model_name_or_path, trust_remote_code=True)
-        set_attn_implementation(model_config, "eager")
+        set_attn_implementation(model_config, self.config.model.attn_implementation)
         model = AutoModel.from_pretrained(
             self.config.model.model_name_or_path,
             config=model_config,
+            attn_implementation=self.config.model.attn_implementation,
             trust_remote_code=True,
         )
         convert_model_dtype(model, self.config.model.torch_dtype)

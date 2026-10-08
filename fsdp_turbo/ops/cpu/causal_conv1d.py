@@ -65,8 +65,10 @@ def causal_conv1d_cpu(
     activation: Optional[str] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
+    head_num: int = 1,
 ):
     """Pure PyTorch implementation used as the portable fallback."""
+    del head_num
     _validate_activation(activation)
     if x.ndim != 3 or weight.ndim != 2 or x.shape[-1] != weight.shape[-1]:
         raise ValueError("x must be [B, T, D] and weight must be [W, D]")

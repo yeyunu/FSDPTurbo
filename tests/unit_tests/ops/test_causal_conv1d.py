@@ -36,6 +36,18 @@ def test_causal_conv1d_dispatches_to_registered_cpu_op(monkeypatch):
     torch.testing.assert_close(final_state, x[:, -weight.shape[0] :].transpose(1, 2))
 
 
+def test_causal_conv1d_accepts_head_num_with_cpu_fallback(monkeypatch):
+    monkeypatch.setattr(torch.accelerator, 'current_accelerator', lambda: torch.device('cpu'))
+    x = torch.randn(2, 5, 3)
+    weight = torch.randn(4, 3)
+
+    output, final_state = causal_conv1d(x, weight, head_num=1, output_final_state=True)
+    expected_output, expected_state = causal_conv1d(x, weight, output_final_state=True)
+
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(final_state, expected_state)
+
+
 def test_causal_conv1d_update_dispatches_and_updates_cache(monkeypatch):
     monkeypatch.setattr(torch.accelerator, 'current_accelerator', lambda: torch.device('cpu'))
 

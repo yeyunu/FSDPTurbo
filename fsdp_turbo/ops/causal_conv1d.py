@@ -1,4 +1,6 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd.
+# Copyright 2025 XPU-Forces Team
+# Copyright (c) 2023-2025 Songlin Yang Yu Zhang
 # Licensed under the Apache License, Version 2.0 (the "License");
 
 from typing import Optional
@@ -17,6 +19,7 @@ def causal_conv1d(
     activation: Optional[str] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
+    head_num: int = 1,
 ):
     """Apply a causal depthwise convolution using the active device backend."""
     return dispatch_op(
@@ -29,6 +32,7 @@ def causal_conv1d(
         activation,
         cu_seqlens,
         output_final_state,
+        head_num=head_num,
     )
 
 

@@ -26,6 +26,7 @@ class ModelConfig:
     use_fused_compressor: bool = False
     use_fused_mhc: bool = False
     use_fused_vision_flash_attn: bool = False
+    attn_implementation: str = 'eager'
 
 
 @dataclass
@@ -274,6 +275,7 @@ class FSDPTurboConfig:
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
 
     def __post_init__(self):
+        self.validate_model_config()
         self.validate_data_config()
         self.validate_tp_config()
         self.validate_cp_config()
@@ -285,6 +287,11 @@ class FSDPTurboConfig:
         self.validate_swap_activation_config()
         self.validate_quantization_config()
         self.validate_fsdp_config()
+
+    def validate_model_config(self):
+        """Validate model loading configuration."""
+        if not isinstance(self.model.attn_implementation, str) or not self.model.attn_implementation:
+            raise ValueError("model.attn_implementation must be a non-empty string.")
 
     def validate_data_config(self):
         """Validate and normalize dataloader configuration."""
