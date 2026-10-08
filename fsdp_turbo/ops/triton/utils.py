@@ -196,16 +196,25 @@ if check_pytorch_version('2.4'):
     device = 'cuda' if device == 'cpu' else device
     autocast_custom_fwd = functools.partial(torch.amp.custom_fwd, device_type=device)
     autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=device)
-
-    def custom_device_ctx(index: int):
-        return device_torch_lib.device(index)
 else:
     assert device == 'cuda', 'Only cuda device is supported for PyTorch version < 2.4.0.'
     autocast_custom_fwd = device_torch_lib.amp.custom_fwd
     autocast_custom_bwd = device_torch_lib.amp.custom_bwd
 
-    def custom_device_ctx(index: int):
-        return torch.accelerator.device(index)
+
+def custom_device_ctx(tensor_device: torch.device):
+    """Return a context for the tensor's current accelerator device.
+
+    Triton's active backend may be unavailable while this module is imported,
+    so the module-level backend probe cannot safely select a runtime context.
+    """
+    if tensor_device.type == 'cpu':
+        return contextlib.nullcontext()
+
+    accelerator = torch.accelerator.current_accelerator()
+    if accelerator is None or accelerator.type != tensor_device.type:
+        raise RuntimeError(f'Input tensor is on {tensor_device.type}, but the current accelerator is {accelerator}.')
+    return torch.accelerator.device(tensor_device.index)
 
 
 def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
@@ -230,7 +239,7 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
                     break
 
         if tensor is not None:
-            ctx = custom_device_ctx(tensor.device.index)
+            ctx = custom_device_ctx(tensor.device)
         else:
             ctx = contextlib.nullcontext()
 

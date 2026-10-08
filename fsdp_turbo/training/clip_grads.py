@@ -213,10 +213,13 @@ def clip_grad_norm(
 ) -> float:
     """Compute gradient norm and clip in one call.
 
-    For FSDP-wrapped models (that expose ``model.clip_grad_norm_``),
-    this delegates to the FSDP-native implementation which is both
-    correct (handles sharded parameters) and efficient (avoids
-    redundant all-gathers).
+    Modules may provide a ``custom_clip_grad_norm`` capability for gradient
+    storage that is not represented by ``parameter.grad``. All providers for a
+    model must use the same handler.
+
+    For other FSDP-wrapped models (that expose ``model.clip_grad_norm_``), this
+    delegates to the FSDP-native implementation, which handles sharded
+    parameters without redundant all-gathers.
 
     For regular models (including those with DTensor gradients),
     this falls back to :func:`compute_grad_norm` +
@@ -235,8 +238,19 @@ def clip_grad_norm(
         The total gradient norm **before** clipping (as a float),
         useful for logging / monitoring.
     """
-    # FSDP models provide their own clip_grad_norm_ which correctly
-    # handles sharded parameters and avoids unnecessary all-gathers.
+    custom_handlers = {}
+    for module in model.modules():
+        handler = getattr(type(module), "custom_clip_grad_norm", None)
+        if callable(handler):
+            custom_handlers.setdefault(handler, []).append(module)
+    if len(custom_handlers) > 1:
+        raise RuntimeError("A model cannot use multiple custom gradient clipping handlers.")
+    if custom_handlers:
+        handler, modules = next(iter(custom_handlers.items()))
+        return handler(model, modules, max_norm, norm_type, group)
+
+    # FSDP models provide their own clip_grad_norm_ which correctly handles
+    # sharded parameters and avoids unnecessary all-gathers.
     if hasattr(model, "clip_grad_norm_"):
         total_norm = model.clip_grad_norm_(max_norm, norm_type)
         return total_norm.item() if isinstance(total_norm, torch.Tensor) else float(total_norm)

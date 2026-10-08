@@ -20,6 +20,12 @@ class ModelConfig:
     torch_dtype: torch.dtype = torch.bfloat16
     # Optional demo/debug knob for building a shallower language model.
     num_hidden_layers: Optional[int] = None
+    engram_storage_backend: Optional[Literal["host_offload", "elastic_buffer"]] = None
+    use_sparse_flash_attn: bool = False
+    use_fused_lightning_indexer: bool = False
+    use_fused_compressor: bool = False
+    use_fused_mhc: bool = False
+    use_fused_vision_flash_attn: bool = False
 
 
 @dataclass
@@ -120,7 +126,7 @@ class FSDPPlanConfig:
     # FSDP implementation strategy
     # 'custom': Use FSDPTurbo custom FSDP implementation
     # 'native': Use PyTorch native FSDP implementation (default)
-    fsdp_implementation: Literal['custom', 'native'] = 'native'
+    fsdp_implementation: Literal["custom", "native"] = "native"
 
 
 @dataclass
@@ -273,6 +279,7 @@ class FSDPTurboConfig:
         self.validate_cp_config()
         self.validate_module_patches()
         self.validate_ep_config()
+        self.validate_engram_config()
         self.validate_recompute_config()
         self.validate_chunk_batch_config()
         self.validate_swap_activation_config()
@@ -293,7 +300,7 @@ class FSDPTurboConfig:
                 raise ValueError("data.conversation_column must be a non-empty string for multimodal data.")
 
     def validate_fsdp_config(self):
-        '''fully shard plan
+        """fully shard plan
         config = FSDPTurboConfig(
             distributed=DistributedConfig(
                 fsdp_plan=FSDPPlanConfig(
@@ -304,7 +311,7 @@ class FSDPTurboConfig:
                 )
             )
         )
-        '''
+        """
         self.distributed.fsdp_plan = (
             FSDPPlanConfig() if self.distributed.fsdp_plan is None else self.distributed.fsdp_plan
         )
@@ -317,7 +324,7 @@ class FSDPTurboConfig:
             )  # remove duplicates
 
     def validate_tp_config(self):
-        '''tensor parallelize plan
+        """tensor parallelize plan
 
         config = FSDPTurboConfig(
             distributed=DistributedConfig(
@@ -327,7 +334,7 @@ class FSDPTurboConfig:
                 )
             )
         )
-        '''
+        """
         self.distributed.tp_plan = TPPlanConfig() if self.distributed.tp_plan is None else self.distributed.tp_plan
         self.distributed.tp_plan.colwise_parallel = (
             [] if self.distributed.tp_plan.colwise_parallel is None else self.distributed.tp_plan.colwise_parallel
@@ -381,18 +388,21 @@ class FSDPTurboConfig:
                 if not isinstance(patch_type, str) or not patch_type:
                     raise ValueError(f"distributed.cp_plan.{field_name} entries must set type.")
                 normalized_patch = {**patch, "target_functions": targets}
-                if patch_type == "kda":
-                    if field_name not in ("ulysses_function_patches", "kcp_function_patches"):
-                        raise ValueError(
-                            "KDA context-parallel patches must use ulysses_function_patches or kcp_function_patches."
-                        )
+                if patch_type == "kda" and field_name not in (
+                    "ulysses_function_patches",
+                    "kcp_function_patches",
+                ):
+                    raise ValueError(
+                        "KDA context-parallel patches must use ulysses_function_patches or kcp_function_patches."
+                    )
                 normalized.append(normalized_patch)
             setattr(self.distributed.cp_plan, field_name, normalized)
 
         if kcp_parallel_size > 1 and ulysses_parallel_size > 1:
             raise ValueError(
-                "distributed.kcp_parallel_size and distributed.ulysses_parallel_size cannot be enabled together; "
-                "KCP already applies Ulysses to MLA on the KCP sequence group."
+                "distributed.kcp_parallel_size and distributed.ulysses_parallel_size "
+                "cannot be enabled together; KCP already applies Ulysses to MLA on "
+                "the KCP sequence group."
             )
         if kcp_parallel_size > 1:
             if not self.distributed.cp_plan.kcp_function_patches:
@@ -423,7 +433,7 @@ class FSDPTurboConfig:
             )
 
     def validate_ep_config(self):
-        '''expert parallelize plan
+        """expert parallelize plan
 
         config = FSDPTurboConfig(
             distributed=DistributedConfig(
@@ -434,16 +444,16 @@ class FSDPTurboConfig:
                 )
             )
         )
-        '''
+        """
         self.distributed.ep_plan = (
-            EPPlanConfig(apply_modules=[], dispatcher='eager')
+            EPPlanConfig(apply_modules=[], dispatcher="eager")
             if self.distributed.ep_plan is None
             else self.distributed.ep_plan
         )
         if self.distributed.ep_plan.gradient_divide_factor is None:
             # Divide across all expert mesh dims (edp * efsdp * ep). torchrun
             # sets WORLD_SIZE; fall back to 1 for non-distributed runs.
-            world_size = int(os.environ.get('WORLD_SIZE', '1'))
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
             edp = world_size // (
                 self.distributed.expert_fully_shard_parallel_size * self.distributed.expert_parallel_size
             )
@@ -453,8 +463,24 @@ class FSDPTurboConfig:
         if self.distributed.ep_plan.apply_efsdp_modules is None:
             self.distributed.ep_plan.apply_efsdp_modules = []
             for ep_module in self.distributed.ep_plan.apply_modules:
-                if ep_module.endswith('.experts'):
+                if ep_module.endswith(".experts"):
                     self.distributed.ep_plan.apply_efsdp_modules.append(ep_module)
+
+    def validate_engram_config(self):
+        """Validate parallel topology required by Host-offload Engram."""
+        backend = self.model.engram_storage_backend
+        supported_backends = (
+            "host_offload",
+            "elastic_buffer",
+        )
+        if backend is None:
+            return
+        if backend not in supported_backends:
+            raise ValueError(f"model.engram_storage_backend must be one of {supported_backends}, got {backend!r}.")
+        if self.distributed.expert_parallel_size <= 1:
+            raise ValueError("Host-offload Engram requires expert_parallel_size > 1.")
+        if self.distributed.kv_allgather_parallel_size != 1 or self.distributed.ulysses_parallel_size != 1:
+            raise ValueError("Host-offload Engram context-parallel token halo is not implemented yet.")
 
     def validate_module_patches(self):
         """Validate the namespace-neutral module patch configuration.
@@ -623,7 +649,7 @@ class FSDPTurboConfig:
                 lines.append(f"{padded_name} {'-' * dash_count} {val_str}")
             return lines
 
-        lines = [sep, f'{"FSDPTurboConfig":^60}', sep]
+        lines = [sep, f"{'FSDPTurboConfig':^60}", sep]
         for section_name, section_obj in sections:
             lines.append(f"  [{section_name}]")
             lines.extend(_format_dataclass(section_obj, indent=4))
@@ -749,7 +775,11 @@ def load_config_from_yaml(yaml_path):
         filtered_distributed_raw = {k: v for k, v in distributed_raw.items() if k in distributed_valid_fields}
 
         distributed_cfg = DistributedConfig(
-            fsdp_plan=fsdp_plan, tp_plan=tp_plan, ep_plan=ep_plan, cp_plan=cp_plan, **filtered_distributed_raw
+            fsdp_plan=fsdp_plan,
+            tp_plan=tp_plan,
+            ep_plan=ep_plan,
+            cp_plan=cp_plan,
+            **filtered_distributed_raw,
         )
     else:
         distributed_cfg = DistributedConfig()

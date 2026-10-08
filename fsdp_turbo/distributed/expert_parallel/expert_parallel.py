@@ -36,12 +36,11 @@ def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, pl
         module.num_local_experts = module.num_global_experts // ep_size
         local_expert_indices_offset = ep_rank * module.num_local_experts
         module.local_expert_indices = [local_expert_indices_offset + i for i in range(module.num_local_experts)]
-        if module.num_local_experts > 1:
-            module.expert_ids_per_ep_rank = torch.tensor(
-                [i % module.num_local_experts for i in range(module.num_global_experts)],
-                dtype=torch.int32,
-                device=torch.accelerator.current_device_index(),
-            )
+        module.expert_ids_per_ep_rank = torch.arange(
+            module.num_global_experts,
+            dtype=torch.int32,
+            device=torch.accelerator.current_device_index(),
+        ).remainder(module.num_local_experts)
 
         # distribute experts weights
         distribute_experts_module(module, ep_mesh)
@@ -82,7 +81,7 @@ def distribute_expert_weight(module_name, module, ep_mesh):
     for name, param in module.named_parameters(recurse=False):
         local_shape, global_offset = compute_local_shape_and_global_offset(param.shape, ep_mesh, placements)
         slices = [slice(offset, offset + size) for offset, size in zip(global_offset, local_shape)]
-        dist_param = torch.nn.Parameter(DTensor.from_local(param[slices].detach().clone(), ep_mesh, placements))
+        dist_param = torch.nn.Parameter(DTensor.from_local(param[tuple(slices)].detach().clone(), ep_mesh, placements))
         module.register_parameter(name, dist_param)
 
     for name, children_module in module.named_children():

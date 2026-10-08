@@ -1,0 +1,179 @@
+# DeepSeek-V4.1-Flash FSDP 训练示例
+
+本目录独立适配 `deepseek-ai/DeepSeek-V4.1-Flash`
+（`model_type=deepseek_v41`），不会修改或覆盖 `examples/deepseekv4` 中的旧版
+DeepSeek-V4-Flash 示例。
+
+官方模型仓库当前只发布了 `inference/model.py` 参考实现，没有发布可训练的
+Transformers `deepseek_v41` 建模模块。所需参考源码已固定复制到
+`fsdp_turbo/models/deepseek_v41/`：
+
+- `inference/model.py`
+- `inference/engram.py`
+- `inference/vision.py`
+- `inference/image_processor.py`
+
+源码对应 revision `dba1be0a40aa45a94ad051997016db3960a90277`，运行示例时不再
+动态下载或加载模型 Python 文件。模型结构配置和 tokenizer 均从
+`model_name_or_path` 读取。
+
+`fsdp_turbo.models.deepseek_v41` 会关闭参考实现自身的 inference tensor parallel，
+通过 FSDPTurbo `ops/` 语义层分发可反向传播的 attention/mHC 算子（含 CPU 兜底和
+NPU 实现），并提供图文 causal-LM loss 接口。模型专用 processor 按官方协议生成
+`images` 和 `token_types`，视觉塔与语言模型可联合反向。训练并行由 FSDPTurbo 统一
+管理：共享专家 SwiGLU 使用 TP，打包后的路由专家使用 EP，其余模块使用 FSDP2。
+
+```bash
+cd examples/deepseek_v41
+bash run.sh
+```
+
+当前示例直接从 `fsdp_turbo/models/deepseek_v41/config.json` 读取训练模型参数。该文件配置
+4 个语言层、KV source 层 1/2、index source 层 1/2/3 和 Engram 层 1，覆盖
+DeepSeek-V4.1 的 CSA2、稀疏索引和 Engram 结构。它不读取官方发布的 FP8/FP4 权重；
+模型参数以 BF16 随机初始化。
+
+默认使用预处理后的多模态数据集
+`/home/g00878035/DSV41/datasets/fsdp_turbo/processed_llava.json`，字段为
+`messages + images`。
+
+示例沿用仓库现有的通用多模态 dataloader，不额外修改其数据格式和加载行为。
+数据集中的图像路径应为绝对路径，或相对于运行时工作目录可解析。
+
+```json
+{"messages":[{"role":"user","content":"描述这张图片"},{"role":"assistant","content":"图片内容是……"}],"images":["/path/to/image.jpg"]}
+```
+
+## 当前支持范围
+
+| 能力 | 状态 |
+|---|---|
+| BF16 图文 causal-LM 训练 | 支持 |
+| FSDP2 | 支持 |
+| 共享专家 SwiGLU tensor parallel | 支持 |
+| 路由专家 expert parallel | 支持 |
+| Padding attention mask | 支持 |
+| 官方 FP8/FP4 checkpoint 加载 | 暂不支持 |
+| V4.1 attention tensor/context parallel | 暂不支持 |
+| CSA2 跨层压缩状态与稀疏索引结构 | 支持构造与结构验证 |
+| CANN Compressor/CompressorGrad 融合压缩算子 | 可选；设置 `model.use_fused_compressor: true` |
+| Lightning Indexer 融合算子 | 可选；当前仅支持 Ascend950DT；910B/910C/910_93 候选路径待开发 |
+| MhcPreSinkhornPremix/MhcPost 融合算子 | 可选；设置 `model.use_fused_mhc: true` |
+| 视觉 FlashAttentionScore/Grad 融合算子 | 可选；设置 `model.use_fused_vision_flash_attn: true`；仅支持 BF16 |
+| CSA2 activation recompute | 暂不支持 |
+| Engram BF16 训练、哈希表常驻行切分 | 支持（CPU 两进程已验证） |
+| Engram Host BF16 + ActiveRowAdam FP32 moments | 已接入可选后端；ElasticBuffer 需要配套 CANN 算子包 |
+| DSpark 训练 | 暂不支持 |
+
+未支持的路径在适配器或配置中会显式拒绝/关闭，避免把旧 V4 的实现误用于 V4.1。
+
+融合索引开关当前仅支持 Ascend950DT，并使用
+`QuantLightningIndexer/QuantSparseLightningIndexer`。Ascend 910B、910C 和 910_93
+的 candidate indexer 路径目前仅保留接口占位，尚未实现，不能开启该选项。
+Ascend950DT 路径需要 Python 3.11、`cannbotdsl`、`cannbot_arena_net_ops` 和配套
+`cann_ops_transformer`，AOT profile 固定
+`index_topk=512`，并支持 64/128 的 PA page size。默认保持关闭，关闭时继续运行原
+BF16 `einsum + topk` 实现。当前融合路径仅接入训练/整段 prefill，尚未接入逐 token
+decode 的累计序列元数据。
+
+MHC 融合开关同时替换每个 Attention/FFN 前的 projection、Sinkhorn、premix，以及
+子层输出后的 residual/post 混合。训练反向分别调用
+`MhcPreSinkhornBackward` 和 `MhcPostBackward`；跨子层传递的 `h_pre` 梯度通过等价的
+小型 pre projection 保留。该路径要求算子包包含 experimental
+`MhcPreSinkhornPremix` 以及正式的 MHC backward/post 算子，并要求
+`hc_mult=4`、`hc_sinkhorn_iters=20`。当前 master 版本在 Ascend 950 上仅接受隐藏维
+4096 或 7168，因此默认的 5120 配置需等待配套算子扩展规格后才能在该平台开启。
+
+融合压缩开关开启后，压缩率大于 1 的 KV source 层调用训练版 CANN
+`Compressor`，反向调用配套的 `CompressorGrad`；压缩率 1 仍保留普通线性投影。
+当前模型没有 compressor positional bias，因此向算子传入零 `ape`。该路径要求
+`cann_ops_transformer` 与 CANN/torch-npu 版本配套；默认保持关闭，关闭时继续运行
+原 FP32 投影、softmax pooling 实现。
+
+默认 8 卡拓扑为 `FSDP=4, TP=2, EP=4, expert DP=2`。注意力包含 attention
+sink 与 indexed sparse-attention 的特殊头布局，因此当前保持复制，不能直接套用通用
+Colwise/Rowwise 规则；`cp_plan` 也保持为空。
+
+## Engram 切分
+
+官方发布配置中的 Engram 位于第 1、14 层（从 0 开始）。每个位置查询
+`(4 - 1) × 8 = 24` 个哈希桶，每个桶向量宽 256。两张表分别有
+384,006,168 和 384,016,682 行，权重分别约 98.306B 和 98.308B 参数。
+Engram 不再保留参考实现的 FP8 `ParallelEngramEmbedding` 路径。存储后端直接决定
+表实现；当前支持 PyTorch Host offload 和 CANN `ElasticBuffer` 两种实现。
+哈希表沿 EP 域切行，TP/EDP 副本共享相同行分片；小型 `wkv`、`q_weight`、
+`k_weight` 仍由所属 Block 的 FSDP 管理。FSDPTurbo 自动把表参数加入 FSDP
+的忽略集合，不需要修改 `fsdp_plan`，也不要给表配置通用 TP。
+
+当前训练配置在第 1 层放置一张 384,006,168 行的发布规模 Engram 表；其 BF16
+纯权重约为 183.11 GiB，实际运行必须结合切分后的梯度和优化器状态评估容量。
+
+Host Engram 始终先在 meta 上创建表，无需在构造模型时传入 mesh。
+其他参数和运行时 buffer 仍正常创建。
+`initialize_deepseek_v41_model` 记录表的初始化标准差和种子，
+`prepare_deepseek_v41_model_for_fsdp` 转换 dtype、搬运其他张量并保留 meta 表。
+随后 `FSDPTurbo` 根据 EP mesh 确定行分片，再分配和初始化本地权重。
+示例的 `build_model` 已采用此流程：
+
+```python
+model = build_deepseek_v41_model(
+    tokenizer=tokenizer,
+)
+initialize_deepseek_v41_model(model)
+model = prepare_deepseek_v41_model_for_fsdp(
+    model, device=device, parameter_dtype=torch.bfloat16,
+)
+model = FSDPTurbo(config, model)
+```
+
+不要在切分前对 meta 表调用普通 `model.to()` 或整模型 `to_empty()`；请使用上面的
+prepare 函数。优化器应在 `FSDPTurbo` 构造后创建。模型构造入口不接收 mesh，
+切分统一由 FSDPTurbo 管理。延后初始化按模块名和行起点派生随机种子，
+在固定拓扑、相同初始种子下可复现；
+不保证与先初始化完整表再切分的随机值逐元素一致。
+
+训练适配器在 Block 内执行 Engram，确保投影参数已被 FSDP materialize。
+图像和 padding 会截断 n-gram，并屏蔽对应位置的 Engram 注入。没有 tokenizer、
+压缩词表不匹配或哈希桶超出表大小时构造会失败。
+目前验证覆盖 CPU/Gloo 查询、稀疏梯度、优化器、梯度范数及小模型图文反向；
+尚未验证 GPU/NPU 多机性能或发布尺寸。
+
+## Engram Host offload
+
+Engram 只暴露存储后端配置。默认使用不依赖额外 CANN 扩展的 PyTorch Host offload：
+
+```yaml
+model:
+  engram_storage_backend: host_offload
+```
+
+使用 CANN `ElasticBuffer` 加速 Host offload 时改为：
+
+```yaml
+model:
+  engram_storage_backend: elastic_buffer
+```
+
+训练入口从仓库内置的 `fsdp_turbo/models/deepseek_v41/config.json` 读取模型结构配置；
+`model.model_name_or_path` 不再用于解析模型结构。
+
+两个 Host 后端都会根据模型的 batch、序列长度和 N-gram 列数自动计算每 rank 的最大 token
+容量，并固定使用 pinned host memory。物理行数向上对齐到 2048，以便沿 EP 等分；补齐行
+不参与 hash。表的权威 BF16 分片和两个 FP32 Adam moment 位于 CPU，FSDP 仅管理 gate 参数；
+ActiveRowAdam 与普通优化器使用相同的学习率和调度参数，其更新公式与 SparseAdam 一致。
+稀疏梯度在归并、累积、裁剪和优化器更新期间保持 FP32。优化器仅通过
+`index_select`/`index_copy_` 读写本步活跃行，最后将更新后的权重行转回 BF16，避免原生
+SparseAdam 在 BF16 权重与 FP32 moments 组合下触发随整表大小增长的混合精度稀疏加。
+两个 moment 仍是与 EP-local 完整表分片同形状的稠密张量；当前单表配置在 8 个
+EP rank 同机时，BF16 权重与 FP32 moments 合计约 915.55 GiB。
+
+两个 Host 后端均要求 `EP > 1`。`host_offload` 使用 PyTorch `all_to_all_single` 与显式
+CPU/NPU 搬运，不依赖 `cann_ops_transformer`，当前仅面向 eager 正确性路径；
+`elastic_buffer` 要求安装提供 `cann_ops_transformer.ElasticBuffer` 训练接口的 CANN 算子包。
+算子包不支持直接注册 Host storage 时，eager 会在每次 forward 重新提交；
+`torch.compile` 会显式拒绝该路径，避免产生表未更新的静默错误。Host 表不参与 TP，
+可以与当前仅切分 shared expert 的 TP plan 共存；当前仍不支持对 Engram 模块本身应用 TP、
+PP、CP 或跨 EP degree checkpoint 转换。
+
+token 压缩、特殊 token 处理和 hash multiplier 已与发布参考实现保持同一 ABI。压缩词表
+不是 99,092 时会直接失败，不再通过告警后静默改写配置。

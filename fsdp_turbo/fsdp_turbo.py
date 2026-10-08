@@ -1,12 +1,20 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import torch
 
-from fsdp_turbo.distributed.expert_parallel.expert_fully_shard_parallel import expert_fully_shard_modules
-from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import fully_shard_parallel_modules
+from fsdp_turbo.distributed.expert_parallel.expert_fully_shard_parallel import (
+    expert_fully_shard_modules,
+)
+from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import (
+    fully_shard_parallel_modules,
+)
 from fsdp_turbo.distributed.parallel_state import init_parallel_state
-from fsdp_turbo.distributed.tensor_parallel.tensor_parallel import tensor_parallel_modules
+from fsdp_turbo.distributed.tensor_parallel.tensor_parallel import (
+    tensor_parallel_modules,
+)
 from fsdp_turbo.memory.chunk_batch.chunk_batch import chunk_batch_modules
-from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_context_parallel import ulysses_context_parallelize_modules
+from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_context_parallel import (
+    ulysses_context_parallelize_modules,
+)
 from fsdp_turbo.distributed.context_parallel.kv_allgather.kv_allgather_context_parallel import (
     kv_allgather_context_parallelize_modules,
 )
@@ -16,7 +24,9 @@ from fsdp_turbo.distributed.context_parallel.kcp.kcp_context_parallel import (
 from fsdp_turbo.distributed.context_parallel.patch import apply_cp_loss_patches
 from fsdp_turbo.memory.recompute.recompute import recompute_modules
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
-from fsdp_turbo.distributed.expert_parallel.expert_parallel import expert_parallelize_modules
+from fsdp_turbo.distributed.expert_parallel.expert_parallel import (
+    expert_parallelize_modules,
+)
 from fsdp_turbo.utils.patch import apply_module_patches
 
 
@@ -33,6 +43,7 @@ class FSDPTurbo(torch.nn.Module):
         self.apply_cp_modules()
         self.apply_module_patches()
         self.apply_ep_modules()
+        self.apply_pre_fsdp_module_hooks()
         self.apply_recompute_modules()
         self.apply_swap_activation_modules()
         self.apply_chunk_batch_modules()
@@ -44,14 +55,29 @@ class FSDPTurbo(torch.nn.Module):
         # fsdp mesh skips the dp all-reduce, yielding wrong gradients when the
         # fsdp domain is not filled (data_parallel_size > 1).
         self.model = fully_shard_parallel_modules(
-            self.model, self.parallel_state.get_device_mesh('dp_fsdp'), self.config.distributed.fsdp_plan
+            self.model,
+            self.parallel_state.get_device_mesh("dp_fsdp"),
+            self.config.distributed.fsdp_plan,
         )
+
+    def apply_pre_fsdp_module_hooks(self):
+        """Allow modules with nonstandard storage to prepare before FSDP."""
+        ignored_modules = self.config.distributed.fsdp_plan.ignored_modules
+        for name, module in self.model.named_modules():
+            prepare = getattr(module, "pre_fsdp_hook", None)
+            if not callable(prepare):
+                continue
+            prepare(self.parallel_state)
+            if name not in ignored_modules:
+                ignored_modules.append(name)
 
     def apply_tp_modules(self):
         if self.config.distributed.tensor_parallel_size == 1:
             return
         self.model = tensor_parallel_modules(
-            self.model, self.parallel_state.get_tp_device_mesh(), self.config.distributed.tp_plan
+            self.model,
+            self.parallel_state.get_tp_device_mesh(),
+            self.config.distributed.tp_plan,
         )
 
     def apply_cp_modules(self):
@@ -87,11 +113,13 @@ class FSDPTurbo(torch.nn.Module):
     def apply_ep_modules(self):
         if self.config.distributed.expert_parallel_size > 1:
             self.model = expert_parallelize_modules(
-                self.model, self.parallel_state.get_ep_device_mesh(), self.config.distributed.ep_plan
+                self.model,
+                self.parallel_state.get_ep_device_mesh(),
+                self.config.distributed.ep_plan,
             )
             self.model = expert_fully_shard_modules(
                 self.model,
-                self.parallel_state.get_device_mesh('edp_efsdp'),
+                self.parallel_state.get_device_mesh("edp_efsdp"),
                 self.config.distributed.ep_plan,
                 self.config.distributed.fsdp_plan,
                 enable_lp_all_gather=self.config.quantization.quantization_plan.enable_fsdp_low_precision_all_gather,
@@ -118,7 +146,9 @@ class FSDPTurbo(torch.nn.Module):
     def apply_swap_activation_modules(self):
         if not self.config.memory.swap_activation:
             return
-        from fsdp_turbo.memory.swap_activation.swap_activation import swap_activation_modules
+        from fsdp_turbo.memory.swap_activation.swap_activation import (
+            swap_activation_modules,
+        )
 
         self.model = swap_activation_modules(self.model, self.config.memory.swap_activation_plan.apply_modules)
 
@@ -130,7 +160,7 @@ class FSDPTurbo(torch.nn.Module):
         from torch.distributed.tensor import Shard, Partial
         from fsdp_turbo.utils.str_match import module_name_match
 
-        tp_mesh = self.parallel_state.get_device_mesh('tp')
+        tp_mesh = self.parallel_state.get_device_mesh("tp")
         colwise = self.config.distributed.tp_plan.colwise_parallel or []
         rowwise = self.config.distributed.tp_plan.rowwise_parallel or []
         for name, mod in self.model.named_modules():
@@ -161,7 +191,9 @@ class FSDPTurbo(torch.nn.Module):
                 and quantization_plan.fsdp_low_precision_all_gather_mode == "on-demand"
             )
 
-            from fsdp_turbo.quantization.converter.model_converter import build_model_converter
+            from fsdp_turbo.quantization.converter.model_converter import (
+                build_model_converter,
+            )
 
             model_converters = build_model_converter(self.config.quantization.quantization_plan)
             model_converters.convert(self.model)

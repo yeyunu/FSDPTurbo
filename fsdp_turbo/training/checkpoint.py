@@ -1,6 +1,10 @@
-import os
 import logging
+import os
 from datetime import datetime
+
+# DCP is an optional dependency, so its imports and Stateful implementation are
+# defined conditionally below.
+# pylint: disable=possibly-used-before-assignment,ungrouped-imports
 
 import torch
 
@@ -11,8 +15,13 @@ logger = logging.getLogger(__name__)
 # torch.distributed.checkpoint (DCP) — available in PyTorch >= 2.2.
 try:
     import torch.distributed.checkpoint as dcp
-    from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict, StateDictOptions
+    from torch.distributed.checkpoint.state_dict import (
+        get_state_dict,
+        set_state_dict,
+        StateDictOptions,
+    )
     from torch.distributed.checkpoint.stateful import Stateful
+
     _HAS_DCP = True
 except ImportError:
     _HAS_DCP = False
@@ -44,8 +53,17 @@ if _HAS_DCP:
         handled through this single object.
         """
 
-        def __init__(self, model, optimizer, scheduler, global_step=0,
-                     data_cfg=None, dataloader=None, strict=True, consumed_samples=0):
+        def __init__(
+            self,
+            model,
+            optimizer,
+            scheduler,
+            global_step=0,
+            data_cfg=None,
+            dataloader=None,
+            strict=True,
+            consumed_samples=0,
+        ):
             self.model = model
             self.optimizer = optimizer
             self.scheduler = scheduler
@@ -61,9 +79,13 @@ if _HAS_DCP:
             # Model + optimizer via get_state_dict (handles FSDP FQNs
             # and sharded state dicts automatically).
             if self.model is not None:
-                model_sd, optim_sd = get_state_dict(self.model, self.optimizer)
-                result["model"] = model_sd
-                result["optim"] = optim_sd
+                custom_state_dict = getattr(self.optimizer, "dcp_state_dict", None)
+                if callable(custom_state_dict):
+                    result.update(custom_state_dict(self.model))
+                else:
+                    model_sd, optim_sd = get_state_dict(self.model, self.optimizer)
+                    result["model"] = model_sd
+                    result["optim"] = optim_sd
 
             # Scheduler (plain state dict).
             if self.scheduler is not None:
@@ -74,12 +96,15 @@ if _HAS_DCP:
             result["consumed_samples"] = self.consumed_samples
             result["dataset_fingerprint"] = dataset_fingerprint(self.data_cfg)
 
-            if (self.dataloader is not None
-                    and hasattr(self.dataloader, "sampler")
-                    and hasattr(self.dataloader.sampler, "state_dict")):
+            if (
+                self.dataloader is not None
+                and hasattr(self.dataloader, "sampler")
+                and hasattr(self.dataloader.sampler, "state_dict")
+            ):
                 sampler_state = self.dataloader.sampler.state_dict()
                 result["dataloader_state_dict"] = {
-                    k: v for k, v in sampler_state.items()
+                    k: v
+                    for k, v in sampler_state.items()
                     if isinstance(v, (int, float, str, bool, list, dict, torch.Tensor))
                 }
 
@@ -89,13 +114,21 @@ if _HAS_DCP:
             # Model + optimizer via set_state_dict (applies in-place,
             # correctly handling FSDP sharded parameters).
             if self.model is not None:
-                set_state_dict(
-                    self.model,
-                    self.optimizer,
-                    model_state_dict=state_dict.get("model", {}),
-                    optim_state_dict=state_dict.get("optim", {}),
-                    options=StateDictOptions(strict=self.strict)
-                )
+                custom_load_state_dict = getattr(self.optimizer, "load_dcp_state_dict", None)
+                if callable(custom_load_state_dict):
+                    custom_load_state_dict(
+                        state_dict,
+                        self.model,
+                        strict=self.strict,
+                    )
+                else:
+                    set_state_dict(
+                        self.model,
+                        self.optimizer,
+                        model_state_dict=state_dict.get("model", {}),
+                        optim_state_dict=state_dict.get("optim", {}),
+                        options=StateDictOptions(strict=self.strict),
+                    )
 
             # Scheduler.
             if self.scheduler is not None and state_dict.get("scheduler"):
@@ -130,8 +163,16 @@ class Checkpointer:
     # Save
     # ------------------------------------------------------------------
 
-    def save(self, model, optimizer, scheduler, global_step, data_cfg=None, dataloader=None,
-             consumed_samples=0):
+    def save(
+        self,
+        model,
+        optimizer,
+        scheduler,
+        global_step,
+        data_cfg=None,
+        dataloader=None,
+        consumed_samples=0,
+    ):
         """Save training checkpoint.
 
         When DCP is available, every rank participates in the save
@@ -146,24 +187,69 @@ class Checkpointer:
         os.makedirs(ckpt_dir, exist_ok=True)
 
         if _HAS_DCP:
-            self._save_dcp(ckpt_dir, model, optimizer, scheduler, global_step, data_cfg, dataloader,
-                           consumed_samples)
+            self._save_dcp(
+                ckpt_dir,
+                model,
+                optimizer,
+                scheduler,
+                global_step,
+                data_cfg,
+                dataloader,
+                consumed_samples,
+            )
         else:
-            self._save_torch(ckpt_dir, model, optimizer, scheduler, global_step, data_cfg, dataloader,
-                             consumed_samples)
+            self._save_torch(
+                ckpt_dir,
+                model,
+                optimizer,
+                scheduler,
+                global_step,
+                data_cfg,
+                dataloader,
+                consumed_samples,
+            )
 
-    def _save_dcp(self, ckpt_dir, model, optimizer, scheduler, global_step, data_cfg, dataloader,
-                  consumed_samples=0):
+    def _save_dcp(
+        self,
+        ckpt_dir,
+        model,
+        optimizer,
+        scheduler,
+        global_step,
+        data_cfg,
+        dataloader,
+        consumed_samples=0,
+    ):
         """Save using ``torch.distributed.checkpoint`` (all ranks)."""
         optim_to_save = optimizer if self.save_optim else None
-        state_dict = {"app": _AppState(model, optim_to_save, scheduler, global_step, data_cfg, dataloader,
-                                       consumed_samples=consumed_samples)}
+        state_dict = {
+            "app": _AppState(
+                model,
+                optim_to_save,
+                scheduler,
+                global_step,
+                data_cfg,
+                dataloader,
+                consumed_samples=consumed_samples,
+            )
+        }
         dcp.save(state_dict, checkpoint_id=ckpt_dir)
         print_rank(logger.info, f"DCP checkpoint saved to {ckpt_dir}")
 
-    def _save_torch(self, ckpt_dir, model, optimizer, scheduler, global_step, data_cfg, dataloader,
-                    consumed_samples=0):
+    def _save_torch(
+        self,
+        ckpt_dir,
+        model,
+        optimizer,
+        scheduler,
+        global_step,
+        data_cfg,
+        dataloader,
+        consumed_samples=0,
+    ):
         """Fallback save using ``torch.save`` (rank 0 only)."""
+        if callable(getattr(optimizer, "dcp_state_dict", None)):
+            raise RuntimeError(f"{type(optimizer).__name__} checkpoint save requires torch.distributed.checkpoint.")
         if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
             return
 
@@ -241,6 +327,8 @@ class Checkpointer:
 
     def _load_torch(self, checkpoint_path, model, optimizer, scheduler, strict: bool = True):
         """Fallback load using ``torch.load`` (rank 0 only)."""
+        if callable(getattr(optimizer, "load_dcp_state_dict", None)):
+            raise RuntimeError(f"{type(optimizer).__name__} checkpoint restore requires torch.distributed.checkpoint.")
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
         if model is not None and "model_state_dict" in state:

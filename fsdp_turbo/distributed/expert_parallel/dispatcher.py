@@ -106,7 +106,7 @@ def dispatch_preprocess(ep_group, top_k_index, num_global_experts, expert_ids_pe
 
     # [B*S, K] --> [E]
     num_local_tokens_per_expert = torch.histc(
-        top_k_index, bins=num_global_experts, min=0, max=num_global_experts
+        top_k_index.float(), bins=num_global_experts, min=0, max=num_global_experts
     ).long()
     # [E] --> [EP*E]
     num_global_tokens_per_expert, _ = gather_along_first_dim_expert_parallel(num_local_tokens_per_expert, ep_group)

@@ -18,6 +18,14 @@ try:
 except ImportError:  # triton is optional; the package must still load without it
     hc_split_sinkhorn_npu = None
 from fsdp_turbo.ops.npu.situ_glu import situ_glu_npu
+from fsdp_turbo.ops.npu.sparse_attention import (
+    indexed_sparse_attention_npu,
+    npu_sparse_flash_mla,
+)
+from fsdp_turbo.ops.npu.compressor import fused_compressor
+from fsdp_turbo.ops.npu.lightning_indexer import fused_lightning_indexer
+from fsdp_turbo.ops.npu.mhc import fused_mhc_post, fused_mhc_pre_sinkhorn_premix
+from fsdp_turbo.ops.npu.vision_flash_attention import fused_vision_flash_attention
 
 __all__ = [
     'causal_conv1d_npu',
@@ -37,4 +45,11 @@ __all__ = [
     'hc_split_sinkhorn_npu',
     'mx_to_block_mx_quant_npu',
     'situ_glu_npu',
+    'indexed_sparse_attention_npu',
+    'npu_sparse_flash_mla',
+    'fused_compressor',
+    'fused_lightning_indexer',
+    'fused_mhc_post',
+    'fused_mhc_pre_sinkhorn_premix',
+    'fused_vision_flash_attention',
 ]
