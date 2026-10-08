@@ -79,14 +79,15 @@ class KimiK3Trainer(BaseTrainer):
 
         outputs = self.model(**batch)
         loss = outputs.loss
+        aux_loss = outputs.aux_loss if hasattr(outputs, 'aux_loss') else None
         if loss is None:
             raise RuntimeError("Model did not return a loss. Make sure the batch contains labels.")
 
         loss = loss / self.config.run.gradient_accumulation_steps
-        with torch.utils.checkpoint.set_checkpoint_debug_enabled(True):
+        del outputs
+        with torch.utils.checkpoint.set_checkpoint_debug_enabled(False):
             loss.backward()
 
-        aux_loss = outputs.aux_loss if hasattr(outputs, 'aux_loss') else None
         return loss, aux_loss
 
 

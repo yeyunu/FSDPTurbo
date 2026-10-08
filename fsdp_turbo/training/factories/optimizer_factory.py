@@ -34,7 +34,7 @@ class OptimizerFactory:
             custom_fn: Callable that returns an optimizer, receives **kwargs.
         """
         _registry[name] = custom_fn
-        logger.info(f"Registered custom optimizer creator: {name}")
+        logger.info("Registered custom optimizer creator: %s", name)
 
     @staticmethod
     def create(
@@ -54,17 +54,16 @@ class OptimizerFactory:
             **kwargs: Keyword args forwarded to the optimizer constructor (e.g. lr, weight_decay).
         """
         if custom_fn is not None:
-            logger.info(f"Creating optimizer from custom_fn: {source}")
+            logger.info("Creating optimizer from custom_fn: %s", source)
             return custom_fn(*args, **kwargs)
 
         if source in _registry:
-            logger.info(f"Creating optimizer from registered source: {source}")
+            logger.info("Creating optimizer from registered source: %s", source)
             return _registry[source](*args, **kwargs)
 
         opt_cls = getattr(torch.optim, source, None)
         if opt_cls is None:
             available = [k for k in dir(torch.optim) if k[0].isupper()]
-            raise KeyError(f"Optimizer '{source}' not found in torch.optim. "
-                           f"Available: {available}")
-        logger.info(f"Creating optimizer from torch.optim: {source}")
+            raise KeyError(f"Optimizer '{source}' not found in torch.optim. Available: {available}")
+        logger.info("Creating optimizer from torch.optim: %s", source)
         return opt_cls(*args, **kwargs)

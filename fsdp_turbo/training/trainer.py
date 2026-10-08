@@ -344,6 +344,9 @@ class BaseTrainer:
             kwargs["mem_fraction_static"] = self.config.optimizer.mem_fraction_static
         if self.config.optimizer.state_keys is not None:
             kwargs["state_keys"] = self.config.optimizer.state_keys
+        if self.config.optimizer.param_prefetch is not None:
+            kwargs["param_prefetch"] = self.config.optimizer.param_prefetch
+
         optimizer = OptimizerFactory.create(
             self.config.optimizer.optimizer_type,
             self.model.parameters(),

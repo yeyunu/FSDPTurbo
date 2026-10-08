@@ -39,6 +39,8 @@ class OptimizerConfig:
     mem_fraction_static: Optional[float] = None
     # Swap optimizer (AdamWSwap) only: state keys participating in swap; None uses the default
     state_keys: Optional[List[str]] = None
+    # Swap optimizer (AdamWSwap) only: prefetch one param to device buffer if it sets True
+    param_prefetch: bool = False
 
 
 @dataclass

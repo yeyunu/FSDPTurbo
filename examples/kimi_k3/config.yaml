@@ -10,7 +10,7 @@ model:
 
 # --- Optimizer Configuration ---
 optimizer:
-  optimizer_type: "AdamW"
+  optimizer_type: "AdamWSwap"
   weight_decay: 0.1
   adam_beta1: 0.9
   adam_beta2: 0.95
@@ -21,6 +21,7 @@ optimizer:
   min_lr: 3.0e-5
   clip_grad: 1.0
   clip_grad_norm_type: 2.0
+  param_prefetch: true
 
 # --- Run Configuration ---
 run:
@@ -94,6 +95,7 @@ distributed:
         {}
       language_model.lm_head:
         {}
+    cpu_offload: false
     param_dtype: "bf16"
     reduce_dtype: "fp32"
     output_dtype: "bf16"

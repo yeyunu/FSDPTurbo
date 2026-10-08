@@ -19,9 +19,10 @@ class SwapOptimizerOperate:
     state_keys = ['exp_avg', 'exp_avg_sq', 'max_exp_avg_sq']
     swap_state_keys = set()
 
-    def __init__(self, mem_fraction_static=0.8, state_keys=None):
+    def __init__(self, mem_fraction_static=0.8, state_keys=None, param_prefetch=False):
         if state_keys is not None:
             self.state_keys = state_keys
+        self.param_prefetch = param_prefetch
 
         if SwapOptimizerOperate.swap_to_device_stream is None:
             SwapOptimizerOperate.swap_to_device_stream = torch.accelerator.Stream()
@@ -57,7 +58,9 @@ class SwapOptimizerOperate:
                         cpu_state[key] = None
                     else:
                         self.swap_state_keys.add(key)
-                        device_state_dtensor[key] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                        device_state_dtensor[key] = torch.zeros_like(
+                            param, memory_format=torch.preserve_format, device=torch.accelerator.current_device()
+                        )
                         # convert dtensor to tensor
                         device_state_tensor[key] = device_state_dtensor[key].to_local()
 
@@ -90,8 +93,10 @@ class SwapOptimizerOperate:
         used_memory = self._memory_allocated()
         unused_memory = self.total_memory - used_memory
 
-        # for example: the memory of exp_avg and exp_avg_sq of  is  (self.byte_param * 2)
-        swap_numel = unused_memory * self.mem_fraction_static // (self.byte_param * len(self.swap_state_keys))
+        # state_keys + 1 (param buffer): 每个 param 需要同时容纳
+        # param buffer + optimizer state 在 device 上
+        divisor = self.byte_param * (len(self.swap_state_keys) + 1)
+        swap_numel = unused_memory * self.mem_fraction_static // divisor
         return swap_numel
 
     def swap_all_to_host(self):
@@ -122,6 +127,20 @@ class SwapOptimizerOperate:
                     device_state[key].storage().resize_(cpu_state[key].storage().size())
                     device_state[key].copy_(cpu_state[key], non_blocking=True)
 
+        # H2D param if CPU offload: 预取 param 到 device buffer,
+        # 和 state 一起 non_blocking H2D,可以和前一个 param 的 D2H 重叠
+        # param_prefetch=False 时不预取,step 内逐个临时 H2D(省显存)
+        if self.param_prefetch:
+            param_local_cpu = param.to_local()
+            if param_local_cpu.device.type == 'cpu':
+                if not hasattr(self, 'param_to_device_buffer'):
+                    self.param_to_device_buffer = {}
+                if param not in self.param_to_device_buffer:
+                    self.param_to_device_buffer[param] = torch.empty_like(
+                        param_local_cpu, device=torch.accelerator.current_device()
+                    )
+                self.param_to_device_buffer[param].copy_(param_local_cpu, non_blocking=True)
+
         self.swap_to_device_events_map[param] = torch.accelerator.current_stream().record_event()
 
     def wait_swap_to_device_event(self, param):
@@ -142,17 +161,40 @@ class SwapOptimizerOperate:
 
         self.swap_to_host_events_map[param] = torch.accelerator.current_stream().record_event()
 
-    def swap_batch_tensor_to_device(self, params_list, index):
-        torch.accelerator.current_stream().wait_stream(self.swap_to_host_stream)
-        swap_count = 0
-        with torch.accelerator.stream(self.swap_to_device_stream):
-            torch.accelerator.current_stream().wait_stream(self.swap_to_host_stream)
-            self.swap_numel = self.get_swap_numel_from_unused_memory()
-            while index < len(params_list) and (swap_count + params_list[index].to_local().numel() <= self.swap_numel):
-                self.swap_tensors_to_device(params_list[index])
-                swap_count += params_list[index].to_local().numel()
-                index += 1
+    def _h2d_next_params(self, params_list, start_idx, current_swap_count, max_count=1):
+        """H2D the next param(s) that fit in available NPU memory.
 
+        Runs on ``swap_to_device_stream``, overlapping with compute on the
+        default stream.  Called after each param's D2H to keep the H2D/D2H/compute
+        pipeline flowing at param-level granularity rather than batch-level.
+
+        ``max_count`` limits how many params are prefetched per call (default 1)
+        so that H2D[i+1] overlaps with compute[i] + D2H[i] instead of batch-loading
+        all params upfront (which would waste NPU memory on buffers).
+        """
+        with torch.accelerator.stream(self.swap_to_device_stream):
+            available_numel = self._max_swap_numel - current_swap_count
+            count = 0
+            while start_idx < len(params_list) and count < max_count:
+                if params_list[start_idx].grad is None:
+                    start_idx += 1
+                    continue
+                param_numel = params_list[start_idx].to_local().numel()
+                if current_swap_count + param_numel > available_numel:
+                    break
+                self.swap_tensors_to_device(params_list[start_idx])
+                current_swap_count += param_numel
+                start_idx += 1
+                count += 1
+        return start_idx, current_swap_count
+
+    def swap_batch_tensor_to_device(self, params_list, index):
+        """Backward-compatible batch H2D (delegates to _h2d_next_params)."""
+        if not hasattr(self, '_max_swap_numel'):
+            self.swap_to_host_stream.synchronize()
+            self.swap_numel = self.get_swap_numel_from_unused_memory()
+            self._max_swap_numel = self.swap_numel
+        next_idx, swap_count = self._h2d_next_params(params_list, index, 0)
         if swap_count == 0:
             raise AssertionError(
                 "OOM, the amount of data transferred for optimizer states "
@@ -179,6 +221,7 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
         fused: Optional[bool] = None,
         mem_fraction_static: Optional[float] = 0.8,
         state_keys: Optional[List[str]] = None,
+        param_prefetch: bool = False,
     ):
         """
         This is a class that supports swapping optimizer states from the device to the host side
@@ -216,7 +259,7 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
             fused=True,
         )
 
-        SwapOptimizerOperate.__init__(self, mem_fraction_static=mem_fraction_static)
+        SwapOptimizerOperate.__init__(self, mem_fraction_static=mem_fraction_static, param_prefetch=param_prefetch)
 
     def step(self, closure=None):
         loss = None
@@ -232,9 +275,19 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
             else:
                 group['step'] = torch.tensor(1, dtype=torch.int64, device=torch.accelerator.current_device_index())
 
-        swap_count = 0
         params_list = list(self.param_to_group_map.keys())
 
+        self.swap_to_host_stream.synchronize()
+        self.swap_numel = self.get_swap_numel_from_unused_memory()
+        self._max_swap_numel = self.swap_numel
+        swap_count = 0
+        next_h2d_idx = 0
+        next_h2d_idx, swap_count = self._h2d_next_params(params_list, 0, 0)
+        if next_h2d_idx == 0:
+            raise AssertionError(
+                "OOM: cannot fit even one param's optimizer state on Device. Try increasing mem_fraction_static."
+            )
+        dev = torch.accelerator.current_device()
         for i, param in enumerate(params_list):
             if param.grad is None:
                 continue
@@ -248,23 +301,60 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
 
             # State initialization
             if len(state) == 0:
-                state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format)
-                state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format)
+                state['exp_avg'] = torch.zeros_like(param, memory_format=torch.preserve_format, device=dev)
+                state['exp_avg_sq'] = torch.zeros_like(param, memory_format=torch.preserve_format, device=dev)
             if 'max_exp_avg_sq' not in state:
                 state['max_exp_avg_sq'] = (
-                    torch.zeros_like(param, memory_format=torch.preserve_format) if amsgrad else None
+                    torch.zeros_like(param, memory_format=torch.preserve_format, device=dev) if amsgrad else None
                 )
 
-            if swap_count == 0:
-                swap_count = self.swap_batch_tensor_to_device(params_list, i)
+            if self.swap_to_device_events_map.get(param, None) is None:
+                self.swap_to_host_stream.synchronize()
+                self.swap_numel = self.get_swap_numel_from_unused_memory()
+                self._max_swap_numel = self.swap_numel
+                next_h2d_idx, swap_count = self._h2d_next_params(params_list, i, swap_count)
+                if self.swap_to_device_events_map.get(param, None) is None:
+                    raise AssertionError(
+                        "OOM: cannot fit param on NPU even after all D2H. Try increasing mem_fraction_static."
+                    )
             self.wait_swap_to_device_event(param)
 
+            # --- handle cpu_offload: param/grad/state may be on CPU ---
+            param_was_cpu = param.to_local().device.type == 'cpu'
+
+            # 优先从预取 buffer 取 param(已 non_blocking H2D)
+            # 避免在 default stream 上 blocking H2D
+            if param_was_cpu and hasattr(self, 'param_to_device_buffer') and param in self.param_to_device_buffer:
+                param_local = self.param_to_device_buffer[param]
+            else:
+                param_local = param.to_local()
+                if param_local.device.type == 'cpu':
+                    param_local = param_local.to(dev)
+
+            grad_local = param.grad.to_local()
+            if grad_local.device.type == 'cpu':
+                grad_local = grad_local.to(dev)
+            exp_avg_local = state['exp_avg'].to_local()
+            exp_avg_sq_local = state['exp_avg_sq'].to_local()
+
+            if param_local.device.type == 'cpu':
+                param_local = param_local.to(dev)
+            if exp_avg_local.device.type == 'cpu':
+                exp_avg_local = exp_avg_local.to(dev)
+                exp_avg_sq_local = exp_avg_sq_local.to(dev)
+
+            max_exp_avg_sq_local = None
+            if amsgrad and state.get('max_exp_avg_sq') is not None:
+                max_exp_avg_sq_local = state['max_exp_avg_sq'].to_local()
+                if max_exp_avg_sq_local.device.type == 'cpu':
+                    max_exp_avg_sq_local = max_exp_avg_sq_local.to(dev)
+
             torch._fused_adamw_(
-                [param.to_local()],
-                [param.grad.to_local()],
-                [state['exp_avg'].to_local()],
-                [state['exp_avg_sq'].to_local()],
-                [state['exp_avg_sq'].to_local()] if amsgrad else [],
+                [param_local],
+                [grad_local],
+                [exp_avg_local],
+                [exp_avg_sq_local],
+                [max_exp_avg_sq_local] if amsgrad else [],
                 [group['step']],
                 lr=group['lr'],
                 beta1=beta1,
@@ -275,13 +365,29 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
                 maximize=group['maximize'],
             )
 
-            # Sync: swap_to_host_stream must wait for the compute stream to finish
-            # _fused_adamw_ before reading/resizing device_state, since device_state
-            # shares storage with state['exp_avg']/state['exp_avg_sq'] via to_local().
-            compute_stream = torch.accelerator.current_stream()
-            with torch.accelerator.stream(self.swap_to_host_stream):
-                torch.accelerator.current_stream().wait_stream(compute_stream)
-                swap_count -= param.to_local().numel()
-                self.swap_tensors_to_host(param)
+            # D2H 全部在 default stream 上 blocking 执行。
+            # non_blocking + swap_to_host_stream + resize_(0) 在 Device 上
+            # 可能导致数据损坏。
+            if param_was_cpu:
+                param._local_tensor.copy_(param_local)  # blocking D2H param
+                # 释放预取 buffer,让显存可被下一个 param 的 H2D 使用
+                if hasattr(self, 'param_to_device_buffer') and param in self.param_to_device_buffer:
+                    del self.param_to_device_buffer[param]
+            # state D2H (blocking)
+            swap_count -= param.to_local().numel()
+            cpu_state = self.param_to_cpu_states_map[param]
+            if param in self.param_to_device_states_map:
+                device_state = self.param_to_device_states_map[param]
+                for key in self.state_keys:
+                    if (
+                        key in device_state
+                        and device_state[key] is not None
+                        and device_state[key].storage().size() != 0
+                    ):
+                        cpu_state[key].copy_(device_state[key])
+                        device_state[key].storage().resize_(0)
+
+            if next_h2d_idx < len(params_list):
+                next_h2d_idx, swap_count = self._h2d_next_params(params_list, next_h2d_idx, swap_count)
 
         return loss

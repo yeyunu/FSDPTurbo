@@ -24,6 +24,7 @@ optimizer:
   adam_epsilon: 1.0e-8
   mem_fraction_static: 0.9                    # 可选：批量 H2D 回装使用的空闲显存比例，默认 0.9
   state_keys: ["exp_avg", "exp_avg_sq"]       # 可选：参与交换的 state 键，缺省使用 AdamWSwap 内部默认
+  param_prefetch: true                        # 可选：参与交换的参数是否提前加载一个，减少带宽阻塞，缺省使用 AdamWSwap 内部默认（关闭）
 ```
 
 | 参数 | 说明 |
@@ -31,6 +32,7 @@ optimizer:
 | `optimizer_type` | 设为`AdamWSwap`即启用优化器状态交换 |
 | `mem_fraction_static` | 批量回装时允许使用的空闲显存比例，默认`0.9` |
 | `state_keys` | 参与交换的优化器状态键列表，缺省使用AdamWSwap内部默认（AdamW为`exp_avg`、`exp_avg_sq`） |
+| `param_prefetch` | 参与交换的参数预加载配置，缺省使用AdamWSwap内部默认（不提前加载） |
 
 `AdamWSwap`已注册到优化器工厂（OptimizerFactory），其余优化器参数（lr、betas、weight_decay等）与标准AdamW一致。参考示例：`examples/deepseekv4/config.yaml`。
 

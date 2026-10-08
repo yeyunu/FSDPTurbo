@@ -15,6 +15,7 @@ def hccl_premul_sum_wrapper(op, output_name):
             output = args[0] if len(args) > 0 else kwargs[output_name]
             output.data.mul_(factor)
         return handle
+
     return wrapper
 
 

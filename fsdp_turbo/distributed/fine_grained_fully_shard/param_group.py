@@ -105,11 +105,18 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
 
         if self.mesh_info.shard_mesh_size == 1:
             for fsdp_param in self.fsdp_params:
-                if not hasattr(fsdp_param, '_unsharded_param'):
-                    unsharded_param = fsdp_param._sharded_local_tensor
-                    if fsdp_param.is_dtensor:
-                        unsharded_param = _from_local_no_grad(unsharded_param, fsdp_param._tp_spec)
-                    fsdp_param._unsharded_param = unsharded_param
+                src = fsdp_param._sharded_local_tensor
+                existing = getattr(fsdp_param, '_unsharded_param', None)
+                if existing is not None:
+                    target = existing._local_tensor if fsdp_param.is_dtensor else existing
+                    if target.device == self.device:
+                        target.data.copy_(src, non_blocking=True)
+                        continue
+                with torch.no_grad():
+                    unsharded_param = src.to(self.device, non_blocking=True)
+                if fsdp_param.is_dtensor:
+                    unsharded_param = _from_local_no_grad(unsharded_param, fsdp_param._tp_spec)
+                fsdp_param._unsharded_param = unsharded_param
             self._to_unsharded()
             self._all_gather_result = None
             return

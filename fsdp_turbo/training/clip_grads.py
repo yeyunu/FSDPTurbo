@@ -103,13 +103,13 @@ def compute_grad_norm(
         group: Process group for all-reducing the norm across
             sharding ranks.  If ``None`` and DTensor gradients
             are present, the group is inferred from the DTensors.
-
     Returns:
         The total gradient norm as a Python float.
     """
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
 
+    dev = torch.accelerator.current_device()
     # Group parameters by their shard-group signature so that gradients
     # sharing the same set of sharded mesh dimensions can be aggregated
     # locally before a single all-reduce per group.  This is required
@@ -121,7 +121,11 @@ def compute_grad_norm(
     grouped_groups = {}
     for p in parameters:
         if p.grad is not None:
-            local_g = _to_local_if_dtensor(p.grad).detach().float()
+            local_g = _to_local_if_dtensor(p.grad).detach()
+            # With cpu_offload, gradients are on CPU; pinned memory allows non_blocking H2D
+            if local_g.device != dev:
+                local_g = local_g.to(dev, non_blocking=True)
+            local_g = local_g.float()
             shard_groups = _get_shard_groups_if_dtensor(p.grad, group)
             sig = tuple(id(g) for g in shard_groups)
             grouped_grads[sig].append(local_g)
@@ -131,12 +135,11 @@ def compute_grad_norm(
         return 0.0
 
     norm_type = float(norm_type)
-    device = next(iter(grouped_grads.values()))[0].device
 
     if norm_type == inf:
         # For each group: local max over its members, all-reduce MAX across
         # every sharded dimension, then take the global max across groups.
-        global_max = torch.zeros((), dtype=torch.float, device=device)
+        global_max = torch.zeros((), dtype=torch.float, device=dev)
         for sig, grads in grouped_grads.items():
             local_max = max(g.abs().max() for g in grads)
             local_max_t = local_max.to(torch.float).reshape(())
@@ -148,9 +151,9 @@ def compute_grad_norm(
     # General p-norm: for each group, sum local ||grad||^p over its members,
     # all-reduce SUM across every sharded dimension, then accumulate across
     # groups.
-    total_sum = torch.zeros((), dtype=torch.float, device=device)
+    total_sum = torch.zeros((), dtype=torch.float, device=dev)
     for sig, grads in grouped_grads.items():
-        local_sum = torch.zeros((), dtype=torch.float, device=device)
+        local_sum = torch.zeros((), dtype=torch.float, device=dev)
         if norm_type == 2.0:
             for g in grads:
                 local_sum += g.norm() ** 2
@@ -188,9 +191,18 @@ def clip_grad_by_norm(
     if clip_coeff >= 1.0:
         return
 
+    dev = torch.accelerator.current_device()
+
     for p in parameters:
         if p.grad is not None:
-            _to_local_if_dtensor(p.grad).detach().mul_(clip_coeff)
+            local_g = _to_local_if_dtensor(p.grad).detach()
+            if local_g.device != dev:
+                # Fallback when no cache: H2D -> mul -> D2H write back to original storage
+                device_g = local_g.to(dev, non_blocking=True)
+                device_g.mul_(clip_coeff)
+                local_g.copy_(device_g, non_blocking=True)
+            else:
+                local_g.mul_(clip_coeff)
 
 
 def clip_grad_norm(
