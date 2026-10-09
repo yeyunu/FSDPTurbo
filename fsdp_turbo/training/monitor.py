@@ -18,7 +18,15 @@ class Monitor:
         self._memory_backend = None
 
     def on_step_start(self):
-        """Record the start time of a step. Call before train_step."""
+        """Record the start time of a step. Call before train_step.
+
+        With gradient accumulation the trainer calls this before every
+        micro-batch; only the first call after a log() starts a new
+        measurement, so the reported step time and peak memory cover the
+        full accumulation window.
+        """
+        if self._step_start_time is not None:
+            return
         self._step_start_time = time.perf_counter()
         self._memory_backend = self._get_memory_backend()
         if self._memory_backend is not None:
@@ -49,7 +57,7 @@ class Monitor:
     def summary(self):
         if not self.loss_history:
             return
-        losses = [l for _, l, _, _ in self.loss_history]
+        losses = [loss for _, loss, _, _ in self.loss_history]
         times = [t for _, _, t, _ in self.loss_history if t is not None]
         avg_loss = sum(losses) / len(losses)
         parts = [f"{len(self.loss_history)} steps", f"avg loss = {avg_loss:.6f}"]
