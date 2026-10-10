@@ -111,7 +111,17 @@ class BaseTrainer:
 
                     # Track how many samples have been processed.
                     if isinstance(batch, dict):
-                        batch_size = next((v.shape[0] for v in batch.values() if isinstance(v, torch.Tensor)), 1)
+                        batch_size = next(
+                            (v.shape[0] for v in batch.values() if isinstance(v, torch.Tensor)),
+                            1,
+                        )
+                        if "sfa_layout" in batch and self.config.data.sfa_layout in (
+                            "BSND",
+                            "TND",
+                        ):
+                            # A packed JSONL row is one sampler item even when
+                            # BSND puts its documents on the batch axis.
+                            batch_size = self.config.data.batch_size
                     elif isinstance(batch, (list, tuple)):
                         batch_size = batch[0].shape[0] if isinstance(batch[0], torch.Tensor) else 1
                     else:
@@ -339,13 +349,14 @@ class BaseTrainer:
             betas=(self.config.optimizer.adam_beta1, self.config.optimizer.adam_beta2),
             eps=self.config.optimizer.adam_epsilon,
         )
-        # Swap optimizer specific kwargs: None means use AdamWSwap internal defaults
-        if self.config.optimizer.mem_fraction_static is not None:
-            kwargs["mem_fraction_static"] = self.config.optimizer.mem_fraction_static
-        if self.config.optimizer.state_keys is not None:
-            kwargs["state_keys"] = self.config.optimizer.state_keys
-        if self.config.optimizer.param_prefetch is not None:
-            kwargs["param_prefetch"] = self.config.optimizer.param_prefetch
+        # Only AdamWSwap accepts swap-specific optimizer arguments.
+        if self.config.optimizer.optimizer_type == "AdamWSwap":
+            if self.config.optimizer.mem_fraction_static is not None:
+                kwargs["mem_fraction_static"] = self.config.optimizer.mem_fraction_static
+            if self.config.optimizer.state_keys is not None:
+                kwargs["state_keys"] = self.config.optimizer.state_keys
+            if self.config.optimizer.param_prefetch is not None:
+                kwargs["param_prefetch"] = self.config.optimizer.param_prefetch
 
         optimizer = OptimizerFactory.create(
             self.config.optimizer.optimizer_type,

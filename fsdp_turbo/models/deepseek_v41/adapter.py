@@ -61,6 +61,9 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         token_types: torch.LongTensor | None = None,
         use_cache: bool = False,
         output_hidden_states: bool = False,
+        sfa_layout: Literal["BSND", "TND"] = "BSND",
+        actual_seq_len: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
         **model_inputs,
     ) -> DeepseekV41CausalLMOutput:
         if use_cache:
@@ -73,17 +76,69 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         if images is not None and not self.model_args.vision_enabled:
             raise ValueError("Image inputs require an enabled DeepSeek vision tower.")
 
+        if isinstance(sfa_layout, (list, tuple)):
+            if len(sfa_layout) != 1:
+                raise ValueError("A batch must use one common sfa_layout.")
+            sfa_layout = sfa_layout[0]
+        sfa_layout = sfa_layout.upper()
+        if sfa_layout not in ("BSND", "TND"):
+            raise ValueError(f"sfa_layout must be BSND or TND, got {sfa_layout!r}.")
+        cu_seqlens = None
+        if sfa_layout == "TND":
+            if not self.model_args.use_sparse_flash_attn:
+                raise ValueError("sfa_layout='TND' requires use_sparse_flash_attn=True.")
+            if input_ids.ndim != 2 or input_ids.size(0) != 1:
+                raise ValueError("TND requires input_ids with shape [1, total_tokens].")
+            if actual_seq_len is None:
+                raise ValueError("actual_seq_len is required when sfa_layout='TND'.")
+            actual_seq_len = actual_seq_len.reshape(-1).to(device=input_ids.device, dtype=torch.int32)
+            if actual_seq_len.numel() == 0:
+                raise ValueError("actual_seq_len must contain at least one sequence end.")
+            if actual_seq_len[0].item() <= 0 or not torch.all(actual_seq_len[1:] > actual_seq_len[:-1]).item():
+                raise ValueError("actual_seq_len must be strictly increasing and positive.")
+            if actual_seq_len[-1].item() != input_ids.numel():
+                raise ValueError(f"actual_seq_len must finish at the flattened token count {input_ids.numel()}.")
+            cu_seqlens = F.pad(actual_seq_len, (1, 0), value=0).contiguous()
+            sequence_lengths = torch.diff(cu_seqlens)
+            for ratio in set(self.model_args.compress_ratios):
+                if ratio and torch.any(sequence_lengths % ratio != 0).item():
+                    raise ValueError(
+                        "TND sequence lengths must be divisible by every active "
+                        f"compression ratio; ratio={ratio}, lengths={sequence_lengths.tolist()}."
+                    )
+            if cu_seqlens.numel() > 2:
+                if self.model_args.use_fused_compressor:
+                    raise NotImplementedError("Packed TND does not yet support the fused compressor.")
+                if self.model_args.use_fused_lightning_indexer:
+                    raise NotImplementedError("Packed TND does not yet support fused lightning indexers.")
+            if position_ids is not None:
+                expected_position_ids = torch.cat(
+                    [torch.arange(length, device=input_ids.device) for length in sequence_lengths.tolist()]
+                ).reshape_as(input_ids)
+                if not torch.equal(position_ids.to(device=input_ids.device), expected_position_ids):
+                    raise ValueError("Packed TND position_ids must restart at zero for every document.")
+        elif actual_seq_len is not None:
+            raise ValueError("actual_seq_len is only valid when sfa_layout='TND'.")
+        elif position_ids is not None:
+            raise ValueError("position_ids is currently only valid for TND input.")
+
         hidden_states, _, collected_hidden_states = self.model.forward_backbone(
             input_ids,
             images=images,
             token_types=token_types,
             attention_mask=attention_mask,
             output_hidden_states=output_hidden_states,
+            sfa_layout=sfa_layout,
+            cu_seqlens=cu_seqlens,
         )
         logits = self.model.head(hidden_states, full_logits=True)
 
         loss = None
         if labels is not None:
+            if cu_seqlens is not None and cu_seqlens.numel() > 2:
+                labels = labels.clone()
+                boundary_starts = cu_seqlens[1:-1].to(device=labels.device, dtype=torch.long)
+                labels.view(-1)[boundary_starts] = -100
             shift_logits = logits[:, :-1].contiguous().float()
             shift_labels = labels[:, 1:].contiguous().to(shift_logits.device)
             if attention_mask is not None:

@@ -11,6 +11,7 @@ from fsdp_turbo.models.deepseek_v41 import (
     build_deepseek_v41_model,
     build_deepseek_v41_model_args,
     initialize_deepseek_v41_model,
+    prepare_deepseek_v41_tokenizer,
     prepare_deepseek_v41_model_for_fsdp,
 )
 from fsdp_turbo.models.deepseek_v41.engram_optimizer import EngramSchedulerContainer
@@ -35,14 +36,24 @@ class DeepseekV41Trainer(BaseTrainer):
         tokenizer = PreTrainedTokenizerFast.from_pretrained(
             self.config.model.tokenizer_name_or_path,
         )
-        return DeepSeekV41Processor(tokenizer, self._model_args())
+        model_args = self._model_args()
+        if prepare_deepseek_v41_tokenizer(tokenizer, model_args):
+            self._using_validation_tokenizer = True
+        return DeepSeekV41Processor(tokenizer, model_args)
 
     def build_model(self):
         from fsdp_turbo.fsdp_turbo import FSDPTurbo
 
         print_rank(logger.info, "> Building DeepSeek-V4.1-Flash reference model...")
+        model_args = self._model_args()
+        if getattr(self, "_using_validation_tokenizer", False):
+            model_args = replace(
+                model_args,
+                engram_layer_ids=(),
+                engram_num_embeddings=(),
+            )
         training_model = build_deepseek_v41_model(
-            model_args=self._model_args(),
+            model_args=model_args,
             tokenizer=self.tokenizer,
             engram_storage_backend=self.config.model.engram_storage_backend,
             use_sparse_flash_attn=self.config.model.use_sparse_flash_attn,
@@ -120,6 +131,12 @@ def parse_arguments():
         help="Override checkpoint output directory",
     )
     parser.add_argument("--max-steps", type=int, default=None, help="Override run.max_steps")
+    parser.add_argument(
+        "--dataset-path",
+        type=str,
+        default=None,
+        help="Override data.dataset_path",
+    )
     return parser.parse_args()
 
 
@@ -136,6 +153,9 @@ def main():
     if parsed_arguments.max_steps is not None:
         run_config = replace(fsdp_config.run, max_steps=parsed_arguments.max_steps)
         fsdp_config = replace(fsdp_config, run=run_config)
+    if parsed_arguments.dataset_path:
+        data_config = replace(fsdp_config.data, dataset_path=parsed_arguments.dataset_path)
+        fsdp_config = replace(fsdp_config, data=data_config)
 
     trainer = DeepseekV41Trainer(config=fsdp_config)
     trainer.setup()

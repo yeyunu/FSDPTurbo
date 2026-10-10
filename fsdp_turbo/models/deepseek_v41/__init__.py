@@ -9,7 +9,7 @@ from .adapter import (
     prepare_deepseek_v41_model_for_fsdp,
 )
 from .experts import DeepSeekV41Experts
-from .processor import DeepSeekV41Processor
+from .processor import DeepSeekV41Processor, prepare_deepseek_v41_tokenizer
 from .image_processor import ImageInput
 
 __all__ = [
@@ -22,4 +22,5 @@ __all__ = [
     "build_deepseek_v41_model_args",
     "initialize_deepseek_v41_model",
     "prepare_deepseek_v41_model_for_fsdp",
+    "prepare_deepseek_v41_tokenizer",
 ]

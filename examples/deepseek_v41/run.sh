@@ -37,4 +37,4 @@ torchrun \
     --master_addr=$MASTER_ADDR \
     --master_port=$MASTER_PORT \
     train.py \
-    --config "$CONFIG_FILE" | tee dsv41_8p.log
+    --config "$CONFIG_FILE" "$@" | tee dsv41_8p.log

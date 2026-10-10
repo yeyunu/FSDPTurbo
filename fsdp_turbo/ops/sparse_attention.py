@@ -17,6 +17,8 @@ def indexed_sparse_attention(
     compressed_topk_indices=None,
     compress_ratio=1,
     window_size=128,
+    layout="BSND",
+    cu_seqlens=None,
 ):
     """Apply differentiable attention over explicitly selected KV positions."""
     device_type = "cpu" if use_eager else None
@@ -33,6 +35,8 @@ def indexed_sparse_attention(
         compressed_topk_indices,
         compress_ratio,
         window_size,
+        layout,
+        cu_seqlens,
         device_type=device_type,
     )
 

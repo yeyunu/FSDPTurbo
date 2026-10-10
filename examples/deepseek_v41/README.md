@@ -33,16 +33,43 @@ bash run.sh
 DeepSeek-V4.1 的 CSA2、稀疏索引和 Engram 结构。它不读取官方发布的 FP8/FP4 权重；
 模型参数以 BF16 随机初始化。
 
-默认使用预处理后的多模态数据集
-`/home/g00878035/DSV41/datasets/fsdp_turbo/processed_llava.json`，字段为
-`messages + images`。
-
-示例沿用仓库现有的通用多模态 dataloader，不额外修改其数据格式和加载行为。
-数据集中的图像路径应为绝对路径，或相对于运行时工作目录可解析。
+TND 示例配置使用 `data.dataset_path` 指向 packed JSONL 数据集；每条记录的
+`documents` 包含一个或多个已预处理文档。准备好 `messages + images` 格式的
+JSONL 后，用本目录的 `pack_deepseek_v41_tnd.py` 打包。图像路径应为绝对路径，或相对于
+运行时工作目录可解析。
 
 ```json
 {"messages":[{"role":"user","content":"描述这张图片"},{"role":"assistant","content":"图片内容是……"}],"images":["/path/to/image.jpg"]}
 ```
+
+## TND 与 BSND 训练
+
+原有 `config.yaml` 保持原样，用于原有非打包数据；`config_tnd.yaml` 用于 TND，
+开启 SparseFlashMla 和 `fixed_router`。`data.sfa_layout: TND` 将同一记录里的文档拼接到 token 维，向
+SparseFlashMla 传递逐文档的 `actual_seq_len`，并隔离注意力、位置编码及 loss。
+对 packed 数据显式设置 `BSND` 时，同一数据集按 batch 维填充，便于比较。两种布局都要求
+`model.use_sparse_flash_attn: true`；多文档 TND 当前不能与 fused compressor 或
+fused lightning indexer 同时使用。
+
+```bash
+python examples/deepseek_v41/pack_deepseek_v41_tnd.py \
+  --input /path/to/normalized.jsonl \
+  --output /path/to/packed.jsonl \
+  --tokenizer examples/deepseekv4/tokenizer \
+  --max-seq-length 1024
+
+# TND 配置默认使用 ./data/packed.jsonl；可在启动时传入实际数据路径。
+CONFIG_FILE=config_tnd.yaml bash examples/deepseek_v41/run.sh \
+  --dataset-path /path/to/packed.jsonl
+```
+
+使用同一 packed 数据集比较 TND/BSND 时，请另建本地 BSND 配置副本，显式设
+`data.sfa_layout: BSND` 和 `model.use_sparse_flash_attn: true`；不要改动原有
+`config.yaml`。若比较 loss 或梯度，两份临时配置还应都关闭 `fixed_router`，
+并保持种子和其余训练参数一致：当前固定路由按展平后的 token 序号分配专家，
+BSND 的 padding 会改变序号。在 A2/A3 上使用没有压缩 KV 的
+SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
+使用默认值。
 
 ## 当前支持范围
 
@@ -53,6 +80,7 @@ DeepSeek-V4.1 的 CSA2、稀疏索引和 Engram 结构。它不读取官方发�
 | 共享专家 SwiGLU tensor parallel | 支持 |
 | 路由专家 expert parallel | 支持 |
 | Padding attention mask | 支持 |
+| Packed TND/BSND SparseFlashMla 训练 | 支持；需配套 CANN 算子包 |
 | 官方 FP8/FP4 checkpoint 加载 | 暂不支持 |
 | V4.1 attention tensor/context parallel | 暂不支持 |
 | CSA2 跨层压缩状态与稀疏索引结构 | 支持构造与结构验证 |

@@ -1,7 +1,6 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """NPU implementations for differentiable indexed sparse attention."""
 
-from functools import lru_cache
 import os
 
 import torch
@@ -21,10 +20,28 @@ def _get_cann_ops():
     return ops
 
 
-def _residual_tensor(residual: int, batch_size: int, device, required: bool):
+def _cmp_mask_mode(has_compressed_kv: bool) -> int:
+    if has_compressed_kv:
+        return 3
+    mode = int(os.getenv("FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV", "0"))
+    if mode not in (0, 3):
+        raise ValueError("FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV must be 0 (A5) or 3 (A2/A3).")
+    return mode
+
+
+def _residual_tensor(residual, batch_size: int, device, required: bool):
     if not required:
         return None
+    if isinstance(residual, torch.Tensor):
+        return residual.to(device=device, dtype=torch.int32)
     return torch.full((batch_size,), residual, dtype=torch.int32, device=device)
+
+
+def _as_int32_cu_seqlens(cu_seqlens):
+    """Normalize cumulative sequence lengths at the CANN operator boundary."""
+    if cu_seqlens is None or cu_seqlens.dtype == torch.int32:
+        return cu_seqlens
+    return cu_seqlens.to(dtype=torch.int32)
 
 
 def _input_summary(
@@ -165,7 +182,6 @@ def _validate_sparse_flash_mla_inputs(
     )
 
 
-@lru_cache(maxsize=32)
 def _forward_metadata(
     batch_size,
     num_query_heads,
@@ -181,12 +197,20 @@ def _forward_metadata(
     window_size,
     device_type,
     device_index,
+    layout,
+    cu_seqlens,
+    cu_seqlens_cmp,
 ):
     device = torch.device(device_type, device_index)
+    cu_seqlens = _as_int32_cu_seqlens(cu_seqlens)
+    cu_seqlens_cmp = _as_int32_cu_seqlens(cu_seqlens_cmp)
     return _get_cann_ops().sparse_flash_mla_metadata(
         num_heads_q=num_query_heads,
         num_heads_kv=num_kv_heads,
         head_dim=head_dim,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_ori_kv=cu_seqlens,
+        cu_seqlens_cmp_kv=cu_seqlens_cmp,
         batch_size=batch_size,
         max_seqlen_q=query_length,
         max_seqlen_ori_kv=original_kv_length,
@@ -201,17 +225,16 @@ def _forward_metadata(
         cmp_topk=topk if has_compressed_kv else 0,
         cmp_ratio=compress_ratio,
         ori_mask_mode=4,
-        cmp_mask_mode=3 if has_compressed_kv else 0,
+        cmp_mask_mode=_cmp_mask_mode(has_compressed_kv),
         ori_win_left=window_size - 1,
         ori_win_right=0,
-        layout_q="BSND",
-        layout_kv="BSND",
+        layout_q=layout,
+        layout_kv=layout,
         has_ori_kv=True,
         has_cmp_kv=has_compressed_kv,
     )
 
 
-@lru_cache(maxsize=32)
 def _backward_metadata(
     batch_size,
     query_length,
@@ -227,12 +250,20 @@ def _backward_metadata(
     window_size,
     device_type,
     device_index,
+    layout,
+    cu_seqlens,
+    cu_seqlens_cmp,
 ):
     device = torch.device(device_type, device_index)
+    cu_seqlens = _as_int32_cu_seqlens(cu_seqlens)
+    cu_seqlens_cmp = _as_int32_cu_seqlens(cu_seqlens_cmp)
     return _get_cann_ops().sparse_flash_mla_grad_metadata(
         num_heads_q=num_query_heads,
         num_heads_kv=num_kv_heads,
         head_dim=head_dim,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_ori_kv=cu_seqlens,
+        cu_seqlens_cmp_kv=cu_seqlens_cmp,
         cmp_residual_kv=_residual_tensor(
             residual,
             batch_size,
@@ -247,11 +278,11 @@ def _backward_metadata(
         cmp_topk=topk if has_compressed_kv else 0,
         cmp_ratio=compress_ratio,
         ori_mask_mode=4,
-        cmp_mask_mode=3 if has_compressed_kv else 0,
+        cmp_mask_mode=_cmp_mask_mode(has_compressed_kv),
         ori_win_left=window_size - 1,
         ori_win_right=0,
-        layout_q="BSND",
-        layout_kv="BSND",
+        layout_q=layout,
+        layout_kv=layout,
         has_ori_kv=True,
         has_cmp_kv=has_compressed_kv,
     )
@@ -269,14 +300,44 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
         softmax_scale,
         compress_ratio,
         window_size,
+        layout,
+        cu_seqlens,
     ):
-        batch_size, query_length, num_query_heads, head_dim = query.shape
-        num_kv_heads = original_kv.shape[2]
-        original_kv_length = original_kv.shape[1]
+        if layout == "TND":
+            _, num_query_heads, head_dim = query.shape
+            batch_size = cu_seqlens.numel() - 1
+            num_kv_heads = original_kv.shape[1]
+            query_length = int(torch.diff(cu_seqlens).max().item())
+            original_kv_length = query_length
+            sequence_lengths = torch.diff(cu_seqlens)
+            if compressed_kv is not None:
+                compressed_lengths = torch.div(sequence_lengths, compress_ratio, rounding_mode="floor")
+                cu_seqlens_cmp = torch.nn.functional.pad(
+                    compressed_lengths.cumsum(0, dtype=torch.int32),
+                    (1, 0),
+                    value=0,
+                )
+                residual = torch.remainder(sequence_lengths, compress_ratio)
+            else:
+                cu_seqlens_cmp = None
+                residual = 0
+        else:
+            batch_size, query_length, num_query_heads, head_dim = query.shape
+            num_kv_heads = original_kv.shape[2]
+            original_kv_length = original_kv.shape[1]
+            cu_seqlens_cmp = None
+            residual = original_kv_length % compress_ratio if compressed_kv is not None and compress_ratio != 1 else 0
         has_compressed_kv = compressed_kv is not None
-        compressed_kv_length = compressed_kv.shape[1] if has_compressed_kv else 0
+        cu_seqlens = _as_int32_cu_seqlens(cu_seqlens)
+        cu_seqlens_cmp = _as_int32_cu_seqlens(cu_seqlens_cmp)
+        compressed_kv_length = (
+            int(torch.diff(cu_seqlens_cmp).max().item())
+            if layout == "TND" and has_compressed_kv
+            else compressed_kv.shape[1]
+            if has_compressed_kv
+            else 0
+        )
         topk = compressed_indices.shape[-1] if has_compressed_kv else 0
-        residual = original_kv_length % compress_ratio if has_compressed_kv and compress_ratio != 1 else 0
         shape = (
             batch_size,
             query_length,
@@ -304,12 +365,18 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
             window_size,
             query.device.type,
             query.device.index,
+            layout,
+            cu_seqlens,
+            cu_seqlens_cmp,
         )
         result, softmax_lse = _get_cann_ops().sparse_flash_mla(
             query,
             ori_kv=original_kv,
             cmp_kv=compressed_kv,
             cmp_sparse_indices=compressed_indices,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_ori_kv=cu_seqlens,
+            cu_seqlens_cmp_kv=cu_seqlens_cmp,
             cmp_residual_kv=_residual_tensor(
                 residual,
                 batch_size,
@@ -321,11 +388,11 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
             softmax_scale=softmax_scale,
             cmp_ratio=compress_ratio,
             ori_mask_mode=4,
-            cmp_mask_mode=3 if has_compressed_kv else 0,
+            cmp_mask_mode=_cmp_mask_mode(has_compressed_kv),
             ori_win_left=window_size - 1,
             ori_win_right=0,
-            layout_q="BSND",
-            layout_kv="BSND",
+            layout_q=layout,
+            layout_kv=layout,
             return_softmax_lse=True,
         )
 
@@ -339,6 +406,9 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.residual = residual
         ctx.shape = shape
+        ctx.layout = layout
+        ctx.cu_seqlens = cu_seqlens
+        ctx.cu_seqlens_cmp = cu_seqlens_cmp
         ctx.mark_non_differentiable(softmax_lse)
         return result
 
@@ -359,6 +429,9 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
             device_type,
             device_index,
         ) = ctx.shape
+        layout = ctx.layout
+        cu_seqlens = ctx.cu_seqlens
+        cu_seqlens_cmp = ctx.cu_seqlens_cmp
         metadata = _backward_metadata(
             batch_size,
             query_length,
@@ -374,6 +447,9 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
             ctx.window_size,
             device_type,
             device_index,
+            layout,
+            cu_seqlens,
+            cu_seqlens_cmp,
         )
         gradients = _get_cann_ops().sparse_flash_mla_grad(
             query,
@@ -384,9 +460,9 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
             cmp_kv=compressed_kv,
             ori_sparse_indices=None,
             cmp_sparse_indices=compressed_indices,
-            cu_seqlens_q=None,
-            cu_seqlens_ori_kv=None,
-            cu_seqlens_cmp_kv=None,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_ori_kv=cu_seqlens,
+            cu_seqlens_cmp_kv=cu_seqlens_cmp,
             seqused_q=None,
             seqused_ori_kv=None,
             seqused_cmp_kv=None,
@@ -403,11 +479,11 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             cmp_ratio=ctx.compress_ratio,
             ori_mask_mode=4,
-            cmp_mask_mode=3 if ctx.has_compressed_kv else 0,
+            cmp_mask_mode=_cmp_mask_mode(ctx.has_compressed_kv),
             ori_win_left=ctx.window_size - 1,
             ori_win_right=0,
-            layout_q="BSND",
-            layout_kv="BSND",
+            layout_q=layout,
+            layout_kv=layout,
         )
         grad_query, grad_original_kv, grad_compressed_kv, grad_sinks = gradients[:4]
         return (
@@ -419,13 +495,15 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
 def _prepare_compressed_indices(indices: torch.Tensor, query: torch.Tensor):
-    if indices.ndim != 3:
-        raise ValueError("compressed_topk_indices must have shape [batch, query, topk]")
-    batch_size, query_length = query.shape[:2]
+    if indices.ndim not in (2, 3):
+        raise ValueError("compressed_topk_indices must have shape [B,S,K] or [T,K]")
+    prefix_shape = indices.shape[:-1]
     topk = indices.shape[-1]
     padded_topk = 512 if topk <= 512 else 1024
     if topk > padded_topk:
@@ -435,11 +513,12 @@ def _prepare_compressed_indices(indices: torch.Tensor, query: torch.Tensor):
         indices = torch.cat(
             (
                 indices,
-                indices.new_full((batch_size, query_length, padded_topk - topk), -1),
+                indices.new_full((*prefix_shape, padded_topk - topk), -1),
             ),
             dim=-1,
         )
-    return indices.unsqueeze(2).contiguous()
+    # CANN expects [..., N, K]: [B,S,1,K] for BSND and [T,1,K] for TND.
+    return indices.unsqueeze(-2).contiguous()
 
 
 def npu_sparse_flash_mla(
@@ -451,34 +530,80 @@ def npu_sparse_flash_mla(
     softmax_scale: float,
     compress_ratio: int,
     window_size: int,
+    layout: str = "BSND",
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run BSND SparseFlashMla forward and SparseFlashMlaGrad backward."""
+    """Run SparseFlashMla in BSND or packed TND layout."""
+    layout = layout.upper()
+    if layout not in ("BSND", "TND"):
+        raise ValueError(f"SparseFlashMla layout must be BSND or TND, got {layout!r}")
+    if layout == "TND":
+        if cu_seqlens is None:
+            raise ValueError("cu_seqlens is required for SparseFlashMla TND layout")
+        if query.ndim != 3 or original_kv.ndim != 2:
+            raise ValueError("TND expects query [T,N,D] and original_kv [T,D]")
+        if compressed_kv is not None and compressed_kv.ndim != 2:
+            raise ValueError("TND expects compressed_kv with shape [Tcmp,D]")
+        if cu_seqlens.dtype != torch.int32 or cu_seqlens.device != query.device:
+            cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32)
+        if cu_seqlens[0].item() != 0 or cu_seqlens[-1].item() != query.shape[0]:
+            raise ValueError("TND cu_seqlens must span all query tokens")
+        if not torch.all(cu_seqlens[1:] > cu_seqlens[:-1]).item():
+            raise ValueError("TND cu_seqlens must be strictly increasing")
+        if original_kv.shape[0] != query.shape[0]:
+            raise ValueError("TND original KV must span all query tokens")
+        if compressed_kv is not None:
+            expected_compressed_tokens = int(
+                torch.div(
+                    torch.diff(cu_seqlens),
+                    compress_ratio,
+                    rounding_mode="floor",
+                )
+                .sum()
+                .item()
+            )
+            if compressed_kv.shape[0] != expected_compressed_tokens:
+                raise ValueError(
+                    "TND compressed KV length must equal the sum of per-document "
+                    f"floor(length / ratio): expected {expected_compressed_tokens}, "
+                    f"got {compressed_kv.shape[0]}"
+                )
+    else:
+        if cu_seqlens is not None:
+            raise ValueError("cu_seqlens must be None for BSND layout")
     compress_ratio = compress_ratio or 1
-    _validate_sparse_flash_mla_inputs(
-        query,
-        original_kv,
-        compressed_kv,
-        compressed_indices,
-        attention_sink,
-        compress_ratio,
-        window_size,
-    )
+    if layout == "BSND":
+        _validate_sparse_flash_mla_inputs(
+            query,
+            original_kv,
+            compressed_kv,
+            compressed_indices,
+            attention_sink,
+            compress_ratio,
+            window_size,
+        )
     if compressed_kv is not None:
         if compressed_indices is None:
             raise ValueError("compressed_topk_indices is required with compressed_key_value")
         compressed_indices = _prepare_compressed_indices(compressed_indices, query)
-        compressed_kv = compressed_kv.unsqueeze(2)
+        compressed_kv = compressed_kv.unsqueeze(2 if layout == "BSND" else 1)
     elif compressed_indices is not None:
         raise ValueError("compressed_key_value is required with compressed_topk_indices")
+    if layout == "BSND":
+        original_kv = original_kv.unsqueeze(2)
+    else:
+        original_kv = original_kv.unsqueeze(1)
     return _SparseFlashMlaFunction.apply(
         query,
-        original_kv.unsqueeze(2),
+        original_kv,
         compressed_kv,
         compressed_indices,
         attention_sink.float(),
         softmax_scale,
         compress_ratio,
         window_size,
+        layout,
+        cu_seqlens,
     )
 
 
@@ -495,6 +620,8 @@ def indexed_sparse_attention_npu(
     compressed_topk_indices: torch.Tensor | None = None,
     compress_ratio: int = 1,
     window_size: int = 128,
+    layout: str = "BSND",
+    cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Use SparseFlashMla when requested, otherwise run semantic PyTorch."""
     if use_sparse_flash_attn:
@@ -507,6 +634,8 @@ def indexed_sparse_attention_npu(
             softmax_scale,
             compress_ratio,
             window_size,
+            layout,
+            cu_seqlens,
         )
     return indexed_sparse_attention_torch(
         query,
@@ -515,6 +644,8 @@ def indexed_sparse_attention_npu(
         topk_indices,
         softmax_scale,
         attention_mask,
+        layout=layout,
+        cu_seqlens=cu_seqlens,
     )
 
 

@@ -79,6 +79,9 @@ class DataConfig:
     image_column: str = "images"
     media_key: str = "images"
     conversation_column: str = "messages"
+    # DeepSeek V4.1 packed JSONL can run with documents on the token (TND)
+    # or batch (BSND) axis. None preserves the record's layout.
+    sfa_layout: Optional[str] = None
 
 
 @dataclass
@@ -300,6 +303,8 @@ class FSDPTurboConfig:
             raise ValueError(
                 f"data.media_key must be one of {sorted(supported_media_keys)}, got {self.data.media_key!r}."
             )
+        if self.data.sfa_layout not in (None, "BSND", "TND"):
+            raise ValueError("data.sfa_layout must be BSND, TND, or null.")
         if self.data.is_multimodal:
             if not isinstance(self.data.image_column, str) or not self.data.image_column:
                 raise ValueError("data.image_column must be a non-empty string for multimodal data.")

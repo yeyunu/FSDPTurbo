@@ -56,6 +56,22 @@ class _Processor:
 
 
 class DataloaderTests(unittest.TestCase):
+    def test_packed_record_layout_comes_from_shared_data_config(self):
+        processor = _Processor()
+        dataset = _MappedDataset([{"documents": [{"dialogue": [], "pictures": []}]}])
+        result = _process_multimodal_dataset(
+            dataset,
+            DataConfig(
+                is_multimodal=True,
+                image_column="pictures",
+                conversation_column="dialogue",
+                sfa_layout="BSND",
+            ),
+            processor,
+        )
+        self.assertEqual(result.rows[0]["sfa_layout"], "BSND")
+        self.assertEqual(len(result.rows[0]["documents"]), 1)
+
     def test_multimodal_config_has_public_schema(self):
         config = DataConfig(
             is_multimodal=True,

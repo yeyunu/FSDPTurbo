@@ -59,19 +59,39 @@ class Attention(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        sequence_lengths: list[int] | None = None,
     ) -> torch.Tensor:
         n = x.size(0)
         q, k, v = (t.view(n, self.n_heads, self.head_dim) for t in self.wqkv(x).chunk(3, dim=-1))
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
-        if self.use_fused_vision_flash_attn:
-            o = fused_vision_flash_attention(
-                q.unsqueeze(0),
-                k.unsqueeze(0),
-                v.unsqueeze(0),
-            ).squeeze(0)
+
+        def attend(q_part, k_part, v_part):
+            if self.use_fused_vision_flash_attn:
+                return fused_vision_flash_attention(
+                    q_part.unsqueeze(0),
+                    k_part.unsqueeze(0),
+                    v_part.unsqueeze(0),
+                ).squeeze(0)
+            return F.scaled_dot_product_attention(
+                q_part.transpose(0, 1),
+                k_part.transpose(0, 1),
+                v_part.transpose(0, 1),
+            ).transpose(0, 1)
+
+        if sequence_lengths is None:
+            o = attend(q, k, v)
         else:
-            o = F.scaled_dot_product_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)).transpose(0, 1)
+            # QKV projections run once so every FSDP-wrapped vision block has
+            # one collective sequence per training step. Attention itself is
+            # split locally to keep images fully isolated from one another.
+            q_parts = q.split(sequence_lengths, dim=0)
+            k_parts = k.split(sequence_lengths, dim=0)
+            v_parts = v.split(sequence_lengths, dim=0)
+            o = torch.cat(
+                [attend(q_part, k_part, v_part) for q_part, k_part, v_part in zip(q_parts, k_parts, v_parts)],
+                dim=0,
+            )
         return self.wo(o.reshape(n, -1))
 
 
@@ -99,8 +119,9 @@ class Block(nn.Module):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
+        sequence_lengths: list[int] | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), cos, sin)
+        x = x + self.attn(self.norm1(x), cos, sin, sequence_lengths)
         return x + self.mlp(self.norm2(x))
 
 
@@ -111,6 +132,7 @@ class ViT(nn.Module):
         super().__init__()
         self.rope_dim = args.vision_dim // args.vision_n_heads // 2
         self.rope_theta = args.vision_rope_theta
+        self.patch_size = args.vision_patch_size
         self.patch_embed = PatchEmbed(args)
         self.blocks = nn.ModuleList([Block(args) for _ in range(args.vision_n_layers)])
         self.norm = RMSNorm(args.vision_dim)
@@ -124,6 +146,21 @@ class ViT(nn.Module):
             x = block(x, cos, sin)
         return self.norm(x)
 
+    def forward_packed(
+        self,
+        patches: list[torch.Tensor],
+        grid_sizes: list[tuple[int, int]],
+    ) -> list[torch.Tensor]:
+        """Encode multiple images with one invocation of every FSDP module."""
+        sequence_lengths = [patch.shape[0] for patch in patches]
+        x = self.patch_embed(torch.cat(patches, dim=0))
+        rope = [get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta) for n_h, n_w in grid_sizes]
+        cos = torch.cat([item[0] for item in rope], dim=0).to(x.device)
+        sin = torch.cat([item[1] for item in rope], dim=0).to(x.device)
+        for block in self.blocks:
+            x = block(x, cos, sin, sequence_lengths)
+        return list(self.norm(x).split(sequence_lengths, dim=0))
+
 
 class Aligner(nn.Module):
     def __init__(self, args):
@@ -133,9 +170,29 @@ class Aligner(nn.Module):
         self.w1 = nn.Linear(in_dim, args.dim)
         self.w2 = nn.Linear(args.dim, args.dim)
 
-    def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+    def forward(self, x, n_h, n_w=None):
+        if isinstance(x, (list, tuple)):
+            return self._forward_packed(x, n_h)
         r = self.downsample_ratio
         x = x.view(n_h, n_w, -1).permute(2, 0, 1)
         x = F.pad(x, (0, -n_w % r, 0, -n_h % r))
         x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
         return self.w2(F.gelu(self.w1(x)))
+
+    def _forward_packed(
+        self,
+        features: list[torch.Tensor],
+        grid_sizes: list[tuple[int, int]],
+    ) -> list[torch.Tensor]:
+        """Align multiple isolated image grids with one FSDP module call."""
+        packed = []
+        output_lengths = []
+        r = self.downsample_ratio
+        for x, (n_h, n_w) in zip(features, grid_sizes):
+            x = x.view(n_h, n_w, -1).permute(2, 0, 1)
+            x = F.pad(x, (0, -n_w % r, 0, -n_h % r))
+            x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
+            packed.append(x)
+            output_lengths.append(x.shape[0])
+        output = self.w2(F.gelu(self.w1(torch.cat(packed, dim=0))))
+        return list(output.split(output_lengths, dim=0))

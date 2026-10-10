@@ -12,6 +12,32 @@ SYSTEM_TOKEN = "<｜System｜>"  # nosec B105 - model vocabulary marker, not a c
 USER_TOKEN = "<｜User｜>"  # nosec B105 - model vocabulary marker, not a credential
 ASSISTANT_TOKEN = "<｜Assistant｜>"  # nosec B105 - model vocabulary marker, not a credential
 THINKING_END_TOKEN = "</think>"  # nosec B105 - model vocabulary marker, not a credential
+IMAGE_TOKEN = "<｜deepseek_image｜>"  # nosec B105 - model vocabulary marker, not a credential
+
+
+def prepare_deepseek_v41_tokenizer(tokenizer, model_args) -> bool:
+    """Ensure the validation tokenizer uses the model's fixed image-token ID.
+
+    Returns ``True`` when reserved tokens had to be added. Callers use this to
+    disable Engram for the synthetic validation vocabulary.
+    """
+    image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
+    if image_token_id is None:
+        missing_before_image = model_args.image_token_id - len(tokenizer)
+        if missing_before_image < 0:
+            raise ValueError(
+                "Tokenizer is missing the image token but its vocabulary already "
+                "extends beyond the configured image_token_id."
+            )
+        reserved = [f"<｜reserved_image_prefix_{index}｜>" for index in range(missing_before_image)]
+        tokenizer.add_special_tokens({"additional_special_tokens": reserved + [IMAGE_TOKEN]})
+        image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
+        added_tokens = True
+    else:
+        added_tokens = False
+    if image_token_id != model_args.image_token_id:
+        raise ValueError(f"Image token id mismatch: tokenizer={image_token_id}, model={model_args.image_token_id}.")
+    return added_tokens
 
 
 def _render_content(content) -> str:
@@ -140,4 +166,8 @@ class DeepSeekV41Processor:
         }
 
 
-__all__ = ["DeepSeekV41Processor", "encode_chat_messages"]
+__all__ = [
+    "DeepSeekV41Processor",
+    "encode_chat_messages",
+    "prepare_deepseek_v41_tokenizer",
+]

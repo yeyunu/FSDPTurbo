@@ -13,6 +13,9 @@ through the processor's chat template before collation.
 
 import json
 import logging
+import math
+import os
+from dataclasses import replace
 
 import torch
 
@@ -51,9 +54,17 @@ def build_dataloader(data_cfg, tokenizer=None, processor=None):
     if data_cfg.is_multimodal:
         if processor is None:
             raise ValueError("A processor is required when data.is_multimodal is enabled.")
-        dataset = load_dataset("json", data_files=data_cfg.dataset_path, split=data_cfg.split)
-        dataset = _process_multimodal_dataset(dataset, data_cfg, processor)
-        collate_fn = _MultimodalCollator(processor, data_cfg.image_column, data_cfg.media_key)
+        if _is_local_jsonl(data_cfg.dataset_path):
+            dataset = _LocalJsonlMultimodalDataset(data_cfg.dataset_path, data_cfg, processor)
+        else:
+            dataset = load_dataset("json", data_files=data_cfg.dataset_path, split=data_cfg.split)
+            dataset = _process_multimodal_dataset(dataset, data_cfg, processor)
+        collate_fn = _MultimodalCollator(
+            processor,
+            data_cfg.image_column,
+            data_cfg.media_key,
+            data_cfg=data_cfg,
+        )
     else:
         dataset = load_dataset(data_cfg.dataset_path, data_cfg.dataset_config, split=data_cfg.split)
         dataset = _process_text_dataset(dataset, data_cfg, tokenizer) if tokenizer is not None else dataset
@@ -88,6 +99,38 @@ def build_dataloader(data_cfg, tokenizer=None, processor=None):
     )
 
 
+def _is_local_jsonl(dataset_path):
+    return (
+        isinstance(dataset_path, (str, os.PathLike))
+        and os.path.isfile(dataset_path)
+        and str(dataset_path).lower().endswith((".jsonl", ".jsonlines"))
+    )
+
+
+class _LocalJsonlMultimodalDataset(torch.utils.data.Dataset):
+    """Lazily read local JSONL without building a Hugging Face Arrow cache."""
+
+    def __init__(self, path, data_cfg, processor):
+        self.path = os.fspath(path)
+        self.data_cfg = data_cfg
+        self.processor = processor
+        self.offsets = []
+        with open(self.path, "rb") as stream:
+            while stream.readline():
+                self.offsets.append(stream.tell())
+        self.offsets.insert(0, 0)
+        self.offsets.pop()
+
+    def __len__(self):
+        return len(self.offsets)
+
+    def __getitem__(self, index):
+        with open(self.path, "rb") as stream:
+            stream.seek(self.offsets[index])
+            example = json.loads(stream.readline())
+        return _process_multimodal_example(example, self.data_cfg, self.processor)
+
+
 def _process_text_dataset(dataset, data_cfg, tokenizer):
     def tokenize_function(examples):
         return tokenizer(
@@ -108,53 +151,92 @@ def _process_text_dataset(dataset, data_cfg, tokenizer):
 
 
 def _process_multimodal_dataset(dataset, data_cfg, processor):
-    conversation_column = data_cfg.conversation_column
-    image_column = data_cfg.image_column
-
     def process_example(example):
-        messages_raw = example[conversation_column]
-        if isinstance(messages_raw, str):
-            messages_raw = json.loads(messages_raw)
-
-        images_raw = example.get(image_column, None)
-        if isinstance(images_raw, str):
-            images_raw = json.loads(images_raw)
-
-        image_paths = images_raw or []
-        messages = []
-        image_inserted = False
-        for message in messages_raw:
-            role = message.get("role", "")
-            content = message.get("content", "")
-            if role == "user":
-                if image_paths and not image_inserted:
-                    user_content = [{"type": "image"}]
-                    text = content.replace("<image>", "").strip()
-                    if text:
-                        user_content.append({"type": "text", "text": text})
-                    messages.append({"role": "user", "content": user_content})
-                    image_inserted = True
-                else:
-                    messages.append({"role": "user", "content": content})
-            elif role == "assistant":
-                messages.append({"role": "assistant", "content": content})
-
-        return {
-            "text": processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False),
-            image_column: image_paths,
-        }
+        return _process_multimodal_example(example, data_cfg, processor)
 
     return dataset.map(process_example, remove_columns=dataset.column_names)
 
 
+def _process_multimodal_example(example, data_cfg, processor):
+    conversation_column = data_cfg.conversation_column
+    image_column = data_cfg.image_column
+    if example.get("documents"):
+        documents = []
+        for document in example["documents"]:
+            rendered = _render_multimodal_record(
+                document.get(conversation_column, []),
+                document.get(image_column, []),
+                processor,
+                image_column,
+            )
+            documents.append(rendered)
+        return {
+            "documents": documents,
+            "sfa_layout": data_cfg.sfa_layout or "TND",
+        }
+
+    if data_cfg.sfa_layout == "TND":
+        raise ValueError("data.sfa_layout=TND requires packed records with documents.")
+
+    return _render_multimodal_record(
+        example[conversation_column],
+        example.get(image_column, None),
+        processor,
+        image_column,
+    )
+
+
+def _render_multimodal_record(messages_raw, images_raw, processor, image_column):
+    if isinstance(messages_raw, str):
+        messages_raw = json.loads(messages_raw)
+
+    if isinstance(images_raw, str):
+        images_raw = json.loads(images_raw)
+
+    image_paths = images_raw or []
+    messages = []
+    image_inserted = False
+    for message in messages_raw:
+        role = message.get("role", "")
+        content = message.get("content", "")
+        if role == "user":
+            if image_paths and not image_inserted:
+                user_content = [{"type": "image"}]
+                text = content.replace("<image>", "").strip()
+                if text:
+                    user_content.append({"type": "text", "text": text})
+                messages.append({"role": "user", "content": user_content})
+                image_inserted = True
+            else:
+                messages.append({"role": "user", "content": content})
+        elif role == "assistant":
+            messages.append({"role": "assistant", "content": content})
+
+    return {
+        "text": processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False),
+        image_column: image_paths,
+    }
+
+
 class _MultimodalCollator:
-    def __init__(self, processor, image_column, media_key="images"):
+    def __init__(self, processor, image_column, media_key="images", data_cfg=None):
         self.processor = processor
         self.image_column = image_column
         self.media_key = media_key
+        self.data_cfg = data_cfg
 
     def __call__(self, features):
         from PIL import Image
+
+        if any(feature.get("documents") for feature in features):
+            if len(features) != 1:
+                raise ValueError("Packed multimodal records require data.batch_size=1.")
+            layout = features[0].get("sfa_layout", "TND")
+            if layout == "TND":
+                return self._collate_tnd(features[0]["documents"], Image)
+            if layout == "BSND":
+                return self._collate_bsnd_documents(features[0]["documents"], Image)
+            raise ValueError(f"Unsupported packed sfa_layout: {layout!r}")
 
         texts = [feature["text"] for feature in features]
         images = []
@@ -196,3 +278,125 @@ class _MultimodalCollator:
             labels[labels == media_token_id] = -100
         batch["labels"] = labels
         return batch
+
+    def _process_packed_documents(self, documents, image_module):
+        if not documents:
+            raise ValueError("Packed training requires at least one document.")
+        max_seq_length = getattr(
+            self.data_cfg,
+            "max_seq_length",
+            getattr(getattr(self.processor, "model_args", None), "max_seq_len", 4096),
+        )
+        parts = []
+        compression_alignment = math.lcm(
+            *(
+                ratio
+                for ratio in getattr(
+                    getattr(self.processor, "model_args", None),
+                    "compress_ratios",
+                    (1,),
+                )
+                if ratio > 0
+            )
+        )
+        for document in documents:
+            images = []
+            for path in document.get(self.image_column, []):
+                with image_module.open(path) as image:
+                    images.append(image.convert("RGB"))
+            part = self.processor(
+                text=[document["text"]],
+                images=images,
+                padding="longest",
+                truncation=True,
+                max_length=max_seq_length,
+                return_tensors="pt",
+            )
+            pad_length = (-part["input_ids"].shape[1]) % compression_alignment
+            if pad_length:
+                pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", 0)
+                part["input_ids"] = torch.nn.functional.pad(part["input_ids"], (0, pad_length), value=pad_token_id or 0)
+                part["attention_mask"] = torch.nn.functional.pad(part["attention_mask"], (0, pad_length), value=0)
+                part["token_types"] = torch.nn.functional.pad(part["token_types"], (0, pad_length), value=-1)
+            parts.append(part)
+
+        lengths = [part["input_ids"].shape[1] for part in parts]
+        packed_total_tokens = sum(lengths)
+        if packed_total_tokens > max_seq_length:
+            raise ValueError(
+                "Packed record exceeds data.max_seq_length after multimodal "
+                f"expansion/alignment: document_lengths={lengths}, "
+                f"packed_total_tokens={packed_total_tokens}, "
+                f"max_seq_length={max_seq_length}. Repack the source data."
+            )
+        return parts, lengths, packed_total_tokens
+
+    def _collate_bsnd_documents(self, documents, image_module):
+        parts, lengths, _ = self._process_packed_documents(documents, image_module)
+        max_batch_size = getattr(getattr(self.processor, "model_args", None), "max_batch_size", None)
+        if max_batch_size is not None and len(parts) > max_batch_size:
+            raise ValueError(f"BSND pack has {len(parts)} documents, but model.max_batch_size={max_batch_size}.")
+        padded_length = max(lengths)
+        pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(self.processor.tokenizer, "eos_token_id", None)
+        if pad_token_id is None:
+            raise ValueError("BSND packing requires a pad or EOS token ID.")
+
+        def stack_padded(name, value):
+            return torch.cat(
+                [
+                    torch.nn.functional.pad(part[name], (0, padded_length - length), value=value)
+                    for part, length in zip(parts, lengths)
+                ],
+                dim=0,
+            )
+
+        input_ids = stack_padded("input_ids", pad_token_id)
+        attention_mask = stack_padded("attention_mask", 0)
+        token_types = stack_padded("token_types", -1)
+        labels = input_ids.clone()
+        labels[token_types >= 0] = -100
+        labels[~attention_mask.bool()] = -100
+        labels[labels == pad_token_id] = -100
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_types": token_types,
+            "images": [part.get("images", [None])[0] for part in parts],
+            "labels": labels,
+            "sfa_layout": "BSND",
+        }
+
+    def _collate_tnd(self, documents, image_module):
+        parts, lengths, _ = self._process_packed_documents(documents, image_module)
+        actual_seq_len = torch.tensor(lengths, dtype=torch.int32).cumsum(0)
+        input_ids = torch.cat([part["input_ids"] for part in parts], dim=1)
+        attention_mask = torch.cat([part["attention_mask"] for part in parts], dim=1)
+        token_types = torch.cat([part["token_types"] for part in parts], dim=1)
+
+        packed_images = []
+        offset = 0
+        for part, length in zip(parts, lengths):
+            for image in (part.get("images") or [None])[0] or ():
+                packed_images.append(replace(image, start=image.start + offset))
+            offset += length
+
+        labels = input_ids.clone()
+        labels[token_types >= 0] = -100
+        pad_token_id = getattr(self.processor.tokenizer, "pad_token_id", None)
+        if pad_token_id is not None:
+            labels[labels == pad_token_id] = -100
+
+        position_ids = torch.cat([torch.arange(length, dtype=torch.long) for length in lengths]).unsqueeze(0)
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_types": token_types,
+            "images": [packed_images or None],
+            "labels": labels,
+            "position_ids": position_ids,
+            "sfa_layout": "TND",
+            "actual_seq_len": actual_seq_len,
+        }

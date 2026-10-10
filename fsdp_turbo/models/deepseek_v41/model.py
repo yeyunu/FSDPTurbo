@@ -33,18 +33,54 @@ world_size = 1
 rank = 0
 default_dtype = torch.bfloat16
 _ACTIVE_ATTENTION_MASK: torch.Tensor | None = None
+_ACTIVE_SFA_LAYOUT = "BSND"
+_ACTIVE_CU_SEQLENS: torch.Tensor | None = None
+
+
+def _packed_sequence_lengths(total_tokens: int) -> list[int] | None:
+    """Return logical TND lengths when the active tensor is a packed sequence."""
+    if _ACTIVE_SFA_LAYOUT != "TND" or _ACTIVE_CU_SEQLENS is None:
+        return None
+    boundaries = _ACTIVE_CU_SEQLENS.tolist()
+    if len(boundaries) <= 2 or boundaries[0] != 0 or boundaries[-1] != total_tokens:
+        return None
+    return [end - start for start, end in zip(boundaries[:-1], boundaries[1:])]
+
+
+def _packed_freqs(freqs_cis: torch.Tensor, lengths: list[int], stride: int = 1):
+    """Build RoPE frequencies with positions restarted for every packed document."""
+    return torch.cat([freqs_cis[:length:stride] for length in lengths], dim=0)
+
+
+def _sequence_slices(lengths: list[int]):
+    ends = []
+    total = 0
+    for length in lengths:
+        total += length
+        ends.append(total)
+    return zip([0, *ends[:-1]], ends)
 
 
 @contextmanager
-def use_attention_mask(attention_mask: torch.Tensor | None):
+def use_attention_mask(
+    attention_mask: torch.Tensor | None,
+    sfa_layout: str = "BSND",
+    cu_seqlens: torch.Tensor | None = None,
+):
     """Expose the current padding mask to indexed sparse-attention calls."""
-    global _ACTIVE_ATTENTION_MASK
+    global _ACTIVE_ATTENTION_MASK, _ACTIVE_SFA_LAYOUT, _ACTIVE_CU_SEQLENS
     previous_attention_mask = _ACTIVE_ATTENTION_MASK
+    previous_sfa_layout = _ACTIVE_SFA_LAYOUT
+    previous_cu_seqlens = _ACTIVE_CU_SEQLENS
     _ACTIVE_ATTENTION_MASK = attention_mask
+    _ACTIVE_SFA_LAYOUT = sfa_layout
+    _ACTIVE_CU_SEQLENS = cu_seqlens
     try:
         yield
     finally:
         _ACTIVE_ATTENTION_MASK = previous_attention_mask
+        _ACTIVE_SFA_LAYOUT = previous_sfa_layout
+        _ACTIVE_CU_SEQLENS = previous_cu_seqlens
 
 
 @contextmanager
@@ -494,6 +530,14 @@ class Compressor(nn.Module):
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor | None:
         bsz, seqlen, _ = x.size()
         ratio, dtype = self.compress_ratio, x.dtype
+        packed_lengths = _packed_sequence_lengths(seqlen) if start_pos == 0 else None
+        if packed_lengths is not None:
+            compressed_parts = [self(x[:, start:end], 0) for start, end in _sequence_slices(packed_lengths)]
+            if any(part is None for part in compressed_parts):
+                raise ValueError(
+                    f"Every packed TND document must contain at least one complete compression group for ratio {ratio}."
+                )
+            return torch.cat(compressed_parts, dim=1)
         if ratio == 1:  # one token per group: nothing to pool, so no gate and no fp32
             return self.norm(self.wkv(x))
 
@@ -635,6 +679,54 @@ class Indexer(torch.nn.Module):
         assert self.freqs_cis is not None
         bsz, seqlen, _ = x.size()
         ratio, rd, end_pos = self.compress_ratio, self.rope_head_dim, start_pos + seqlen
+
+        packed_lengths = _packed_sequence_lengths(seqlen) if start_pos == 0 else None
+        if packed_lengths is not None:
+            compressed_lengths = [length // ratio for length in packed_lengths]
+            index_parts = []
+            key_parts = []
+            candidate_parts = []
+            full_index_k = shared_attn.index_k
+            packed_slices = zip(
+                _sequence_slices(packed_lengths),
+                _sequence_slices(compressed_lengths),
+            )
+            for document_index, (token_slice, compressed_slice) in enumerate(packed_slices):
+                token_start, token_end = token_slice
+                compressed_start, compressed_end = compressed_slice
+                part_latent = None if latent is None else latent[:, compressed_start:compressed_end]
+                if not self.owns_k:
+                    shared_attn.index_k = full_index_k[:, compressed_start:compressed_end]
+                if self.uses_candidates:
+                    if shared_attn.packed_candidates is None:
+                        raise RuntimeError("Packed candidate masks were not published by the source layer.")
+                    shared_attn.candidates = shared_attn.packed_candidates[document_index]
+                part_indices = self(
+                    x[:, token_start:token_end],
+                    qr[:, token_start:token_end],
+                    part_latent,
+                    0,
+                    offset,
+                )
+                if part_indices.shape[-1] < self.index_topk:
+                    part_indices = F.pad(
+                        part_indices,
+                        (0, self.index_topk - part_indices.shape[-1]),
+                        value=-1,
+                    )
+                index_parts.append(part_indices)
+                if self.is_candidate_source:
+                    candidate_parts.append(shared_attn.candidates)
+                if self.owns_k:
+                    key_parts.append(shared_attn.index_k[:, : compressed_end - compressed_start])
+            if self.owns_k:
+                shared_attn.index_k = torch.cat(key_parts, dim=1)
+            else:
+                shared_attn.index_k = full_index_k
+            if self.is_candidate_source:
+                shared_attn.packed_candidates = candidate_parts
+            shared_attn.candidates = None
+            return torch.cat(index_parts, dim=1)
 
         # latent is None while a group is still filling up, so there is nothing to publish yet
         if self.owns_k and latent is not None:
@@ -890,7 +982,12 @@ class Attention(nn.Module):
         """
         bsz, seqlen, _ = x.size()
         ratio = self.compress_ratio
-        compress_len = (start_pos + seqlen) // ratio
+        packed_lengths = _packed_sequence_lengths(seqlen) if start_pos == 0 else None
+        compress_len = (
+            sum(length // ratio for length in packed_lengths)
+            if packed_lengths is not None
+            else (start_pos + seqlen) // ratio
+        )
         latent = None
         if self.is_kv_source:
             latent = self.compressor(x, start_pos)
@@ -900,11 +997,14 @@ class Attention(nn.Module):
         idxs = self._compress_topk_idxs(x, qr, latent, start_pos, offset, compress_len)
         if latent is not None:
             # a latent stands for the first token of its group, so group j takes position j * ratio
-            freqs = (
-                self.freqs_cis[: seqlen - seqlen % ratio : ratio]
-                if start_pos == 0
-                else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
-            )
+            if packed_lengths is not None:
+                freqs = _packed_freqs(self.freqs_cis, packed_lengths, ratio)
+            else:
+                freqs = (
+                    self.freqs_cis[: seqlen - seqlen % ratio : ratio]
+                    if start_pos == 0
+                    else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
+                )
             apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs)
             if self.training and start_pos == 0:
                 shared_attn.compress_kv = latent
@@ -915,7 +1015,12 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, start_pos: int):
         bsz, seqlen, _ = x.size()
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        packed_lengths = _packed_sequence_lengths(seqlen) if start_pos == 0 else None
+        freqs_cis = (
+            _packed_freqs(self.freqs_cis, packed_lengths)
+            if packed_lengths is not None
+            else self.freqs_cis[start_pos : start_pos + seqlen]
+        )
         rd = self.rope_head_dim
 
         qr = self.q_norm(self.wq_a(x))
@@ -933,6 +1038,16 @@ class Attention(nn.Module):
                 compress_idxs = None
 
         if self.use_sparse_flash_attn:
+            sfa_layout = _ACTIVE_SFA_LAYOUT
+            output_shape = q.shape
+            if sfa_layout == "TND":
+                # Match MindSpeed-MM: [1,S,N,D]/[1,S,D] -> [T,N,D]/[T,D]
+                # immediately before the fused operator, then restore its output.
+                q = q.reshape(-1, q.shape[-2], q.shape[-1]).contiguous()
+                kv = kv.reshape(-1, kv.shape[-1]).contiguous()
+                if compress_kv is not None:
+                    compress_kv = compress_kv.reshape(-1, compress_kv.shape[-1]).contiguous()
+                    compress_idxs = compress_idxs.reshape(-1, compress_idxs.shape[-1]).contiguous()
             o = indexed_sparse_attention(
                 q,
                 kv,
@@ -945,7 +1060,11 @@ class Attention(nn.Module):
                 compressed_topk_indices=compress_idxs,
                 compress_ratio=self.compress_ratio or 1,
                 window_size=self.window_size,
+                layout=sfa_layout,
+                cu_seqlens=_ACTIVE_CU_SEQLENS,
             )
+            if sfa_layout == "TND":
+                o = o.reshape(output_shape)
         else:
             if compress_kv is not None:
                 kv = torch.cat([kv, compress_kv], dim=1)
@@ -1420,6 +1539,7 @@ class SharedAttentionRuntime:
         self.index_k: torch.Tensor | None = None
         self.topk_idxs: torch.Tensor | None = None
         self.candidates: torch.Tensor | None = None
+        self.packed_candidates: list[torch.Tensor] | None = None
         self.candidate_block_indices: torch.Tensor | None = None
         self.candidate_block_length: torch.Tensor | None = None
 
@@ -1485,14 +1605,34 @@ class Transformer(nn.Module):
         """Overwrite each image's token span in h with its ViT/aligner features. The IMAGE slots take
         the aligner rows in row-major order; the span delimiters take learned embeddings.
         """
-        for i, image_sample in enumerate(images):
-            for img in image_sample or ():
+        image_records = [img for sample in images for img in (sample or ())]
+        real_image_count = len(image_records)
+        if not image_records:
+            # Vision modules are FSDP-wrapped. Every model-parallel rank must
+            # invoke them exactly once even when its local pack has no image.
+            grid = self.aligner.downsample_ratio
+            patch = self.vision.patch_size
+            dummy = h.new_zeros((grid * grid, 3, patch, patch))
+            patches = [dummy]
+            grid_sizes = [(grid, grid)]
+        else:
+            patches = [img.patches.to(h.device) for img in image_records]
+            grid_sizes = [(img.n_vit_h, img.n_vit_w) for img in image_records]
+
+        vision_features = self.vision.forward_packed(patches, grid_sizes)
+        aligned_features = self.aligner(vision_features, grid_sizes)
+        if real_image_count == 0:
+            return
+
+        feature_iterator = iter(aligned_features)
+        for i, sample_images in enumerate(images):
+            for img in sample_images or ():
                 types = img.types.to(h.device)
                 span = h[i, img.start : img.start + types.numel()]
                 span[types == IMAGE_START] = self.image_start.to(h.dtype)
                 span[types == IMAGE_END] = self.image_end.to(h.dtype)
                 span[types == IMAGE_NEW_LINE] = self.image_newline.to(h.dtype)
-                embeds = self.encode_image(img.patches.to(h.device), img.n_vit_h, img.n_vit_w)
+                embeds = next(feature_iterator)
                 span[types == IMAGE] = embeds.to(h.dtype)
 
     def forward_backbone(
@@ -1503,6 +1643,8 @@ class Transformer(nn.Module):
         token_types: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         output_hidden_states: bool = False,
+        sfa_layout: str = "BSND",
+        cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, ...] | None]:
         """Run the shared backbone path used by training and generation."""
         if start_pos == 0:
@@ -1513,7 +1655,23 @@ class Transformer(nn.Module):
         if attention_mask is not None:
             attention_mask = attention_mask.bool()
             engram_mask = attention_mask if engram_mask is None else engram_mask & attention_mask
-        engram_hashes = self.engram_hash(input_ids, start_pos, engram_mask) if self.engram_hash is not None else None
+        if self.engram_hash is None:
+            engram_hashes = None
+        elif cu_seqlens is not None and cu_seqlens.numel() > 2:
+            boundaries = cu_seqlens.tolist()
+            engram_hashes = torch.cat(
+                [
+                    self.engram_hash(
+                        input_ids[:, begin:end],
+                        0,
+                        None if engram_mask is None else engram_mask[:, begin:end],
+                    )
+                    for begin, end in zip(boundaries[:-1], boundaries[1:])
+                ],
+                dim=1,
+            )
+        else:
+            engram_hashes = self.engram_hash(input_ids, start_pos, engram_mask)
 
         h = self.embed(input_ids)
         if images is not None:
@@ -1525,7 +1683,7 @@ class Transformer(nn.Module):
         main_hiddens = []
         collected_hidden_states = [h] if output_hidden_states else None
 
-        with use_attention_mask(attention_mask):
+        with use_attention_mask(attention_mask, sfa_layout, cu_seqlens):
             for layer_id, layer in enumerate(self.layers):
                 engram_hash_ids = (
                     engram_hashes[:, :, layer.engram.layer_hash_index, :] if layer.engram is not None else None
