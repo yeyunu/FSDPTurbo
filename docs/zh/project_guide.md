@@ -121,7 +121,7 @@ NNODES=2 GPUS_PER_NODE=16 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 bash run.sh
 FSDPTurbo提供了一套兼具高性能与易用性的大模型分布式训练解决方案，具有以下核心特点：
 
 - **多维并行**：支持FSDP/TP/EP/EFSDP/CP多维并行自由组合，基于通配符模式选择模块，与具体模型结构解耦
-- **易接入**：基于PyTorch FSDP2构建，直接对接HuggingFace Transformers生态，`FSDPTurbo(config, model)`一行完成并行化改造
+- **易接入**：基于PyTorch FSDP2构建，直接对接HuggingFace Transformers生态，`FSDPTurbo(config, model)`完成并行化改造
 - **显存优化**：提供激活重计算、分块损失、激活值交换、优化器状态交换等手段，支持低显存大模型训练
 - **量化加速**：支持MXFP8量化格式、分块量化与量化感知训练（QAT），兼容专家并行路径
 - **多后端支持**：面向昇腾NPU，算子按设备统一注册、自动分发

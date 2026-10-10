@@ -4,13 +4,13 @@
 
 FSDPTurbo是一个兼具高性能与易用性的分布式训练加速库，基于高内聚低耦合的架构设计理念，打造一套与模型结构解耦的通用加速方案，用于训练大规模深度学习模型。
 
-FSDPTurbo基于PyTorch FSDP2（DTensor全分片数据并行）构建，直接对接HuggingFace Transformers生态：用户使用原生`AutoModel`加载模型后，仅需一行`FSDPTurbo(config, model)`即可完成并行化改造，显著降低大模型分布式训练的接入成本。
+FSDPTurbo基于PyTorch FSDP2（DTensor全分片数据并行）构建，直接对接HuggingFace Transformers生态：用户使用原生`AutoModel`加载模型后，通过`FSDPTurbo(config, model)`即可完成并行化改造，显著降低大模型分布式训练的接入成本。
 
 FSDPTurbo面向昇腾NPU，从并行优化、内存优化、量化加速三个方面对大模型训练进行优化。
 
 ## FSDPTurbo架构
 
-FSDPTurbo架构关系如[图1](#架构图)所示，整体采用分层架构：用户配置经`FSDPTurbo(config, model)`一行入口编排，下接分布式并行、内存优化、量化加速三大能力域，底座为HuggingFace模型与多后端算子。
+FSDPTurbo架构关系如[图1](#架构图)所示，整体采用分层架构：用户配置经`FSDPTurbo(config, model)`入口编排，下接分布式并行、内存优化、量化加速三大能力域，底座为HuggingFace模型与多后端算子。
 
 各模块职责：
 

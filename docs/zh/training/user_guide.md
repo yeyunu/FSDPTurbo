@@ -15,7 +15,7 @@ FSDPTurbo提供端到端的大语言模型训练方案，涵盖分布式预训�
 
 FSDPTurbo的训练流程如下：
 
-1. **编写训练入口**（`train.py`）：使用Transformers原生方式加载模型，一行代码`FSDPTurbo(config, model)`应用并行化。
+1. **编写训练入口**（`train.py`）：使用Transformers原生方式加载模型，通过`FSDPTurbo(config, model)`应用并行化。
 2. **编写训练配置**（`config.yaml`）：配置模型路径、优化器、数据集、并行策略与内存优化。
 3. **编写启动脚本**（`run.sh`）：通过`torchrun`拉起分布式训练。
 

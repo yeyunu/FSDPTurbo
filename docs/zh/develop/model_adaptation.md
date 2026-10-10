@@ -11,7 +11,7 @@
 
 ## 编写训练入口
 
-使用Transformers原生方式加载模型，随后一行代码应用FSDPTurbo：
+使用Transformers原生方式加载模型，随后通过`FSDPTurbo(config, model)`应用并行化：
 
 ```python
 import torch
