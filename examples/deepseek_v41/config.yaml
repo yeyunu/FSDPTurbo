@@ -10,8 +10,8 @@ model:
   engram_storage_backend: "host_offload"
   # Use CANN SparseFlashMla/SparseFlashMlaGrad instead of eager indexed attention.
   use_sparse_flash_attn: false
-  # Use QuantLightningIndexer/QuantSparseLightningIndexer on Ascend950DT.
-  # Ascend 910B/910C/910_93 candidate indexers are not supported yet.
+  # Select candidate indexers on Atlas A3/Ascend 910B/910C and quantized
+  # indexers on Ascend950DT.
   use_fused_lightning_indexer: false
   # Use CANN Compressor/CompressorGrad for compressed-KV pooling.
   use_fused_compressor: false

@@ -216,6 +216,12 @@ def _validate_pre_inputs(
         raise ValueError("Fused MHC operators currently require hc_mult=4 and num_iters=20")
 
 
+def _supports_mhc_premix_autograd(x: torch.Tensor) -> bool:
+    device_name = torch.accelerator.get_device_name(x.device.index)
+    normalized_name = device_name.upper().replace("-", "").replace(" ", "")
+    return any(model in normalized_name for model in ("ASCEND910B", "ASCEND910C", "ASCEND910_93"))
+
+
 @register_op("fused_mhc_pre_sinkhorn_premix", "npu")
 def fused_mhc_pre_sinkhorn_premix(
     x: torch.Tensor,
@@ -231,12 +237,30 @@ def fused_mhc_pre_sinkhorn_premix(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse MHC projection, Sinkhorn and collapse using the previous premix."""
     _validate_pre_inputs(x, phi, alpha, bias, premix, hc_mult, num_iters)
-    h_in, h_post, h_res, operator_h_pre = _MhcPreSinkhornPremixFunction.apply(
+    contiguous_inputs = (
         x.contiguous(),
         phi.float().contiguous(),
         alpha.float().contiguous(),
         bias.float().contiguous(),
         premix.float().contiguous(),
+    )
+
+    if _supports_mhc_premix_autograd(x):
+        # Ascend 910B/910C and Atlas A3 provide the premix operator's
+        # registered autograd formula.
+        # Calling it directly preserves gradients from all four public outputs.
+        h_in, h_post, h_res, h_pre, *_ = _get_mhc_ops().pre(
+            *contiguous_inputs,
+            hc_mult,
+            num_iters,
+            hc_eps,
+            norm_eps,
+            True,
+        )
+        return h_in, h_post, h_res.unflatten(-1, (hc_mult, hc_mult)), h_pre
+
+    h_in, h_post, h_res, operator_h_pre = _MhcPreSinkhornPremixFunction.apply(
+        *contiguous_inputs,
         hc_mult,
         num_iters,
         hc_eps,

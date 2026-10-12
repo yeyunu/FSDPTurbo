@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from importlib import import_module
 
 import torch
 import torch.nn.functional as F
@@ -96,6 +97,29 @@ def _get_ds41_ops():
         f"packages. Arena import failed: {arena_error!r}; "
         f"cann_ops_transformer ds41 import failed: {transformer_error!r}."
     ) from arena_error
+
+
+class _CandidateOps:
+    def __init__(self, lightning_indexer, candidate_source, candidate_consumer):
+        self.lightning_indexer = lightning_indexer
+        self.candidate_source = candidate_source
+        self.candidate_consumer = candidate_consumer
+
+
+def _get_candidate_ops():
+    try:
+        custom_ops = import_module("cann_ops_transformer_custom_li")
+        return _CandidateOps(
+            custom_ops.lightning_indexer,
+            custom_ops.lightning_indexer_candidate,
+            custom_ops.sparse_lightning_indexer,
+        )
+    except (ImportError, AttributeError) as error:
+        raise RuntimeError(
+            "use_fused_lightning_indexer=True requires lightning_indexer_v2 "
+            "from cann_ops_transformer and lightning_indexer_candidate and "
+            "sparse_lightning_indexer from cann_ops_transformer_custom."
+        ) from error
 
 
 def _pack_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -284,8 +308,122 @@ def _fused_candidate_lightning_indexer(
     candidate_block_indices: torch.Tensor | None = None,
     candidate_block_length: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    # Ascend 910B, 910C, and 910_93 are not currently supported.
-    pass
+    """Run LightningIndexerV2 or its sparse candidate consumer."""
+    if query.device.type != "npu":
+        raise ValueError("Fused DS41 lightning indexers require NPU tensors")
+    if query.ndim != 4 or query.shape[2:] != (32, 128):
+        raise ValueError(f"Indexer query must have shape [B,S,32,128], got {tuple(query.shape)}")
+    if key.ndim != 3 or key.shape[0] != query.shape[0] or key.shape[-1] != 128:
+        raise ValueError(f"Indexer key must have shape [B,K,128], got {tuple(key.shape)}")
+    if head_weights.shape != query.shape[:3]:
+        raise ValueError(f"Indexer weights must have shape {tuple(query.shape[:3])}, got {tuple(head_weights.shape)}")
+    if not 0 < topk <= 2048:
+        raise ValueError(f"Candidate lightning indexers require topk in [1, 2048], got {topk}")
+    if compress_ratio < 1 or compress_ratio > 128 or compress_ratio & (compress_ratio - 1):
+        raise ValueError(
+            f"Candidate lightning indexers require a power-of-two compress_ratio in [1, 128], got {compress_ratio}"
+        )
+    if candidate_block_indices is not None and candidate_topk_blocks != -1:
+        raise ValueError("candidate_topk_blocks must be -1 when consuming candidate indices")
+    if candidate_topk_blocks != -1 and (
+        candidate_topk_blocks <= 0 or candidate_topk_blocks > 2048 or candidate_topk_blocks % 64
+    ):
+        raise ValueError(
+            "Candidate lightning indexer source requires "
+            "candidate_topk_blocks to be -1 or a multiple of 64 in [64, 2048], "
+            f"got {candidate_topk_blocks}"
+        )
+    uses_candidates = candidate_block_indices is not None or candidate_topk_blocks > 0
+    if uses_candidates and (
+        candidate_block_size < 2 or candidate_block_size > 64 or candidate_block_size & (candidate_block_size - 1)
+    ):
+        raise ValueError(
+            "Candidate lightning indexers require a power-of-two "
+            f"candidate_block_size in [2, 64], got {candidate_block_size}"
+        )
+
+    batch_size, sequence_length = query.shape[:2]
+    expected_key_length = sequence_length // compress_ratio
+    if key.shape[1] != expected_key_length:
+        raise ValueError(
+            "Candidate lightning indexers require the physical compressed K length "
+            f"to equal floor(S/compress_ratio)={expected_key_length}, got {key.shape[1]}"
+        )
+
+    valid_queries = None
+    if attention_mask is not None:
+        if attention_mask.shape != (batch_size, sequence_length):
+            raise ValueError(
+                "Lightning indexer attention_mask must have shape "
+                f"{(batch_size, sequence_length)}, got {tuple(attention_mask.shape)}"
+            )
+        valid_queries = attention_mask.to(device=query.device, dtype=torch.bool)
+    residual = (
+        torch.full(
+            (batch_size,),
+            sequence_length % compress_ratio,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        if compress_ratio != 1
+        else None
+    )
+    common_kwargs = dict(
+        seqused_k=None,
+        cmp_residual_k=residual,
+        metadata=None,
+        max_seqlen_q=-1,
+        layout_q="BSND",
+        layout_k="BSND",
+        mask_mode=3,
+        cmp_ratio=compress_ratio,
+    )
+    candidate_ops = _get_candidate_ops()
+    contiguous_query = query.contiguous()
+    contiguous_key = key.unsqueeze(2).contiguous()
+    contiguous_weights = head_weights.float().contiguous()
+
+    if candidate_block_indices is not None:
+        indices, _ = candidate_ops.candidate_consumer(
+            contiguous_query,
+            contiguous_key,
+            contiguous_weights,
+            topk,
+            candidate_block_indices,
+            candidate_block_length=candidate_block_length,
+            candidate_block_size=candidate_block_size,
+            **common_kwargs,
+        )
+        candidates = candidate_lengths = None
+    elif candidate_topk_blocks > 0:
+        indices, _, candidates, candidate_lengths = candidate_ops.candidate_source(
+            contiguous_query,
+            contiguous_key,
+            contiguous_weights,
+            topk,
+            candidate_topk_blocks=candidate_topk_blocks,
+            candidate_block_size=candidate_block_size,
+            **common_kwargs,
+        )
+    else:
+        indices, _ = candidate_ops.lightning_indexer(
+            contiguous_query,
+            contiguous_key,
+            contiguous_weights,
+            topk,
+            return_value=0,
+            **common_kwargs,
+        )
+        candidates = candidate_lengths = None
+
+    if index_offset:
+        indices = torch.where(indices >= 0, indices + index_offset, indices)
+    if valid_queries is not None:
+        invalid_queries = ~valid_queries[:, :, None, None]
+        indices = indices.masked_fill(invalid_queries, -1)
+        if candidates is not None:
+            candidates = candidates.masked_fill(invalid_queries, -1)
+    return indices.squeeze(2), candidates, candidate_lengths
 
 
 def _get_npu_device_name(query: torch.Tensor) -> str:
@@ -301,8 +439,8 @@ def _select_lightning_indexer_backend(device_name: str) -> str:
     if any(model in normalized_name for model in ("ASCEND910B", "ASCEND910C", "ASCEND910_93")):
         return "candidate"
     raise RuntimeError(
-        "use_fused_lightning_indexer=True supports only Ascend 910B/910C "
-        "and Ascend950DT, but the current device is "
+        "use_fused_lightning_indexer=True supports only Atlas A3 (Ascend 910_93), "
+        "Ascend 910B/910C, and Ascend950DT, but the current device is "
         f"{device_name!r}"
     )
 

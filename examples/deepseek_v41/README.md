@@ -85,7 +85,7 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 | V4.1 attention tensor/context parallel | 暂不支持 |
 | CSA2 跨层压缩状态与稀疏索引结构 | 支持构造与结构验证 |
 | CANN Compressor/CompressorGrad 融合压缩算子 | 可选；设置 `model.use_fused_compressor: true` |
-| Lightning Indexer 融合算子 | 可选；当前仅支持 Ascend950DT；910B/910C/910_93 候选路径待开发 |
+| Lightning Indexer 融合算子 | 可选；支持 Atlas A3（Ascend 910_93）、Ascend 910B/910C 和 Ascend950DT |
 | MhcPreSinkhornPremix/MhcPost 融合算子 | 可选；设置 `model.use_fused_mhc: true` |
 | 视觉 FlashAttentionScore/Grad 融合算子 | 可选；设置 `model.use_fused_vision_flash_attn: true`；仅支持 BF16 |
 | CSA2 activation recompute | 暂不支持 |
@@ -95,11 +95,12 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 
 未支持的路径在适配器或配置中会显式拒绝/关闭，避免把旧 V4 的实现误用于 V4.1。
 
-融合索引开关当前仅支持 Ascend950DT，并使用
-`QuantLightningIndexer/QuantSparseLightningIndexer`。Ascend 910B、910C 和 910_93
-的 candidate indexer 路径目前仅保留接口占位，尚未实现，不能开启该选项。
-Ascend950DT 路径需要 Python 3.11、`cannbotdsl`、`cannbot_arena_net_ops` 和配套
-`cann_ops_transformer`，AOT profile 固定
+融合索引开关开启后会读取当前 NPU 型号并自动选择实现：Atlas A3（Ascend 910_93）、
+Ascend 910B/910C 使用 `LightningIndexerV2/SparseLightningIndexer`，Ascend950DT
+使用 `QuantLightningIndexer/QuantSparseLightningIndexer`。A3/910B/910C 路径要求
+安装提供 candidate source/consumer 算子的 `cann_ops_transformer` 或
+`cann_ops_transformer_custom`；Ascend950DT 路径需要 Python 3.11、`cannbotdsl`、
+`cannbot_arena_net_ops` 和配套 `cann_ops_transformer`，AOT profile 固定
 `index_topk=512`，并支持 64/128 的 PA page size。默认保持关闭，关闭时继续运行原
 BF16 `einsum + topk` 实现。当前融合路径仅接入训练/整段 prefill，尚未接入逐 token
 decode 的累计序列元数据。
