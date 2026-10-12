@@ -59,7 +59,7 @@ class SwapOptimizerOperate:
                     else:
                         self.swap_state_keys.add(key)
                         device_state_dtensor[key] = torch.zeros_like(
-                            param, memory_format=torch.preserve_format, device=torch.accelerator.current_device()
+                            param, memory_format=torch.preserve_format, device=torch.accelerator.current_device_index()
                         )
                         # convert dtensor to tensor
                         device_state_tensor[key] = device_state_dtensor[key].to_local()
@@ -76,7 +76,9 @@ class SwapOptimizerOperate:
         params = list(self.param_to_device_states_map.keys())
         # Define how many bytes the optimizer state of each parameter occupies.
         self.byte_param = 4 if params[0].dtype == torch.float32 else 2
-        self.total_memory = torch.accelerator.get_device_properties(torch.accelerator.current_device()).total_memory
+        self.total_memory = torch.accelerator.get_device_properties(
+            torch.accelerator.current_device_index()
+        ).total_memory
 
     @staticmethod
     def _memory_allocated():
@@ -137,7 +139,7 @@ class SwapOptimizerOperate:
                     self.param_to_device_buffer = {}
                 if param not in self.param_to_device_buffer:
                     self.param_to_device_buffer[param] = torch.empty_like(
-                        param_local_cpu, device=torch.accelerator.current_device()
+                        param_local_cpu, device=torch.accelerator.current_device_index()
                     )
                 self.param_to_device_buffer[param].copy_(param_local_cpu, non_blocking=True)
 
@@ -287,7 +289,7 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
             raise AssertionError(
                 "OOM: cannot fit even one param's optimizer state on Device. Try increasing mem_fraction_static."
             )
-        dev = torch.accelerator.current_device()
+        dev = torch.accelerator.current_device_index()
         for i, param in enumerate(params_list):
             if param.grad is None:
                 continue

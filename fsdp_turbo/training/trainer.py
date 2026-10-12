@@ -349,7 +349,9 @@ class BaseTrainer:
             betas=(self.config.optimizer.adam_beta1, self.config.optimizer.adam_beta2),
             eps=self.config.optimizer.adam_epsilon,
         )
-        # Only AdamWSwap accepts swap-specific optimizer arguments.
+        # Swap optimizer specific kwargs: None means use AdamWSwap internal defaults.
+        # Only forward them for swap optimizers -- plain torch.optim optimizers
+        # (e.g. AdamW) do not accept these and would raise on unexpected kwargs.
         if self.config.optimizer.optimizer_type == "AdamWSwap":
             if self.config.optimizer.mem_fraction_static is not None:
                 kwargs["mem_fraction_static"] = self.config.optimizer.mem_fraction_static
@@ -473,11 +475,27 @@ class BaseTrainer:
         """
         from fsdp_turbo.training.clip_grads import clip_grad_norm
 
+        keep_on_device = False
+        if self.config.optimizer.clip_grad_keep_on_device:
+            from fsdp_turbo.memory.swap_optimizer import AdamWSwap
+
+            # Only AdamWSwap handles device-resident grads with host params
+            # (it uploads both); any other optimizer would fail with params on
+            # host and grads on device.
+            if isinstance(self.optimizer, AdamWSwap):
+                keep_on_device = True
+            else:
+                logger.warning(
+                    "optimizer.clip_grad_keep_on_device=True is ignored because the "
+                    "optimizer is not AdamWSwap; falling back to host gradient write-back."
+                )
+
         return clip_grad_norm(
             self.model,
             max_norm=self.config.optimizer.clip_grad,
             norm_type=self.config.optimizer.clip_grad_norm_type,
             group=self._get_grad_sync_group(),
+            keep_on_device=keep_on_device,
         )
 
     def _compute_grad_norm(self):

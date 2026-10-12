@@ -364,12 +364,12 @@ def get_autotune_config(
 
 
 def get_npu_properties():
-    return driver.active.utils.get_device_properties(torch.accelerator.current_device())
+    return driver.active.utils.get_device_properties(torch.accelerator.current_device_index())
 
 
 @functools.cache
 def get_vector_num() -> int:
-    current_device = torch.accelerator.current_device()
+    current_device = torch.accelerator.current_device_index()
     properties = driver.active.utils.get_device_properties(current_device)
     return properties["num_vectorcore"]
 

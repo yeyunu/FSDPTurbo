@@ -24,7 +24,8 @@ optimizer:
   adam_epsilon: 1.0e-8
   mem_fraction_static: 0.9                    # 可选：批量 H2D 回装使用的空闲显存比例，默认 0.9
   state_keys: ["exp_avg", "exp_avg_sq"]       # 可选：参与交换的 state 键，缺省使用 AdamWSwap 内部默认
-  param_prefetch: true                        # 可选：参与交换的参数是否提前加载一个，减少带宽阻塞，缺省使用 AdamWSwap 内部默认（关闭）
+  param_prefetch: false                        # 可选：参与交换的参数是否提前加载一个，减少带宽阻塞，缺省使用 AdamWSwap 内部默认（关闭）
+  clip_grad_keep_on_device: false              # 可选：cpu_offload打开时clip_grad对梯度更新后保留梯度在device侧，减少一次h2d和d2h的搬运，仅在cpu_offload和AdamWSwap同时开启时生效，缺省使用 AdamWSwap 内部默认（关闭）
 ```
 
 | 参数 | 说明 |
@@ -33,6 +34,7 @@ optimizer:
 | `mem_fraction_static` | 批量回装时允许使用的空闲显存比例，默认`0.9` |
 | `state_keys` | 参与交换的优化器状态键列表，缺省使用AdamWSwap内部默认（AdamW为`exp_avg`、`exp_avg_sq`） |
 | `param_prefetch` | 参与交换的参数预加载配置，缺省使用AdamWSwap内部默认（不提前加载） |
+| `clip_grad_keep_on_device` | 在cpu_offload和AdamWSwap同时开启时，clip_grad对梯度更新后保留梯度在device侧，缺省使用AdamWSwap内部默认（梯度在host侧） |
 
 `AdamWSwap`已注册到优化器工厂（OptimizerFactory），其余优化器参数（lr、betas、weight_decay等）与标准AdamW一致。参考示例：`examples/deepseekv4/config.yaml`。
 

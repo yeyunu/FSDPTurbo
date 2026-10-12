@@ -47,7 +47,13 @@ class OptimizerConfig:
     # Swap optimizer (AdamWSwap) only: state keys participating in swap; None uses the default
     state_keys: Optional[List[str]] = None
     # Swap optimizer (AdamWSwap) only: prefetch one param to device buffer if it sets True
-    param_prefetch: bool = False
+    param_prefetch: Optional[bool] = False
+    # Re-point CPU-offloaded gradients at their clipped device copies so
+    # AdamWSwap consumes them directly, skipping the clip D2H write-back and
+    # the step H2D upload. The host gradient is released, so no extra copy
+    # is kept. Only effective when cpu_offload and swap_optimizer are both
+    # enabled.
+    clip_grad_keep_on_device: Optional[bool] = False
 
 
 @dataclass

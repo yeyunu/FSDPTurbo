@@ -109,7 +109,7 @@ def compute_grad_norm(
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
 
-    dev = torch.accelerator.current_device()
+    dev = torch.accelerator.current_device_index()
     # Group parameters by their shard-group signature so that gradients
     # sharing the same set of sharded mesh dimensions can be aggregated
     # locally before a single all-reduce per group.  This is required
@@ -171,6 +171,7 @@ def clip_grad_by_norm(
     parameters: Union[list, torch.Tensor],
     max_norm: float,
     total_norm: float,
+    keep_on_device: bool = False,
 ) -> None:
     """Clip gradients in-place so that their total norm <= ``max_norm``.
 
@@ -178,11 +179,23 @@ def clip_grad_by_norm(
     DTensor gradients are clipped on their local shards directly
     (the clip coefficient is the same on every rank after all-reduce).
 
+    When *keep_on_device* is True and a gradient lives on the host (cpu_offload),
+    the existing ``p.grad`` DTensor is re-backed with its clipped device copy
+    in place (mutating ``_local_tensor``, since the autograd grad setter forbids
+    assigning a device grad to a host param). Optimizers that already skip the
+    H2D upload for device-resident local grads (AdamWSwap) then pick it up
+    directly, so the clip D2H write-back and the step H2D copy are both
+    avoided, and the host gradient storage is released with the replacement.
+    With any other optimizer the gradient would sit on the device while the
+    parameter stays on the host, so this must only be enabled for AdamWSwap.
+
     Args:
         parameters: Model parameters whose ``.grad`` will be scaled.
         max_norm: Maximum allowed total norm.
         total_norm: The current total gradient norm (as returned by
             :func:`compute_grad_norm`).
+        keep_on_device: Re-point host gradients at their clipped device copies
+            so AdamWSwap consumes them without a host round-trip.
     """
     if total_norm == 0.0 or max_norm <= 0.0:
         return
@@ -191,16 +204,32 @@ def clip_grad_by_norm(
     if clip_coeff >= 1.0:
         return
 
-    dev = torch.accelerator.current_device()
+    dev = torch.accelerator.current_device_index()
 
     for p in parameters:
         if p.grad is not None:
-            local_g = _to_local_if_dtensor(p.grad).detach()
+            grad = p.grad
+            local_g = _to_local_if_dtensor(grad).detach()
             if local_g.device != dev:
-                # Fallback when no cache: H2D -> mul -> D2H write back to original storage
                 device_g = local_g.to(dev, non_blocking=True)
                 device_g.mul_(clip_coeff)
-                local_g.copy_(device_g, non_blocking=True)
+                if keep_on_device:
+                    # Re-back the existing grad DTensor with the device copy.
+                    # Assigning ``p.grad = <npu dtensor>`` is rejected by the
+                    # autograd grad setter (the sharded param lives on host),
+                    # so mutate the DTensor in place instead: its ``_local_tensor``
+                    # is exactly what ``to_local()`` returns, so AdamWSwap then
+                    # sees an NPU-local grad and skips its H2D upload, while the
+                    # host gradient storage is released with the replacement.
+                    if _HAS_DTENSOR and isinstance(grad, DTensor):
+                        grad._local_tensor = device_g
+                    else:
+                        # Plain-tensor grads cannot be re-backed this way;
+                        # keep the host write-back so the grad stays usable.
+                        local_g.copy_(device_g, non_blocking=True)
+                else:
+                    # H2D -> clip on device -> D2H write back to original storage
+                    local_g.copy_(device_g, non_blocking=True)
             else:
                 local_g.mul_(clip_coeff)
 
@@ -210,6 +239,7 @@ def clip_grad_norm(
     max_norm: float,
     norm_type: Union[int, float] = 2.0,
     group: Optional[torch.distributed.ProcessGroup] = None,
+    keep_on_device: bool = False,
 ) -> float:
     """Compute gradient norm and clip in one call.
 
@@ -231,8 +261,12 @@ def clip_grad_norm(
         max_norm: Maximum allowed total gradient norm.
         norm_type: Type of the p-norm. Defaults to 2.0.
         group: Process group for all-reducing the gradient norm
-            across sharding ranks.  If ``None`` and DTensor
-            gradients are present, the group is inferred automatically.
+            across sharding ranks.  If ``None`` and DTensor gradients
+            are present, the group is inferred automatically.
+        keep_on_device: Re-point host gradients at their clipped device copies
+            so AdamWSwap consumes them without a host round-trip. Only honored
+            on the fallback compute/clip path (custom handlers and FSDP-native
+            ``clip_grad_norm_`` ignore it).
 
     Returns:
         The total gradient norm **before** clipping (as a float),
@@ -257,5 +291,5 @@ def clip_grad_norm(
 
     params = list(model.parameters())
     total_norm = compute_grad_norm(params, norm_type, group=group)
-    clip_grad_by_norm(params, max_norm, total_norm)
+    clip_grad_by_norm(params, max_norm, total_norm, keep_on_device=keep_on_device)
     return total_norm

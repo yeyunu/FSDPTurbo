@@ -23,6 +23,7 @@ optimizer:
   clip_grad: 1.0
   clip_grad_norm_type: 2.0
   param_prefetch: true
+  clip_grad_keep_on_device: true
 
 # --- Run Configuration ---
 run:
