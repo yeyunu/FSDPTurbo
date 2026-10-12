@@ -12,6 +12,7 @@ from fsdp_turbo.ops.cpu.mx_quant import (
 )
 from fsdp_turbo.ops.cpu.permute import permute_cpu, unpermute_cpu
 from fsdp_turbo.ops.cpu.rms_norm import rms_norm_cpu
+from fsdp_turbo.ops.cpu.rope import rope_torch
 from fsdp_turbo.ops.cpu.sinkhorn import hc_split_sinkhorn_cpu
 from fsdp_turbo.ops.cpu.sparse_attention import indexed_sparse_attention_torch
 from fsdp_turbo.ops.cpu.situ_glu import situ_glu_cpu
@@ -31,6 +32,7 @@ __all__ = [
     'permute_cpu',
     'unpermute_cpu',
     'rms_norm_cpu',
+    'rope_torch',
     'hc_split_sinkhorn_cpu',
     'indexed_sparse_attention_torch',
     'mx_to_block_mx_quant_cpu',

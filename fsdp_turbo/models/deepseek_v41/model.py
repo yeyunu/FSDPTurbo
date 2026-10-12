@@ -18,12 +18,15 @@ from fsdp_turbo.ops.lightning_indexer import (
     fused_lightning_indexer,
 )
 from fsdp_turbo.ops.compressor import fused_compressor
+from fsdp_turbo.ops.rope import rope
+from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.ops.mhc import fused_mhc_post, fused_mhc_pre_sinkhorn_premix
 from .host_offload_embedding import (
     HostOffloadEmbedding,
     TorchHostOffloadEmbedding,
 )
 from .experts import DeepSeekV41Experts
+from .activation import silu_mul
 from .image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
 from torch import nn
 from .vision import Aligner, ViT
@@ -314,6 +317,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor):
+        if x.device.type == "npu":
+            return rms_norm(x, self.weight, self.eps)
         dtype = x.dtype
         x = x.float()
         var = x.square().mean(-1, keepdim=True)
@@ -416,17 +421,14 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
     [b, s, h, d]; `inverse` conjugates the rotation, which is how the attention output gets the
     query's rotation removed again so the cache can stay in one shared rotated form.
     """
-    y = x
-    x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
-    if inverse:
-        freqs_cis = freqs_cis.conj()
-    if x.ndim == 3:
-        freqs_cis = freqs_cis.view(1, x.size(1), x.size(-1))
-    else:
-        freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
-    x = torch.view_as_real(x * freqs_cis).flatten(-2)
-    y.copy_(x)
-    return y
+    return rope(
+        x,
+        freqs_cis.real,
+        freqs_cis.imag,
+        interleaved=True,
+        inverse=inverse,
+        inplace=True,
+    )
 
 
 @lru_cache(8)
@@ -1147,7 +1149,7 @@ class Expert(nn.Module):
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
-        x = F.silu(gate) * up
+        x = silu_mul(gate, up)
         if weights is not None:
             x = weights * x
         return self.w2(x.to(dtype))

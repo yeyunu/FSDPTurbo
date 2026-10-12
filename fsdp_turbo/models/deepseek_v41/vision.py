@@ -5,6 +5,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from fsdp_turbo.ops.vision_flash_attention import fused_vision_flash_attention
+from fsdp_turbo.ops.rope import rope
+from fsdp_turbo.ops.rms_norm import rms_norm
+from .activation import packed_swiglu
 
 
 @lru_cache(8)
@@ -18,9 +21,13 @@ def get_vision_cos_sin(n_h: int, n_w: int, dim: int, theta: float):
 
 
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    dtype = x.dtype
-    x1, x2 = x.float().chunk(2, dim=-1)
-    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
+    # [tokens, heads, dim] -> [batch, tokens, heads, dim].
+    return rope(
+        x.unsqueeze(0),
+        cos.unsqueeze(0),
+        sin.unsqueeze(0),
+        interleaved=False,
+    ).squeeze(0)
 
 
 class RMSNorm(nn.Module):
@@ -30,6 +37,8 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "npu":
+            return rms_norm(x, self.weight, self.eps)
         dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
@@ -102,8 +111,15 @@ class MLP(nn.Module):
         self.w2 = nn.Linear(args.vision_inter_dim, args.vision_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate, up = self.w1(x).chunk(2, dim=-1)
-        return self.w2(F.silu(gate) * up)
+        gate_up = self.w1(x)
+        if gate_up.dtype == torch.bfloat16:
+            # Preserve the reference's BF16 rounding after SiLU. The fused
+            # activation can change it, causing output drift after w2.
+            gate, up = gate_up.chunk(2, dim=-1)
+            intermediate = F.silu(gate) * up
+        else:
+            intermediate = packed_swiglu(gate_up)
+        return self.w2(intermediate)
 
 
 class Block(nn.Module):
@@ -154,9 +170,9 @@ class ViT(nn.Module):
         """Encode multiple images with one invocation of every FSDP module."""
         sequence_lengths = [patch.shape[0] for patch in patches]
         x = self.patch_embed(torch.cat(patches, dim=0))
-        rope = [get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta) for n_h, n_w in grid_sizes]
-        cos = torch.cat([item[0] for item in rope], dim=0).to(x.device)
-        sin = torch.cat([item[1] for item in rope], dim=0).to(x.device)
+        rope_coefficients = [get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta) for n_h, n_w in grid_sizes]
+        cos = torch.cat([item[0] for item in rope_coefficients], dim=0).to(x.device)
+        sin = torch.cat([item[1] for item in rope_coefficients], dim=0).to(x.device)
         for block in self.blocks:
             x = block(x, cos, sin, sequence_lengths)
         return list(self.norm(x).split(sequence_lengths, dim=0))

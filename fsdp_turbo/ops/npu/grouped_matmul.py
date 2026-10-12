@@ -25,13 +25,21 @@ class GroupedMatmul(torch.autograd.Function):
         # Transpose to [input_dim, output_dim] so that input [M, K] @ weight.T [K, N] = output [M, N].
         # Always transpose rather than guessing from shape, since shape-based detection is
         # unreliable when input_dim == output_dim (square weight matrices).
-        weights_for_matmul = [w.T for w in weight_chunks]
+        # With one x/weight/y, split-M selects the packed-weight API:
+        # its sole weight must keep the expert axis [1, K, N].
+        weights_for_matmul = [weights.transpose(1, 2)] if weights.shape[0] == 1 else [w.T for w in weight_chunks]
 
         ctx.save_for_backward(input_tensor, weights)
 
-        fwd_output = torch_npu.npu_grouped_matmul([input_tensor], weights_for_matmul, bias=weights_bias,
-                                                  group_list=ctx.group_list, split_item=2, group_type=0,
-                                                  group_list_type=ctx.group_list_type)[0]
+        fwd_output = torch_npu.npu_grouped_matmul(
+            [input_tensor],
+            weights_for_matmul,
+            bias=weights_bias,
+            group_list=ctx.group_list,
+            split_item=2,
+            group_type=0,
+            group_list_type=ctx.group_list_type,
+        )[0]
         return fwd_output
 
     @staticmethod
@@ -41,18 +49,30 @@ class GroupedMatmul(torch.autograd.Function):
         group_list_type = ctx.group_list_type
 
         # Get weight chunks (original [output_dim, input_dim] format)
-        weight_chunks = [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
+        weight_chunks = [weights] if weights.shape[0] == 1 else [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
 
         # Calculate input gradient: grad_output [M, N] @ weight [N, K] = grad_input [M, K].
         # Forward used transposed weights, so the original weights are used directly here.
-        grad = torch_npu.npu_grouped_matmul([grad_output], weight_chunks, bias=None,
-                                            group_list=group_list, split_item=2, group_type=0,
-                                            group_list_type=group_list_type)[0]
+        grad = torch_npu.npu_grouped_matmul(
+            [grad_output],
+            weight_chunks,
+            bias=None,
+            group_list=group_list,
+            split_item=2,
+            group_type=0,
+            group_list_type=group_list_type,
+        )[0]
 
         # Calculate weight gradient (K split gmm): grad_weight = inp^T @ grad_output = [K, N]
-        grad_weight = torch_npu.npu_grouped_matmul([inp.T], [grad_output], bias=None,
-                                                   group_list=group_list, split_item=3,
-                                                   group_type=2, group_list_type=group_list_type)[0]
+        grad_weight = torch_npu.npu_grouped_matmul(
+            [inp.T],
+            [grad_output],
+            bias=None,
+            group_list=group_list,
+            split_item=3,
+            group_type=2,
+            group_list_type=group_list_type,
+        )[0]
 
         # Transpose to match original weight format [output_dim, input_dim]
         grad_weight_chunks = [w.T for w in grad_weight]

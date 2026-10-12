@@ -1,8 +1,27 @@
+# Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+
 """Packed DeepSeek-V4.1 routed experts compatible with FSDPTurbo EP."""
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from .activation import packed_swiglu, silu_mul
+
+
+def _use_fused_permute(hidden_states, global_indices):
+    # Keep both local permutation pairs on the same backend. Empty send or
+    # receive buffers retain eager routing, but must still enter AllToAll.
+    return hidden_states.device.type == "npu" and hidden_states.numel() > 0 and global_indices.numel() > 0
+
+
+def _reorder_router_weights(weights, row_map, fused):
+    if fused:
+        # NPU returns original-route -> permuted-row, the inverse of the
+        # eager gather indices. Scatter preserves FP32 probabilities and their
+        # autograd connection without sorting again or moving the multiply.
+        return torch.empty_like(weights).scatter(0, row_map.long(), weights)
+    return weights.index_select(0, row_map.long())
 
 
 class DeepSeekV41Experts(nn.Module):
@@ -52,7 +71,18 @@ class DeepSeekV41Experts(nn.Module):
         topk_indices: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Run the non-EP fallback over the selected experts."""
+        """Run routed experts with grouped projections on supported NPU inputs."""
+        if (
+            hidden_states.device.type == "npu"
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+            and hidden_states.numel() > 0
+            and topk_indices.numel() > 0
+        ):
+            return self._forward_grouped(hidden_states, topk_indices, topk_weights)
+        return self._forward_eager(hidden_states, topk_indices, topk_weights)
+
+    def _forward_eager(self, hidden_states, topk_indices, topk_weights):
+        """Original per-expert arithmetic, also the accuracy reference."""
         original_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         topk_indices = topk_indices.reshape(hidden_states.size(0), -1)
@@ -67,11 +97,13 @@ class DeepSeekV41Experts(nn.Module):
                 selected_hidden_states,
                 self.gate_up_proj[expert_index],
             ).float()
-            gate_states, up_states = gate_up_states.chunk(2, dim=-1)
             if self.limit is not None:
+                gate_states, up_states = gate_up_states.chunk(2, dim=-1)
                 gate_states = gate_states.clamp(max=self.limit)
                 up_states = up_states.clamp(min=-self.limit, max=self.limit)
-            intermediate_states = self.act_fn(gate_states) * up_states
+                intermediate_states = silu_mul(gate_states, up_states)
+            else:
+                intermediate_states = packed_swiglu(gate_up_states)
             intermediate_states = intermediate_states * topk_weights[token_indices, topk_positions, None]
             expert_output = F.linear(
                 intermediate_states.to(hidden_states.dtype),
@@ -81,6 +113,61 @@ class DeepSeekV41Experts(nn.Module):
 
         # Reference MoE accumulates routed experts and the shared expert in
         # FP32, then performs one final cast in MoE.forward.
+        return output.view(original_shape)
+
+    def _forward_grouped(self, hidden_states, topk_indices, topk_weights):
+        """Group projections only; preserve per-expert activation and sum order.
+
+        CPU execution of this private method is useful for structural tests;
+        the public fast path is restricted to supported NPU input dtypes.
+        """
+        from fsdp_turbo.ops.moe import grouped_matmul
+
+        if hidden_states.numel() == 0 or topk_indices.numel() == 0:
+            return self._forward_eager(hidden_states, topk_indices, topk_weights)
+        original_shape = hidden_states.shape
+        x = hidden_states.reshape(-1, self.hidden_dim)
+        ids = topk_indices.reshape(x.size(0), -1)
+        probs = topk_weights.reshape_as(ids)
+        active = torch.unique(ids).tolist()
+        selections = [torch.where(ids == expert) for expert in active]
+        sizes = [rows.numel() for rows, _ in selections]
+        counts = torch.tensor(sizes, dtype=torch.int64, device=x.device)
+        expert_ids = torch.tensor(active, dtype=torch.long, device=x.device)
+
+        def select_weights(weights):
+            # unique returns sorted ids: all-active weights need no copy.
+            if len(active) == self.num_experts:
+                return weights
+            return weights.index_select(0, expert_ids)
+
+        # The shared dispatcher otherwise follows the current accelerator,
+        # which can be NPU even for CPU tensors in mixed-device processes.
+        use_eager = x.device.type == "cpu"
+        packed_x = torch.cat([x[rows] for rows, _ in selections], dim=0)
+        gate_up = grouped_matmul(packed_x, counts, select_weights(self.gate_up_proj), use_eager=use_eager)
+        intermediates = []
+        for states, (rows, slots) in zip(gate_up.split(sizes), selections):
+            states = states.float()
+            if self.limit is not None:
+                gate, up = states.chunk(2, dim=-1)
+                gate = gate.clamp(max=self.limit)
+                up = up.clamp(min=-self.limit, max=self.limit)
+                intermediate = silu_mul(gate, up)
+            else:
+                intermediate = packed_swiglu(states)
+            # Match eager type promotion and apply probabilities before down.
+            intermediate = intermediate * probs[rows, slots, None]
+            intermediates.append(intermediate.to(x.dtype))
+        packed_output = grouped_matmul(
+            torch.cat(intermediates, dim=0),
+            counts,
+            select_weights(self.down_proj),
+            use_eager=use_eager,
+        )
+        output = torch.zeros_like(x, dtype=torch.float32)
+        for contribution, (rows, _) in zip(packed_output.split(sizes), selections):
+            output = output.index_add(0, rows, contribution.float())
         return output.view(original_shape)
 
     def native_eager_forward(
@@ -95,10 +182,10 @@ class DeepSeekV41Experts(nn.Module):
         """Run EP with the released DeepSeek expert arithmetic order.
 
         This is selected through FSDPTurbo's existing ``custom_*`` dispatcher
-        extension point. Token routing and combination retain the native eager
-        ordering, while the two expert projections use the accelerator's
-        grouped GEMM. Keeping this on the model avoids changing the generic
-        dispatcher or grouped-matmul behavior used by other architectures.
+        extension point. NPU token routing uses paired fused permutations,
+        while probability application and FP32 combination retain the native
+        arithmetic order. The two expert projections use the accelerator's
+        grouped GEMM. CPU/CUDA and empty routing buffers retain eager routing.
         """
         from torch.distributed._functional_collectives import (
             all_to_all_single_autograd,
@@ -132,8 +219,9 @@ class DeepSeekV41Experts(nn.Module):
             self.num_global_experts,
             self.expert_ids_per_ep_rank,
         )
-        local_counts, _ = indices
+        local_counts, global_indices = indices
         input_split, output_splits = split_sizes
+        fused_permute = _use_fused_permute(hidden_states, global_indices)
 
         hidden_states, unpermute_indices = alltoall_dispatch(
             ep_group,
@@ -141,17 +229,17 @@ class DeepSeekV41Experts(nn.Module):
             topk_indices,
             indices,
             split_sizes,
-            fused=False,
+            fused=fused_permute,
         )
         source_order, expert_order = unpermute_indices
-        router_weights = topk_weights.reshape(-1).index_select(0, source_order.long())
+        router_weights = _reorder_router_weights(topk_weights.reshape(-1), source_order, fused_permute)
         router_weights = all_to_all_single_autograd(
             router_weights,
             output_splits.tolist(),
             input_split.tolist(),
             ep_group,
         )
-        router_weights = router_weights.index_select(0, expert_order.long())
+        router_weights = _reorder_router_weights(router_weights, expert_order, fused_permute)
         gate_up_proj = self.gate_up_proj.to_local() if isinstance(self.gate_up_proj, DTensor) else self.gate_up_proj
         down_proj = self.down_proj.to_local() if isinstance(self.down_proj, DTensor) else self.down_proj
 
@@ -161,12 +249,15 @@ class DeepSeekV41Experts(nn.Module):
             gate_up_proj,
             use_eager=False,
         ).float()
-        gate, up = gate_up.chunk(2, dim=-1)
         if self.limit is not None:
+            gate, up = gate_up.chunk(2, dim=-1)
             gate = gate.clamp(max=self.limit)
             up = up.clamp(min=-self.limit, max=self.limit)
-        intermediate = self.act_fn(gate) * up
-        intermediate *= router_weights.float().unsqueeze(-1)
+            intermediate = silu_mul(gate, up)
+        else:
+            intermediate = packed_swiglu(gate_up)
+        # Do not mutate an activation output that a fused backward may save.
+        intermediate = intermediate * router_weights.float().unsqueeze(-1)
         expert_output = grouped_matmul(
             intermediate.to(hidden_states.dtype),
             local_counts,
@@ -184,7 +275,7 @@ class DeepSeekV41Experts(nn.Module):
             combine_weights,
             unpermute_indices,
             split_sizes,
-            fused=False,
+            fused=fused_permute,
         )
         return output.view(*original_shape)
 
