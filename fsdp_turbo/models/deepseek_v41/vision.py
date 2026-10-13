@@ -153,7 +153,9 @@ class ViT(nn.Module):
         self.blocks = nn.ModuleList([Block(args) for _ in range(args.vision_n_layers)])
         self.norm = RMSNorm(args.vision_dim)
 
-    def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+    def forward(self, patches, n_h, n_w=None):
+        if isinstance(patches, (list, tuple)):
+            return self._forward_packed(patches, n_h)
         x = self.patch_embed(patches)
         cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
         cos = cos.to(x.device)
@@ -162,7 +164,7 @@ class ViT(nn.Module):
             x = block(x, cos, sin)
         return self.norm(x)
 
-    def forward_packed(
+    def _forward_packed(
         self,
         patches: list[torch.Tensor],
         grid_sizes: list[tuple[int, int]],

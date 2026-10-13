@@ -62,7 +62,6 @@ class DeepseekV41Trainer(BaseTrainer):
             use_fused_mhc=self.config.model.use_fused_mhc,
             use_fused_vision_flash_attn=(self.config.model.use_fused_vision_flash_attn),
         )
-        initialize_deepseek_v41_model(training_model)
         training_model = prepare_deepseek_v41_model_for_fsdp(
             training_model,
             device=torch.accelerator.current_accelerator(),
@@ -70,7 +69,10 @@ class DeepseekV41Trainer(BaseTrainer):
         )
 
         print_rank(logger.info, "> Applying FSDPTurbo parallelism...")
-        return FSDPTurbo(self.config, training_model)
+        parallel_model = FSDPTurbo(self.config, training_model)
+        print_rank(logger.info, "> Initializing local DeepSeek-V4.1 parameter shards...")
+        initialize_deepseek_v41_model(parallel_model.model)
+        return parallel_model
 
     def build_optimizer(self):
         """Build the model-specific dense + Engram optimizer container."""

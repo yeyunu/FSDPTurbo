@@ -139,25 +139,25 @@ Engram 不再保留参考实现的 FP8 `ParallelEngramEmbedding` 路径。存储
 
 Host Engram 始终先在 meta 上创建表，无需在构造模型时传入 mesh。
 其他参数和运行时 buffer 仍正常创建。
-`initialize_deepseek_v41_model` 记录表的初始化标准差和种子，
 `prepare_deepseek_v41_model_for_fsdp` 转换 dtype、搬运其他张量并保留 meta 表。
-随后 `FSDPTurbo` 根据 EP mesh 确定行分片，再分配和初始化本地权重。
+随后 `FSDPTurbo` 根据 EP/FSDP mesh 分片参数并分配本地 Engram 权重，最后
+`initialize_deepseek_v41_model` 只初始化各 rank 的本地参数 shard。
 示例的 `build_model` 已采用此流程：
 
 ```python
 model = build_deepseek_v41_model(
     tokenizer=tokenizer,
 )
-initialize_deepseek_v41_model(model)
 model = prepare_deepseek_v41_model_for_fsdp(
     model, device=device, parameter_dtype=torch.bfloat16,
 )
 model = FSDPTurbo(config, model)
+initialize_deepseek_v41_model(model.model)
 ```
 
 不要在切分前对 meta 表调用普通 `model.to()` 或整模型 `to_empty()`；请使用上面的
 prepare 函数。优化器应在 `FSDPTurbo` 构造后创建。模型构造入口不接收 mesh，
-切分统一由 FSDPTurbo 管理。延后初始化按模块名和行起点派生随机种子，
+切分统一由 FSDPTurbo 管理。延后初始化按全局种子、层号和行起点派生随机种子，
 在固定拓扑、相同初始种子下可复现；
 不保证与先初始化完整表再切分的随机值逐元素一致。
 

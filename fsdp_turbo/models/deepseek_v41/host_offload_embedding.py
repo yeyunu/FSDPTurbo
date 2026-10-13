@@ -103,7 +103,10 @@ def _fetch(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     fetched, fetch_context = buffer.value.engram_fetch(indices.contiguous())()
     token = buffer.store_fetch_context(fetch_context)
-    return fetched.contiguous(), indices.new_tensor(token, dtype=torch.int64)
+    # The token names Python-owned state and is never consumed by an accelerator
+    # kernel. Keep it on the host so backward does not introduce an NPU-to-host
+    # synchronization merely to recover a Python dictionary key.
+    return fetched.contiguous(), torch.tensor(token, dtype=torch.int64, device="cpu")
 
 
 @_fetch.register_fake
@@ -115,7 +118,7 @@ def _fetch_fake(weight, indices, buffer):
             dtype=weight.dtype,
             device=indices.device,
         ),
-        indices.new_empty((), dtype=torch.int64),
+        torch.empty((), dtype=torch.int64, device="cpu"),
     )
 
 
@@ -216,7 +219,6 @@ class HostOffloadEmbedding(nn.Module):
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.pin_memory = pin_memory
         self.init_std = 0.02
-        self.init_seed = None
         # Ownership is unknown until FSDPTurbo has constructed its EP mesh.
         self.weight = nn.Parameter(
             torch.empty(
@@ -275,8 +277,8 @@ class HostOffloadEmbedding(nn.Module):
             logger.warning("Pinned Host allocation is unavailable; allocating pageable Engram storage.")
             local = torch.empty(self.local_rows, self.embedding_dim, dtype=self.weight.dtype)
         generator = torch.Generator(device="cpu")
-        seed = torch.initial_seed() if self.init_seed is None else self.init_seed
-        generator.manual_seed((seed + self.row_start) % (2**64))
+        seed = (torch.initial_seed() + self.layer_id + self.row_start) % (2**64)
+        generator.manual_seed(seed)
         nn.init.normal_(local, std=self.init_std, generator=generator)
         self.weight = nn.Parameter(local, requires_grad=self.weight.requires_grad)
         self.weight._engram_host_offload = True

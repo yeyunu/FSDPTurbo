@@ -637,11 +637,13 @@ class Indexer(torch.nn.Module):
         self.q_lora_rank = args.q_lora_rank
         self.softmax_scale = self.index_head_dim**-0.5
         if self.use_fused_lightning_indexer:
-            if (self.n_heads, self.index_head_dim, self.index_topk) != (32, 128, 512):
-                raise ValueError("Fused DS41 indexers require index_n_heads=32, index_head_dim=128 and index_topk=512")
-            if self.compress_ratio not in (1, 2):
-                raise ValueError("Fused DS41 indexers require index-source compress ratios 1 or 2")
-            if self.is_candidate_source and (
+            if (self.n_heads, self.index_head_dim) != (32, 128):
+                raise ValueError("Fused DS41 indexers require index_n_heads=32 and index_head_dim=128")
+            if not 1 <= self.index_topk <= 8192:
+                raise ValueError("Fused DS41 indexers require index_topk in [1,8192]")
+            if not 1 <= self.compress_ratio <= 128:
+                raise ValueError("Fused DS41 indexers require index-source compress ratios in [1,128]")
+            if (self.is_candidate_source or self.uses_candidates) and (
                 self.candidate_topk_blocks,
                 self.candidate_block_size,
             ) != (2048, 8):
@@ -1621,7 +1623,7 @@ class Transformer(nn.Module):
             patches = [img.patches.to(h.device) for img in image_records]
             grid_sizes = [(img.n_vit_h, img.n_vit_w) for img in image_records]
 
-        vision_features = self.vision.forward_packed(patches, grid_sizes)
+        vision_features = self.vision(patches, grid_sizes)
         aligned_features = self.aligner(vision_features, grid_sizes)
         if real_image_count == 0:
             return

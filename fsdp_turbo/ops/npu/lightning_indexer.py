@@ -13,23 +13,31 @@ from fsdp_turbo.ops.registry import register_op
 
 
 _FP4_THRESHOLDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
-_SUPPORTED_PAGE_SIZES = (64, 128)
+_MX_BLOCK_SIZE = 32
 
 
 class _DirectArenaOps:
     """Normalize the arena Python entry points to the ds41 call schema."""
 
-    def __init__(self, quant_lightning_indexer, quant_sparse_lightning_indexer):
+    def __init__(
+        self,
+        quant_lightning_indexer,
+        quant_sparse_lightning_indexer,
+        quant_lightning_indexer_metadata,
+        quant_sparse_lightning_indexer_metadata,
+    ):
         self._qli = quant_lightning_indexer
         self._qsli = quant_sparse_lightning_indexer
+        self.quant_lightning_indexer_metadata = quant_lightning_indexer_metadata
+        self.quant_sparse_lightning_indexer_metadata = quant_sparse_lightning_indexer_metadata
 
-    def quant_lightning_indexer(self, q, k, w, q_descale, k_descale, topk, quant_mode, **kwargs):
+    def quant_lightning_indexer(self, q, k, w, descale_q, descale_k, topk, quant_mode, **kwargs):
         return self._qli(
             q,
             k,
             w,
-            q_descale,
-            k_descale,
+            descale_q,
+            descale_k,
             topk=topk,
             quant_mode=quant_mode,
             **kwargs,
@@ -40,8 +48,7 @@ class _DirectArenaOps:
         q,
         k,
         w,
-        q_descale,
-        k_descale,
+        descale_q,
         candidate_block_indices,
         candidate_block_length,
         topk,
@@ -53,8 +60,7 @@ class _DirectArenaOps:
             q,
             k,
             w,
-            q_descale,
-            k_descale,
+            descale_q,
             candidate_block_indices,
             candidate_block_length,
             topk=topk,
@@ -75,8 +81,15 @@ def _get_ds41_ops():
         from ops.quant_sparse_lightning_indexer_dsl import (
             quant_sparse_lightning_indexer,
         )
+        from ops.quant_lightning_indexer_metadata_dsl import quant_lightning_indexer_metadata
+        from ops.quant_sparse_lightning_indexer_metadata_dsl import quant_sparse_lightning_indexer_metadata
 
-        return _DirectArenaOps(quant_lightning_indexer, quant_sparse_lightning_indexer)
+        return _DirectArenaOps(
+            quant_lightning_indexer,
+            quant_sparse_lightning_indexer,
+            quant_lightning_indexer_metadata,
+            quant_sparse_lightning_indexer_metadata,
+        )
     except (ImportError, AttributeError) as error:
         arena_error = error
 
@@ -84,9 +97,17 @@ def _get_ds41_ops():
     try:
         from cann_ops_transformer.ops import ds41
 
-        if hasattr(ds41, "quant_lightning_indexer") and hasattr(ds41, "quant_sparse_lightning_indexer"):
+        if all(
+            hasattr(ds41, name)
+            for name in (
+                "quant_lightning_indexer",
+                "quant_sparse_lightning_indexer",
+                "quant_lightning_indexer_metadata",
+                "quant_sparse_lightning_indexer_metadata",
+            )
+        ):
             return ds41
-        transformer_error = AttributeError("ds41 does not expose both QLI and QSLI")
+        transformer_error = AttributeError("ds41 must expose QLI/QSLI and both metadata entry points")
     except (ImportError, AttributeError) as error:
         transformer_error = error
 
@@ -153,8 +174,8 @@ def _pack_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def _make_paged_key(key: torch.Tensor, page_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Convert dense ``[B,K,128]`` keys to PA_BBND and a sequential block table."""
-    if page_size not in _SUPPORTED_PAGE_SIZES:
-        raise ValueError(f"Precompiled DS41 indexers support page_size 64 or 128, got {page_size}")
+    if page_size <= 0 or page_size > 1024 or page_size % 16:
+        raise ValueError(f"DS41 indexers require page_size to be a multiple of 16 in [16,1024], got {page_size}")
     if key.ndim != 3 or key.shape[-1] != 128:
         raise ValueError(f"Indexer key must have shape [B,K,128], got {tuple(key.shape)}")
 
@@ -169,6 +190,18 @@ def _make_paged_key(key: torch.Tensor, page_size: int) -> tuple[torch.Tensor, to
         batch_size, pages_per_sequence
     )
     return packed_key, key_scale, block_table
+
+
+def _pack_sparse_key(key: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Store each logical 8-token block as 512 K bytes followed by 32 scale bytes."""
+    pages, page_size = key.shape[:2]
+    return torch.cat(
+        (
+            key.reshape(pages, page_size // 8, 512),
+            scale.reshape(pages, page_size // 8, 32),
+        ),
+        dim=-1,
+    ).contiguous()
 
 
 def _sequence_metadata(
@@ -223,33 +256,65 @@ def _fused_quant_lightning_indexer(
         raise ValueError(f"Indexer query must have shape [B,S,32,128], got {tuple(query.shape)}")
     if head_weights.shape != query.shape[:3]:
         raise ValueError(f"Indexer weights must have shape {tuple(query.shape[:3])}, got {tuple(head_weights.shape)}")
-    if topk != 512:
-        raise ValueError(f"Packaged DS41 AOT indexers require topk=512, got {topk}")
-    if compress_ratio not in (1, 2):
-        raise ValueError(f"Packaged DS41 AOT indexers support compress_ratio 1 or 2, got {compress_ratio}")
+    if not 1 <= topk <= 8192:
+        raise ValueError(f"DS41 indexers require topk in [1,8192], got {topk}")
+    if not 1 <= compress_ratio <= 128:
+        raise ValueError(f"DS41 indexers require compress_ratio in [1,128], got {compress_ratio}")
+    if candidate_block_indices is not None:
+        if candidate_block_length is None:
+            raise ValueError("candidate_block_length is required with candidate indices")
+        if candidate_block_size != 8:
+            raise ValueError("QSLI requires candidate_block_size=8")
+        tokens = query.shape[0] * query.shape[1]
+        if candidate_block_indices.shape != (tokens, 1, 2048):
+            raise ValueError("QSLI candidate indices must have shape [B*S,1,2048]")
+        if candidate_block_length.shape != (tokens, 1):
+            raise ValueError("QSLI candidate lengths must have shape [B*S,1]")
 
     batch_size, sequence_length = query.shape[:2]
     packed_query, query_scale = _pack_mxfp4(query.reshape(-1, 32, 128))
     packed_key, key_scale, block_table = _make_paged_key(key, page_size)
     cu_q, used_q, used_k, residual = _sequence_metadata(query, key.shape[1], compress_ratio, attention_mask)
     weights = head_weights.reshape(-1, 32).float().contiguous()
-    common_kwargs = dict(
+    sequence_kwargs = dict(
         cu_seqlens_q=cu_q,
         seqused_q=used_q,
         seqused_k=used_k,
         cmp_residual_k=residual,
-        block_table=block_table,
-        metadata=None,
         max_seqlen_q=sequence_length,
         mask_mode=3,
         cmp_ratio=compress_ratio,
         layout_q="TND",
-        layout_kv="PA_BBND",
+        layout_k="PA_BBND",
+    )
+    metadata_kwargs = dict(
+        **sequence_kwargs,
+        batch_size=batch_size,
+        max_seqlen_k=key.shape[1],
+        num_heads_q=32,
+        num_heads_k=1,
+        head_dim=128,
+        topk=topk,
+    )
+    common_kwargs = dict(
+        **sequence_kwargs,
+        block_table=block_table,
+        output_idx_offset=torch.full(
+            (batch_size * sequence_length, 1),
+            index_offset,
+            dtype=torch.int32,
+            device=packed_query.device,
+        ),
         return_value=False,
     )
     ds41 = _get_ds41_ops()
 
     if candidate_block_indices is None:
+        metadata = ds41.quant_lightning_indexer_metadata(
+            **metadata_kwargs,
+            candidate_topk_blocks=candidate_topk_blocks,
+            candidate_block_size=candidate_block_size,
+        )
         indices, _, candidates, candidate_lengths = ds41.quant_lightning_indexer(
             packed_query,
             packed_key,
@@ -260,33 +325,32 @@ def _fused_quant_lightning_indexer(
             1,
             candidate_topk_blocks=candidate_topk_blocks,
             candidate_block_size=candidate_block_size,
+            metadata=metadata,
             **common_kwargs,
         )
         if candidate_topk_blocks <= 0:
             candidates = candidate_lengths = None
-        if index_offset:
-            indices = torch.where(indices >= 0, indices + index_offset, indices)
     else:
-        if candidate_block_length is None:
-            raise ValueError("candidate_block_length is required with candidate indices")
-        output_offset = torch.full(
-            (batch_size * sequence_length, 1),
-            index_offset,
-            dtype=torch.int32,
-            device=query.device,
+        candidate_block_indices = candidate_block_indices.to(device=packed_query.device, dtype=torch.int32).contiguous()
+        candidate_block_length = candidate_block_length.to(device=packed_query.device, dtype=torch.int32).contiguous()
+        metadata = ds41.quant_sparse_lightning_indexer_metadata(
+            candidate_block_length,
+            **metadata_kwargs,
+            quant_mode=1,
+            candidate_block_size=candidate_block_size,
         )
         indices, _ = ds41.quant_sparse_lightning_indexer(
             packed_query,
-            packed_key,
+            _pack_sparse_key(packed_key, key_scale),
             weights,
             query_scale,
-            key_scale,
             candidate_block_indices,
             candidate_block_length,
             topk,
             1,
             candidate_block_size,
-            output_idx_offset=output_offset,
+            descale_k=None,
+            metadata=metadata,
             **common_kwargs,
         )
         candidates = candidate_lengths = None

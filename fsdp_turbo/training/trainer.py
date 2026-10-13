@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.utils.dtype import get_dtype
@@ -12,6 +13,108 @@ from fsdp_turbo.training.checkpoint import Checkpointer
 from fsdp_turbo.training.monitor import Monitor
 
 logger = logging.getLogger(__name__)
+
+
+def get_local_rank() -> int:
+    """
+    获取当前进程的 Local Rank（节点内编号）
+    优先使用 torchrun 设置的 LOCAL_RANK 环境变量
+    """
+    local_rank = os.environ.get('LOCAL_RANK')
+    if local_rank is not None:
+        return int(local_rank)
+
+    # 回退方案：全局 rank 对节点内卡数取模（假设每节点8卡）
+    if dist.is_initialized():
+        global_rank = dist.get_rank()
+        # 从环境变量获取每节点卡数，如果没有则默认为8
+        local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', 8))
+        return global_rank % local_world_size
+
+    return 0
+
+
+def parse_cpu_affinity_conf(conf_str: str) -> dict:
+    """
+    解析 CPU_AFFINITY_CONF 字符串
+    格式: "1,npu0:144-155,npu1:156-167,..."
+    返回: {'npu0': (144, 155), 'npu1': (156, 167), ...}
+    """
+    npu_map = {}
+    if not conf_str:
+        return npu_map
+
+    # 按逗号分割
+    parts = [p.strip() for p in conf_str.split(',')]
+
+    # 跳过开头的开关标志（如 "1"）
+    start_idx = 0
+    if parts and not parts[0].startswith('npu'):
+        start_idx = 1
+
+    for part in parts[start_idx:]:
+        if not part:
+            continue
+        if ':' in part:
+            npu_name, range_str = part.split(':', 1)
+            npu_name = npu_name.strip()
+            range_str = range_str.strip()
+            if '-' in range_str:
+                try:
+                    start, end = map(int, range_str.split('-'))
+                    npu_map[npu_name] = (start, end)
+                except ValueError:
+                    logger.warning("无法解析CPU范围: %s", part)
+    return npu_map
+
+
+def apply_cpu_affinity_by_conf():
+    """
+    主入口：读取环境变量，解析，并根据 Local Rank 绑定 CPU
+    必须在 dist.init_process_group 之后调用
+    """
+    conf_str = os.environ.get("CPU_AFFINITY_CONF", "")
+    if not conf_str:
+        logger.info("CPU_AFFINITY_CONF 未设置，跳过CPU绑核")
+        return
+
+    # 解析配置
+    npu_map = parse_cpu_affinity_conf(conf_str)
+    if not npu_map:
+        logger.warning("CPU_AFFINITY_CONF 解析结果为空: %s", conf_str)
+        return
+
+    # 获取 Local Rank
+    local_rank = get_local_rank()
+    npu_name = f"npu{local_rank}"
+
+    if npu_name not in npu_map:
+        logger.warning("Local Rank %s 对应的 %s 未在配置中找到，跳过绑核", local_rank, npu_name)
+        return
+
+    start_cpu, end_cpu = npu_map[npu_name]
+
+    if not hasattr(os, "sched_setaffinity") or not hasattr(os, "sched_getaffinity"):
+        logger.warning("当前平台不支持 CPU 绑核，跳过绑核")
+        return
+    set_affinity = getattr(os, "sched_setaffinity")
+    get_affinity = getattr(os, "sched_getaffinity")
+
+    # 执行绑核
+    try:
+        # 设置当前进程（或主线程）的 CPU 亲和性
+        set_affinity(0, range(start_cpu, end_cpu + 1))
+
+        # 验证绑核结果
+        actual = sorted(get_affinity(0))
+        expected = list(range(start_cpu, end_cpu + 1))
+        if actual == expected:
+            logger.info("[OK] Local Rank %s (%s) 已绑定到 CPU %s-%s", local_rank, npu_name, start_cpu, end_cpu)
+        else:
+            logger.warning("[WARN] 绑核结果不符，期望 %s，实际 %s", expected, actual)
+
+    except Exception as e:
+        logger.error("绑核失败: %s", e, exc_info=True)
 
 
 class BaseTrainer:
@@ -280,6 +383,7 @@ class BaseTrainer:
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.accelerator.set_device_index(local_rank)
         torch.accelerator.set_device(local_rank)
+        apply_cpu_affinity_by_conf()
 
         self._set_seed()
 

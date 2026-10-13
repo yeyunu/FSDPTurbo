@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import math
-import zlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -22,7 +21,7 @@ _REFERENCE_DIRECTORY = Path(__file__).parent
 
 
 def _load_model_args() -> dict:
-    with (_REFERENCE_DIRECTORY / "config_8p.json").open("r", encoding="utf-8") as config_file:
+    with (_REFERENCE_DIRECTORY / "config_8p_A5.json").open("r", encoding="utf-8") as config_file:
         return json.load(config_file)
 
 
@@ -232,12 +231,17 @@ def _depth_std(name: str, base_std: float) -> float:
 
 
 def initialize_deepseek_v41_model(model: nn.Module, standard_deviation: float = 0.02) -> None:
-    """Initialize common modules, then apply the few DeepSeek-V4.1-specific rules."""
+    """Initialize materialized parameters, including DTensor local shards.
+
+    Deferred host tables initialize themselves when their EP shard is materialized.
+    """
     with torch.no_grad():
         for module_name, module in model.named_modules():
             if isinstance(module, HostOffloadEmbedding):
-                module.init_std = standard_deviation
-                module.init_seed = (torch.initial_seed() + zlib.crc32(module_name.encode())) % (2**64)
+                # This table owns its row-wise initialization. After parallelism
+                # it may already be materialized on the host, so never overwrite
+                # it through the generic rules below.
+                continue
 
             for local_name, parameter in module.named_parameters(recurse=False):
                 if parameter.is_meta:
@@ -264,7 +268,7 @@ def initialize_deepseek_v41_model(model: nn.Module, standard_deviation: float = 
                 elif local_name in {"q_weight", "k_weight"}:
                     nn.init.ones_(parameter)
                 elif local_name in _MHC_PARAMETERS or local_name == "attn_sink":
-                    nn.init.trunc_normal_(parameter, mean=0.0, std=standard_deviation)
+                    nn.init.normal_(parameter, mean=0.0, std=standard_deviation)
                 elif isinstance(module, reference_model.ParallelEmbedding):
                     nn.init.normal_(parameter, mean=0.0, std=1.0)
                 elif isinstance(module, reference_model.ParallelHead):
@@ -279,17 +283,21 @@ def initialize_deepseek_v41_model(model: nn.Module, standard_deviation: float = 
                 elif isinstance(module, reference_model.DeepSeekV41Experts):
                     depth_std = _depth_std(name, standard_deviation)
                     if local_name == "gate_up_proj":
-                        gate, up = parameter.chunk(2, dim=1)
-                        nn.init.trunc_normal_(gate, mean=0.0, std=standard_deviation)
-                        nn.init.trunc_normal_(up, mean=0.0, std=depth_std)
+                        # Initialize the packed, contiguous storage in one pass.  The
+                        # two dim-1 chunks are non-contiguous across experts, making
+                        # separate random fills disproportionately expensive.
+                        nn.init.normal_(parameter, mean=0.0, std=standard_deviation)
+                        if standard_deviation:
+                            _, up = parameter.chunk(2, dim=1)
+                            up.mul_(depth_std / standard_deviation)
                     else:
-                        nn.init.trunc_normal_(parameter, mean=0.0, std=depth_std)
+                        nn.init.normal_(parameter, mean=0.0, std=depth_std)
                 elif name.endswith(".ffn.gate.weight") or name.endswith(
                     (".ffn.shared_experts.w2.weight", ".ffn.shared_experts.w3.weight")
                 ):
-                    nn.init.trunc_normal_(parameter, mean=0.0, std=_depth_std(name, standard_deviation))
+                    nn.init.normal_(parameter, mean=0.0, std=_depth_std(name, standard_deviation))
                 elif local_name == "weight" or parameter.ndim > 1:
-                    nn.init.trunc_normal_(parameter, mean=0.0, std=standard_deviation)
+                    nn.init.normal_(parameter, mean=0.0, std=standard_deviation)
                 else:
                     nn.init.zeros_(parameter)
 

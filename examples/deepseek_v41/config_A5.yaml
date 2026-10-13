@@ -1,0 +1,172 @@
+# ============================================================
+# DeepSeek-V4.1-Flash Text Training Configuration
+# ============================================================
+
+# --- Model Configuration ---
+model:
+  model_name_or_path: "/mnt/share/g00878035/DSV41/models/DeepSeek-V4.1-Flash"
+  tokenizer_name_or_path: "/mnt/share/g00878035/DSV41/models/DeepSeek-V4.1-Flash"
+  torch_dtype: "bf16"
+  engram_storage_backend: "elastic_buffer"
+  # Use CANN SparseFlashMla/SparseFlashMlaGrad instead of eager indexed attention.
+  use_sparse_flash_attn: true
+  # Use QuantLightningIndexer/QuantSparseLightningIndexer on Ascend950DT.
+  # Ascend 910B/910C/910_93 candidate indexers are not supported yet.
+  use_fused_lightning_indexer: true
+  # Use CANN Compressor/CompressorGrad for compressed-KV pooling.
+  use_fused_compressor: true
+  # Use CANN MhcPreSinkhornPremix/MhcPost training kernels.
+  use_fused_mhc: true
+  # Use CANN FlashAttn/FlashAttnGrad for full bidirectional vision attention.
+  use_fused_vision_flash_attn: true
+
+# --- Optimizer Configuration ---
+optimizer:
+  optimizer_type: "AdamW"
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1e-8
+  lr: 3.0e-4
+  warmup_ratio: 0.03
+  lr_scheduler_type: "CosineAnnealingLR"
+  min_lr: 3.0e-5
+  clip_grad: 1.0
+
+# --- Run Configuration ---
+run:
+  seed: 42
+  deterministic: false
+  max_steps: -1
+  num_train_epochs: 1
+  gradient_accumulation_steps: 1
+  logging_steps: 1
+  profile:
+    enabled: true
+    wait_steps: 1
+    warmup_steps: 1
+    active_steps: 1
+    repeat: 1
+    skip_first: 5
+    output_dir: "/mnt/share/g00878035/DSV41/profiles/dsv41_8p"
+    record_shapes: true
+    profile_memory: false
+    with_stack: true
+
+  # profile:
+  #   enabled: true
+  #   wait_steps: 0
+  #   warmup_steps: 0
+  #   active_steps: 5
+  #   repeat: 1
+  #   skip_first: 0
+  #   output_dir: "/mnt/share/g00878035/DSV41/profiles/dsv41_8p_first"
+  #   record_shapes: true
+  #   profile_memory: false
+  #   with_stack: false
+
+# --- Checkpoint Configuration ---
+checkpoint:
+  output_dir: "./output"
+  save_steps: 500
+  strict: true
+  save_optim: true
+  load_optim: true
+  resume_from_checkpoint: null
+
+# --- Data Configuration ---
+data:
+  dataset_path: "/mnt/share/g00815994/kimi-k3-0825/LLaVA-Instruct-150K/llava_instruct_150k_fsdp_turbo_10k_len2165.json"
+  dataset_config: null
+  text_column: "text"
+  image_column: "images"
+  conversation_column: "messages"
+  media_key: "images"
+  split: "train"
+  batch_size: 1
+  max_seq_length: 2048
+  num_workers: 8
+  pin_memory: true
+  shuffle: false
+  is_multimodal: true
+
+# --- Distributed Configuration ---
+distributed:
+  data_parallel_size: 1
+  fully_shard_parallel_size: 8
+  tensor_parallel_size: 1
+  kv_allgather_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 8
+  expert_fully_shard_parallel_size: 1
+  expert_data_parallel_size: 1
+
+  # --- FSDP Plan ---
+  fsdp_plan:
+    ignored_modules: []
+    apply_modules:
+      model.layers.{*}:
+        {}
+      # The vision blocks are individually too light to hide one cross-node AG.
+      # Treat the complete tower as one FSDP unit to batch parameter unsharding.
+      model.vision:
+        {}
+      model.aligner:
+        {}
+      model.embed:
+        {}
+      model.head:
+        {}
+    param_dtype: "bf16"
+    reduce_dtype: "fp32"
+    # Preserve heterogeneous block outputs: BF16 hidden states and FP32 HC
+    # pre-mix coefficients. Casting the whole tuple to BF16 changes layer N+1.
+    output_dtype: null
+    # DeepSeek controls numerical dtypes inside the model. In particular,
+    # blanket casting would truncate FP32 HC pre-mix coefficients to BF16.
+    cast_forward_inputs: false
+    num_to_forward_prefetch: 2
+    num_to_backward_prefetch: 2
+    hook_modules:
+      - model.layers.{*}
+      - model.vision
+    fsdp_implementation: "custom"
+
+  # --- Tensor Parallel Plan ---
+  # V4.1 attention retains replicated heads because its attention sink and
+  # indexed sparse-attention layout require a model-specific head sharder.
+  # Split the shared SwiGLU expert over its intermediate dimension instead.
+  tp_plan:
+    colwise_parallel:
+      - model.layers.{*}.ffn.shared_experts.w1
+      - model.layers.{*}.ffn.shared_experts.w3
+    rowwise_parallel:
+      - model.layers.{*}.ffn.shared_experts.w2
+    sequence_parallel: []
+
+  # --- Expert Parallel Plan ---
+  ep_plan:
+    apply_modules:
+      - model.layers.{*}.ffn.experts
+    # Preserve DeepSeek-V4.1's expert probability application and FP32
+    # accumulation order for numerical accuracy.
+    dispatcher: "custom_native_eager_forward"
+    fixed_router: true
+    apply_efsdp_modules:
+      - model.layers.{*}.ffn.experts
+
+  cp_plan:
+    ulysses_function_patches: []
+    kv_allgather_function_patches: []
+    loss_function_patches: []
+
+# --- Memory Configuration ---
+memory:
+  # V4.1 attention shares runtime state between layers. Recompute requires a
+  # model-specific state capture and is intentionally disabled in this adapter.
+  recompute: false
+  recompute_plan: []
+
+# --- Quantization Configuration ---
+quantization:
+  quantization_plan: null

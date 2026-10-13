@@ -37,7 +37,7 @@ def test_packed_vision_matches_isolated_images_and_calls_each_module_once():
         mock.patch.object(vision.blocks[1], "forward", wraps=vision.blocks[1].forward) as block1_forward,
         mock.patch.object(aligner, "forward", wraps=aligner.forward) as aligner_forward,
     ):
-        features = vision.forward_packed(patches, grids)
+        features = vision(patches, grids)
         actual = aligner(features, grids)
 
     assert patch_embed_forward.call_count == 1
@@ -58,8 +58,22 @@ def test_packed_vision_backward_is_finite():
     ]
     grids = [(3, 3), (6, 3)]
 
-    output = aligner(vision.forward_packed(patches, grids), grids)
+    output = aligner(vision(patches, grids), grids)
     sum(image.float().square().mean() for image in output).backward()
 
     assert all(image.grad is not None for image in patches)
     assert all(torch.isfinite(image.grad).all() for image in patches)
+
+
+def test_packed_vision_runs_tower_hooks_before_patch_projection():
+    vision = ViT(_model_args())
+    events = []
+    vision.register_forward_pre_hook(lambda *_: events.append("unshard"))
+    vision.patch_embed.register_forward_pre_hook(lambda *_: events.append("projection"))
+    vision.register_forward_hook(lambda *_: events.append("reshard"))
+    patches = [torch.randn(9, 3, 2, 2), torch.randn(18, 3, 2, 2)]
+    grids = [(3, 3), (6, 3)]
+
+    output = vision(patches, grids)
+    assert events == ["unshard", "projection", "reshard"]
+    assert [image.shape[0] for image in output] == [9, 18]
