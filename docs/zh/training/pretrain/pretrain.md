@@ -29,7 +29,7 @@
 
 ### 环境搭建
 
-启动预训练前请参考 [软件安装](../install_guide.md) 完成环境安装，并确保已完成相关环境变量配置：
+启动预训练前请参考[软件安装](../install_guide.md)完成环境安装，并确保已完成相关环境变量配置：
 
 ```shell
 source /usr/local/Ascend/cann/set_env.sh

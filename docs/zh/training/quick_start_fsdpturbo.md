@@ -107,11 +107,8 @@ cd ..
 
 > [!NOTE]
 >
-> 本地文件支持`.json`、`.jsonl`、`.csv`、`.parquet`、`.txt`等格式，由HuggingFace `datasets`自动识别。HuggingFace Hub上的数据集（`.parquet`等格式）由HuggingFace `datasets`自动识别加载。
-
-> [!NOTE]
->
-> 如需进行多模态数据集的下载、格式转换与校验，请参考 [geo3k 数据集微调实战](./geo3k_finetune_guide.md)。
+> - 本地文件支持`.json`、`.jsonl`、`.csv`、`.parquet`、`.txt`等格式，由HuggingFace `datasets`自动识别。HuggingFace Hub上的数据集（`.parquet`等格式）由HuggingFace `datasets`自动识别加载。
+> - 如需进行多模态数据集的下载、格式转换与校验，请参考[geo3k数据集微调实战](./geo3k_finetune_guide.md)。
 
 ## 启动预训练
 
@@ -264,13 +261,13 @@ cd ..
 
 > [!NOTE]
 >
-> - 多机微调需在多个终端同时启动微调脚本（每个终端的`NODE_RANK`不同，其余参数相同）。
+> 多机微调需在多个终端同时启动微调脚本（每个终端的`NODE_RANK`不同，其余参数相同）。
 
 ## 训练脚本参数说明
 
 下表为`config.yaml`中部分关键参数解释：
 
-**表1**训练配置参数说明
+**表1**  训练配置参数说明
 
 | 参数名 | 说明 | 配置示例 |
 |---|---|---|

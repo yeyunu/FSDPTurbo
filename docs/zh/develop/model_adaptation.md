@@ -96,7 +96,8 @@ distributed:
         type: causal_lm_loss
 ```
 
-> **Note**
+> [!NOTE]
+>
 > Ulysses CP可能需要通过`module_patches`替换模型forward（参考`examples/qwen3_5/config.yaml`）：
 
 ```yaml
@@ -120,7 +121,8 @@ distributed:
       - model.layers.{*}.mlp.experts
 ```
 
-> **Note**
+> [!NOTE]
+> 
 > EP路径要求experts模块持有3D张量参数（`gate_up_proj`、`down_proj`），而非ModuleList形式的独立专家子模块。若模型专家计算语义非标准，可使用`dispatcher='custom_ep_forward_eager'` / `'custom_ep_forward_fused'`，并在专家模块上自行实现：
 >
 > ```python

@@ -31,6 +31,6 @@ distributed:
 
 ## 注意事项
 
-- **梯度同步**：TP切分参数由FSDP2统一管理梯度规约（TP列并行/行并行模块不再排除在FSDP2分片之外），开启TP与关闭TP精度可对齐；梯度范数计算同时识别`Shard`与`_StridedShard`放置方式。
+- **梯度同步**：TP切分参数由FSDP2统一管理梯度归约（TP列并行/行并行模块不再排除在FSDP2分片之外），开启TP与关闭TP精度可对齐；梯度范数计算同时识别`Shard`与`_StridedShard`放置方式。
 - **并行度约束**：`tensor_parallel_size`需能整除注意力头数与隐藏维度，否则列并行/行并行切分会失败。
 - **推荐配置**：单节点内优先使用FSDP2 + TP组合（如8卡：`fully_shard_parallel_size=4, tensor_parallel_size=2`），TP不宜过大，建议 ≤ 8。

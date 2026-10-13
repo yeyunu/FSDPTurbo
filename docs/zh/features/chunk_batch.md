@@ -45,7 +45,7 @@ memory:
 - 微批次切分则包装decoder层的forward（见`fsdp_turbo/memory/chunk_batch/chunk_batch.py`），将输入沿**batch维**切片逐块执行，输出再拼接回原形状。
 - 两种机制都以接管forward入口的方式生效，叠加后序列切分、掩码重建、跨rank通信与输出拼接所依赖的形状约定不再被保证，当前实现未提供组合适配。
 
-> [!WARNING]
+> [!NOTICE]
 >
 > 与Chunk Loss不同（开启CP后设置`enable_chunk_loss`会直接报错），微批次切分与CP同时开启**没有启动或前向阶段的显式校验**，不会立刻报错，但行为未定义，务必避免该配置组合。
 

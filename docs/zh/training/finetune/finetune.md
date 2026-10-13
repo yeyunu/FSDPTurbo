@@ -19,13 +19,7 @@
 
 ## 环境搭建
 
-启动微调前，请参考 [软件安装](../install_guide.md) 完成环境安装。
-
-NPU环境下训练前需加载CANN环境：
-
-```shell
-source /usr/local/Ascend/cann/set_env.sh
-```
+启动微调前，请参考[软件安装](../install_guide.md)完成环境安装。
 
 ## 模型权重准备
 

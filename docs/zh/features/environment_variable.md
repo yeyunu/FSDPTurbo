@@ -29,8 +29,9 @@ NNODES=2 GPUS_PER_NODE=16 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 bash run.sh
 | `ASCEND_LAUNCH_BLOCKING` | NPU同步执行开关（示例脚本中设置为`1`，便于调试定位） |
 | `ASCEND_SLOG_PRINT_TO_STDOUT` | NPU日志输出到标准输出（调试用，默认关闭） |
 
-> **Note**
-> 训练前需正确加载昇腾环境（若使用NPU）：
+> [!NOTE]
+> 
+> NPU环境下，训练前需正确加载昇腾环境：
 >
 > ```bash
 > source /usr/local/Ascend/cann/set_env.sh

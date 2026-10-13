@@ -4,7 +4,7 @@
 
 ## 性能分析方法
 
-性能调优的前提是准确定位瓶颈。FSDPTurbo内置PyTorch Profiler支持，详见 [性能数据采集](../../tools/profiling.md)。通过Profiling结果可判断：
+性能调优的前提是准确定位瓶颈。FSDPTurbo内置PyTorch Profiler支持，详见[性能数据采集](../../tools/profiling.md)。通过Profiling结果可判断：
 
 - **计算瓶颈**：算子耗时占比高，需优化计算效率或开启量化。
 - **通信瓶颈**：AllGather / ReduceScatter耗时占比高，需调整预取策略或并行度。
@@ -47,7 +47,7 @@ MXFP8量化训练可同时降低显存占用与提升计算吞吐：
 - 配合`enable_fsdp_low_precision_all_gather: true`降低通信量。
 - MoE模型可额外开启`quant_gmm: true`加速专家计算。
 
-详见 [量化训练](../../features/quantization.md)。
+详见[量化训练](../../features/quantization.md)。
 
 ## MoE模型专项
 
@@ -57,4 +57,4 @@ MXFP8量化训练可同时降低显存占用与提升计算吞吐：
 | EFSDP并行度 | 专家参数量大时开启`apply_efsdp_modules`，对专家参数做FSDP2全分片。 |
 | `fixed_router`固定路由 | 调试手段：以固定均匀路由替代实际路由，避免负载不均带来的性能与精度问题，仅在`expert_parallel_size > 1`时生效。 |
 
-详见 [专家并行](../../features/expert_parallel.md)。
+详见[专家并行](../../features/expert_parallel.md)。

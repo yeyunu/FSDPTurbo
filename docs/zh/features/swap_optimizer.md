@@ -8,7 +8,7 @@ AdamW等优化器的状态（一阶动量`exp_avg`、二阶动量`exp_avg_sq`）
 
 1. 初始化时，将优化器状态从device复制到pinned CPU内存。
 2. `step()`执行时，按当前可用显存批量将state回装到device，计算参数更新后再交换回host。
-3. 通过分批回装，将峰值显存从"全部state"降低为"单批state"。
+3. 通过分批回装，将峰值显存从“全部state”降低为“单批state”。
 
 ## 配置方法
 
