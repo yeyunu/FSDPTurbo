@@ -4,6 +4,20 @@
 [`config.yaml`](./config.yaml) 已开启 Ulysses Context Parallel（CP），CP
 并行度为 2。
 
+## 模型代码加载
+
+`train.py` 和系统测试先调用 `fsdp_turbo.models.kimi.register_kimi_k3()`，
+将仓库内的 `KimiK3Config`、`KimiLinearConfig` 和 `KimiK3ForConditionalGeneration`
+注册到 Transformers。随后使用 `trust_remote_code=False` 加载配置和模型，
+确保使用 `fsdp_turbo/models/kimi/` 内的 `modeling_kimi_k3.py` 与
+`modeling_kimi_linear.py`，包括本地算子和 MoE 适配。
+`model_name_or_path` 仍指定配置及权重来源；processor 显式使用仓库内的
+`KimiK3Processor`，保留对列表文本输入的适配。其 tokenizer 和图像处理器
+继续通过 `trust_remote_code=True` 从模型目录加载。
+
+此方式对应 MindSpeed-MM 的“导入本地模型包、注册类、加载权重”流程，
+通过 Transformers 注册表接入，无需修改模型目录中的 modeling 文件。
+
 ## 开启 Ulysses CP
 
 开启 CP 时，配置中需要同时包含下面四部分：
@@ -105,6 +119,26 @@ padding，并通过 `attention_mask` 排除 padding token。
 ## 环境依赖
 
 在 A5 服务器上执行 Kimi K3 预训练前，需要先下载并安装 `mindspeed_ops` 库（https://gitcode.com/Ascend/MindSpeed-Ops）。
+
+Attention Residual 通过算子注册入口自动选择后端。在 NPU 上使用 AscendC 实现需要安装
+[`ops-transformer`](https://gitcode.com/cann/ops-transformer) 的
+`block_attention_residuals` 前向和反向算子。参考版本和安装方式如下：
+
+```bash
+git clone https://gitcode.com/cann/ops-transformer.git
+cd ops-transformer
+git checkout a041b05638
+source /usr/local/Ascend/cann/set_env.sh
+bash build.sh --pkg --soc=${soc_version} \
+  --ops=block_attention_residuals,block_attention_residuals_grad -j16
+bash build/cann-ops-transformer-custom_linux-aarch64.run
+bash build.sh --torch_extension
+pip install torch_extension/dist/*.whl --force-reinstall --no-deps
+export LD_LIBRARY_PATH=${ASCEND_OPP_PATH}/vendors/custom_transformer/op_api/lib/:${LD_LIBRARY_PATH}
+```
+
+`${soc_version}` 根据设备选择，例如 Atlas A2 使用 `ascend910b`，Atlas A3 使用
+`ascend910_93`，950 系列使用 `ascend950`。缺少扩展时自动回退到 eager 实现。
 
 ## 启动训练
 

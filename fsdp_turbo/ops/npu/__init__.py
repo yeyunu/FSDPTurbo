@@ -1,3 +1,4 @@
+from fsdp_turbo.ops.npu.attn_res import attn_res_npu
 from fsdp_turbo.ops.npu.causal_conv1d import causal_conv1d_npu, causal_conv1d_update_npu
 from fsdp_turbo.ops.npu.chunk_kda import chunk_kda_npu
 from fsdp_turbo.ops.npu.grouped_matmul import grouped_matmul_npu
@@ -30,6 +31,7 @@ from fsdp_turbo.ops.npu.mhc import fused_mhc_post, fused_mhc_pre_sinkhorn_premix
 from fsdp_turbo.ops.npu.vision_flash_attention import fused_vision_flash_attention
 
 __all__ = [
+    'attn_res_npu',
     'causal_conv1d_npu',
     'causal_conv1d_update_npu',
     'chunk_kda_npu',

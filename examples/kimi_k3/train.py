@@ -37,10 +37,12 @@ class KimiK3Trainer(BaseTrainer):
 
     def build_tokenizer(self):
         if self.config.data.is_multimodal:
-            from transformers import AutoProcessor
+            from fsdp_turbo.models.kimi.kimi_k3_processor import KimiK3Processor
 
             print_rank(logger.info, "> Building Processor (multimodal)...")
-            processor = AutoProcessor.from_pretrained(self.config.model.tokenizer_name_or_path, trust_remote_code=True)
+            processor = KimiK3Processor.from_pretrained(
+                self.config.model.tokenizer_name_or_path, trust_remote_code=True
+            )
             self.processor = processor
             return processor.tokenizer
         else:
@@ -52,15 +54,18 @@ class KimiK3Trainer(BaseTrainer):
         _ensure_triton_driver()
 
         from transformers import AutoModel
+        from fsdp_turbo.models.kimi import register_kimi_k3
+
+        register_kimi_k3()
 
         print_rank(logger.info, "> Building KimiK3 Model...")
-        model_config = AutoConfig.from_pretrained(self.config.model.model_name_or_path, trust_remote_code=True)
+        model_config = AutoConfig.from_pretrained(self.config.model.model_name_or_path, trust_remote_code=False)
         set_attn_implementation(model_config, self.config.model.attn_implementation)
         model = AutoModel.from_pretrained(
             self.config.model.model_name_or_path,
             config=model_config,
             attn_implementation=self.config.model.attn_implementation,
-            trust_remote_code=True,
+            trust_remote_code=False,
         )
         convert_model_dtype(model, self.config.model.torch_dtype)
 

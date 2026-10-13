@@ -6,13 +6,57 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# MODEL_PATH only needs config/tokenizer/processor and remote-code files.
+# MODEL_PATH supplies config/tokenizer/processor files; modeling is imported locally.
 # The language model is reduced to NUM_HIDDEN_LAYERS and randomly initialized.
 # DATASET_PATH points to multimodal JSON data (conversations + images).
 
-mkdir -p /home/dataset/Kimi-K3-tmp
-cp -r /home/dataset/Kimi-K3/* /home/dataset/Kimi-K3-tmp
-cp -r "$SCRIPT_DIR/../../../../fsdp_turbo/models/kimi/"* /home/dataset/Kimi-K3-tmp
+mkdir -p /home/dataset/Kimi-K3-tmp || exit 1
+cp -r /home/dataset/Kimi-K3/* /home/dataset/Kimi-K3-tmp/ || exit 1
+
+# Populate the local model package before register_kimi_k3() imports its modeling.
+# Only copy missing files, preserving existing local modeling and training adapters.
+KIMI_MODEL_DIR="$(python - <<'PY'
+from pathlib import Path
+import fsdp_turbo.models.kimi as kimi
+
+print(Path(kimi.__file__).resolve().parent)
+PY
+)" || exit 1
+echo "Preparing local Kimi model package: $KIMI_MODEL_DIR"
+(
+    cd /home/dataset/Kimi-K3-tmp || exit 1
+    for model_file in \
+        config.json \
+        configuration_kimi_k3.py \
+        encoding_k3.py \
+        generation_config.json \
+        kimi_k3_vision_processing.py \
+        media_utils.py \
+        preprocessor_config.json \
+        tiktoken.model \
+        tokenizer_config.json
+    do
+        if [ ! -e "$KIMI_MODEL_DIR/$model_file" ]; then
+            cp "$model_file" "$KIMI_MODEL_DIR/" || exit 1
+        fi
+    done
+) || exit 1
+
+# Fail before launching multiple ranks if the imported package is incomplete.
+python - <<'PY'
+from importlib.util import find_spec
+
+for module_name in (
+    'fsdp_turbo.models.kimi.configuration_kimi_k3',
+    'fsdp_turbo.models.kimi.modeling_kimi_k3',
+    'fsdp_turbo.models.kimi.modeling_kimi_linear',
+):
+    if find_spec(module_name) is None:
+        raise ModuleNotFoundError(f'Required local model module is missing: {module_name}')
+PY
+if [ $? -ne 0 ]; then
+    exit 1
+fi
 
 export MODEL_PATH=${MODEL_PATH:-/home/dataset/Kimi-K3-tmp}
 export DATASET_PATH=${DATASET_PATH:-/home/dataset/coco/llava_instruct_150k_fsdp_turbo_100.json}

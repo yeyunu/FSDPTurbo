@@ -85,6 +85,7 @@ except ImportError:
 #     raise ImportError("Plese run `pip install -U fla-core`")
 
 from fsdp_turbo.modules.short_conv import ShortConvolution
+from fsdp_turbo.ops.attn_res import attn_res
 from fsdp_turbo.ops.kda import chunk_kda
 from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.ops.triton.utils import tensor_cache
@@ -1017,6 +1018,7 @@ class KimiDecoderLayer(nn.Module):
         self.use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
         if self.use_attn_residuals:
             self.attn_res_block_size = config.attn_res_block_size
+            self.attn_res_fn = attn_res
             self.self_attention_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.mlp_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.self_attention_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
@@ -1097,11 +1099,12 @@ class KimiDecoderLayer(nn.Module):
         prefix_sum = hidden_states
 
         if block_residual is not None and block_residual.shape[1] > 0:
-            hidden_states = _apply_attn_res(
+            hidden_states = self.attn_res_fn(
                 prefix_sum.view(-1, hidden_size),
                 block_residual,
-                self.self_attention_res_proj,
-                self.self_attention_res_norm,
+                self.self_attention_res_proj.weight,
+                self.self_attention_res_norm.weight,
+                self.self_attention_res_norm.variance_epsilon,
             ).view(batch_size, seq_len, hidden_size)
 
         if self.layer_idx % self.attn_res_block_size == 0:
@@ -1136,11 +1139,12 @@ class KimiDecoderLayer(nn.Module):
         else:
             prefix_sum = hidden_states
 
-        hidden_states = _apply_attn_res(
+        hidden_states = self.attn_res_fn(
             prefix_sum.view(-1, hidden_size),
             block_residual,
-            self.mlp_res_proj,
-            self.mlp_res_norm,
+            self.mlp_res_proj.weight,
+            self.mlp_res_norm.weight,
+            self.mlp_res_norm.variance_epsilon,
         ).view(batch_size, seq_len, hidden_size)
 
         hidden_states = self.post_attention_layernorm(hidden_states)
@@ -1184,22 +1188,6 @@ class KimiPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
-def _apply_attn_res(prefix_sum, block_residual, proj, norm):
-    """
-    prefix_sum:     (num_tokens, hidden_size)
-    block_residual: (num_tokens, num_blocks, hidden_size)
-    """
-    v = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-    v_float = v.float()
-    variance = v_float.pow(2).mean(-1, keepdim=True)
-    k = v_float * torch.rsqrt(variance + norm.variance_epsilon)
-    score_weight = norm.weight.float() * proj.weight.squeeze(0).float()
-    scores = (k * score_weight).sum(-1)
-    probs = scores.softmax(-1).unsqueeze(1)
-    hidden_states = torch.matmul(probs, v_float).squeeze(1)
-    return hidden_states.to(v.dtype)
-
-
 class KimiLinearModel(KimiPreTrainedModel):
     def __init__(self, config: KimiLinearConfig):
         super().__init__(config)
@@ -1216,6 +1204,7 @@ class KimiLinearModel(KimiPreTrainedModel):
         if self.use_attn_residuals:
             self.output_attn_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
+            self.attn_res_fn = attn_res
 
         if getattr(config, "_attn_implementation", None) is not None:
             # if config._attn_implementation != "flash_attention_2":
@@ -1331,11 +1320,12 @@ class KimiLinearModel(KimiPreTrainedModel):
 
     def _apply_output_attn_res(self, hidden_states, block_residual):
         batch_size, seq_len, hidden_size = hidden_states.shape
-        return _apply_attn_res(
+        return self.attn_res_fn(
             hidden_states.view(-1, hidden_size),
             block_residual,
-            self.output_attn_res_proj,
-            self.output_attn_res_norm,
+            self.output_attn_res_proj.weight,
+            self.output_attn_res_norm.weight,
+            self.output_attn_res_norm.variance_epsilon,
         ).view(batch_size, seq_len, hidden_size)
 
 

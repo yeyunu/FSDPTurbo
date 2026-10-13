@@ -8,7 +8,7 @@ try:
 except ImportError:
     torch_npu = None
 from torch.optim import AdamW
-from transformers import AutoConfig, AutoModel, AutoProcessor
+from transformers import AutoConfig, AutoModel
 
 from fsdp_turbo.fsdp_turbo import FSDPTurbo
 from fsdp_turbo.fsdp_turbo_config import (
@@ -82,9 +82,13 @@ def _set_attn_implementation(model_config, attn_implementation):
 
 def get_model_processor(config):
     """Build a reduced-layer, randomly initialized Kimi-K3 model for ST."""
+    from fsdp_turbo.models.kimi import register_kimi_k3
+    from fsdp_turbo.models.kimi.kimi_k3_processor import KimiK3Processor
+
+    register_kimi_k3()
     model_config = AutoConfig.from_pretrained(
         config.model.model_name_or_path,
-        trust_remote_code=True,
+        trust_remote_code=False,
     )
     _set_attn_implementation(model_config, 'eager')
     set_num_hidden_layers(model_config, config.model.num_hidden_layers)
@@ -94,11 +98,11 @@ def get_model_processor(config):
     with torch.device('meta'):
         model = AutoModel.from_config(
             model_config,
-            trust_remote_code=True,
+            trust_remote_code=False,
             torch_dtype=torch.bfloat16,
         )
 
-    processor = AutoProcessor.from_pretrained(
+    processor = KimiK3Processor.from_pretrained(
         config.model.tokenizer_name_or_path,
         trust_remote_code=True,
     )
