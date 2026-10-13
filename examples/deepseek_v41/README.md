@@ -28,6 +28,26 @@ cd examples/deepseek_v41
 bash run.sh
 ```
 
+训练 head 的计算精度由 YAML 中的 `model.head_compute_dtype` 控制，默认 `fp32`。
+如需启用 BF16 head + FP32 CE，可在 `config.yaml` 或 `config_tnd.yaml` 中设置：
+
+```yaml
+model:
+  head_compute_dtype: "bf16"
+```
+
+`head_compute_dtype` 只控制词表投影的矩阵乘法精度，不改变参数存储或优化器配置。
+logits 转为 FP32 后计算交叉熵；BF16 模式返回的 logits 为 BF16。
+BF16 投影存在舍入差异，启用后应对比 loss 曲线、梯度范数及训练吞吐。
+
+在昇腾 NPU 上还可以设置 `head_compute_dtype: "hf32"`：输入和 head 权重在投影时转为
+FP32，head 前向及反向矩阵乘临时启用
+`torch_npu.npu.matmul.cube_math_type = torch_npu.npu.CubeMathType.USE_HF32`，
+计算完成或发生异常后恢复原设置。HF32 是矩阵乘计算模式，返回的 logits 和交叉熵仍为
+FP32，参数存储和优化器配置不变。该模式要求 NPU 及支持上述接口的 `torch_npu`，
+在 CPU/CUDA 或接口缺失时明确报错。HF32 同样存在精度差异，需要在目标设备上验证训练表现。
+接口语义参见[昇腾文档](https://www.hiascend.com/document/detail/zh/Pytorch/latest/apiref/customapi/docs/zh/custom_APIs/torch_npu-npu/torch_npu-npu-matmul-cubeMathType.md)。
+
 当前示例直接从 `fsdp_turbo/models/deepseek_v41/config.json` 读取训练模型参数。该文件配置
 4 个语言层、KV source 层 1/2、index source 层 1/2/3 和 Engram 层 1，覆盖
 DeepSeek-V4.1 的 CSA2、稀疏索引和 Engram 结构。它不读取官方发布的 FP8/FP4 权重；

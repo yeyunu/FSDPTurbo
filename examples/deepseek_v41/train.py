@@ -61,6 +61,7 @@ class DeepseekV41Trainer(BaseTrainer):
             use_fused_compressor=self.config.model.use_fused_compressor,
             use_fused_mhc=self.config.model.use_fused_mhc,
             use_fused_vision_flash_attn=(self.config.model.use_fused_vision_flash_attn),
+            head_compute_dtype=self.config.model.head_compute_dtype,
         )
         training_model = prepare_deepseek_v41_model_for_fsdp(
             training_model,

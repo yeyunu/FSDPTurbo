@@ -26,6 +26,8 @@ class ModelConfig:
     use_fused_compressor: bool = False
     use_fused_mhc: bool = False
     use_fused_vision_flash_attn: bool = False
+    # DeepSeek-V4.1 head projection precision; cross entropy remains FP32.
+    head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32"
     attn_implementation: str = 'eager'
 
 
@@ -299,6 +301,8 @@ class FSDPTurboConfig:
 
     def validate_model_config(self):
         """Validate model loading configuration."""
+        if self.model.head_compute_dtype not in ("fp32", "bf16", "hf32"):
+            raise ValueError("model.head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
         if not isinstance(self.model.attn_implementation, str) or not self.model.attn_implementation:
             raise ValueError("model.attn_implementation must be a non-empty string.")
 

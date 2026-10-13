@@ -21,6 +21,7 @@ from fsdp_turbo.ops.compressor import fused_compressor
 from fsdp_turbo.ops.rope import rope
 from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.ops.mhc import fused_mhc_post, fused_mhc_pre_sinkhorn_premix
+from fsdp_turbo.ops.hf32_linear import hf32_linear
 from .host_offload_embedding import (
     HostOffloadEmbedding,
     TorchHostOffloadEmbedding,
@@ -1356,14 +1357,19 @@ class ParallelHead(nn.Module):
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
         self.part_vocab_size = vocab_size // world_size
-        # bf16 in the checkpoint, kept as fp32 here so the logits come out in fp32 directly
+        # FSDP may normalize parameter storage; projection precision is independent.
+        self.compute_dtype = torch.float32
+        self.use_hf32 = False
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor, full_logits=False):
         """x: [b, s, d]. Generation only needs the last position, so that is the default."""
         if not full_logits:
             x = x[:, -1]
-        logits = F.linear(x.float(), self.weight.float())
+        if self.use_hf32:
+            logits = hf32_linear(x, self.weight)
+        else:
+            logits = F.linear(x.to(self.compute_dtype), self.weight.to(self.compute_dtype))
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)

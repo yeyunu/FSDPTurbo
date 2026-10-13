@@ -29,6 +29,7 @@ from fsdp_turbo.ops.npu.compressor import fused_compressor
 from fsdp_turbo.ops.npu.lightning_indexer import fused_lightning_indexer
 from fsdp_turbo.ops.npu.mhc import fused_mhc_post, fused_mhc_pre_sinkhorn_premix
 from fsdp_turbo.ops.npu.vision_flash_attention import fused_vision_flash_attention
+from fsdp_turbo.ops.npu.hf32_linear import hf32_linear_npu
 
 __all__ = [
     'attn_res_npu',
@@ -58,4 +59,5 @@ __all__ = [
     'fused_mhc_post',
     'fused_mhc_pre_sinkhorn_premix',
     'fused_vision_flash_attention',
+    'hf32_linear_npu',
 ]

@@ -166,13 +166,18 @@ def _build_deepseek_v41_model(
     model_args,
     *,
     tokenizer=None,
+    head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
 ) -> DeepseekV41ForCausalLMAdapter:
+    if head_compute_dtype not in ("fp32", "bf16", "hf32"):
+        raise ValueError("head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
         backbone = reference_model.Transformer(model_args, tokenizer=tokenizer)
     finally:
         torch.set_default_dtype(previous_dtype)
+    backbone.head.compute_dtype = torch.bfloat16 if head_compute_dtype == "bf16" else torch.float32
+    backbone.head.use_hf32 = head_compute_dtype == "hf32"
     return DeepseekV41ForCausalLMAdapter(backbone, model_args)
 
 
@@ -186,6 +191,7 @@ def build_deepseek_v41_model(
     use_fused_compressor: bool = False,
     use_fused_mhc: bool = False,
     use_fused_vision_flash_attn: bool = False,
+    head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
 ) -> DeepseekV41ForCausalLMAdapter:
     """Build an uninitialized BF16 model from the vendored config JSON.
 
@@ -208,6 +214,7 @@ def build_deepseek_v41_model(
     return _build_deepseek_v41_model(
         model_args,
         tokenizer=tokenizer,
+        head_compute_dtype=head_compute_dtype,
     )
 
 

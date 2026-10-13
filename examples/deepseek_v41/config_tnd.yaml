@@ -7,6 +7,8 @@ model:
   model_name_or_path: "/home/g00878035/DSV41/models/DeepSeek-V4.1-Flash"
   tokenizer_name_or_path: "../deepseekv4/tokenizer"
   torch_dtype: "bf16"
+  # Head projection precision: fp32, bf16, or hf32 (NPU); cross entropy remains FP32.
+  head_compute_dtype: "fp32"
   engram_storage_backend: "host_offload"
   # Use CANN SparseFlashMla/SparseFlashMlaGrad instead of eager indexed attention.
   use_sparse_flash_attn: true
