@@ -62,6 +62,31 @@ JSONL 后，用本目录的 `pack_deepseek_v41_tnd.py` 打包。图像路径应�
 {"messages":[{"role":"user","content":"描述这张图片"},{"role":"assistant","content":"图片内容是……"}],"images":["/path/to/image.jpg"]}
 ```
 
+## 数据格式转换
+如果使用数据格式为原生的llava格式，不是上述中json格式，如原llava_instruct.json格式为：
+```json
+[
+  {
+    "id": "000",
+    "image": "000.jpg",
+    "conversations": [
+      {
+        "from": "human",
+        "value":"描述这张图片"
+      },
+      {
+        "from":"gpt",
+        "value":"图片内容是……"
+      }
+    ]
+  },
+]
+```
+可以使用下面的脚本进行转换
+```bash
+bash convert_llava_for_fsdp_turbo.sh
+```
+
 ## TND 与 BSND 训练
 
 原有 `config.yaml` 保持原样，用于原有非打包数据；`config_tnd.yaml` 用于 TND，
