@@ -1,11 +1,11 @@
 ---
 name: "fsdp-turbo-dev-guide"
-description: "FSDPTurbo 仓库开发守则：device 抽象、ops 隔离、config 校验、日志、命名等 7 条规则。在编写或修改 fsdp_turbo 代码时必须遵循。"
+description: "FSDPTurbo 仓库开发守则：device 抽象、ops 隔离、config 校验、日志、命名、models 叶子隔离等 8 条规则。在编写或修改 fsdp_turbo 代码时必须遵循。"
 ---
 
 # FSDPTurbo 开发守则
 
-本守则是 FSDPTurbo 仓库的强制开发规范。当 Agent 在 `fsdp_turbo/` 目录下新增、修改、审查代码，或回答该仓库相关实现问题时，**必须**遵循以下 7 条规则，并在生成代码后逐条自检。
+本守则是 FSDPTurbo 仓库的强制开发规范。当 Agent 在 `fsdp_turbo/` 目录下新增、修改、审查代码，或回答该仓库相关实现问题时，**必须**遵循以下 8 条规则，并在生成代码后逐条自检。
 
 仓库顶层模块结构（用于理解规则的作用范围）：
 
@@ -13,6 +13,7 @@ description: "FSDPTurbo 仓库开发守则：device 抽象、ops 隔离、config
 fsdp_turbo/
 ├── distributed/      # 分布式并行（FSDP/TP/CP/EP）
 ├── memory/           # 显存优化（recompute/chunk_batch/swap）
+├── models/           # 各模型适配（叶子模块：包内其他模块禁止引用，模型目录之间相互独立）
 ├── modules/          # 通用 module 组件
 ├── ops/              # 算子抽象层（cpu/npu/triton + registry）
 ├── optimizer/        # 优化器
@@ -114,7 +115,8 @@ out = grouped_matmul(x, split_list, weights)
 
 - `ops/`、`utils/` 是公共底层依赖，任何模块可依赖；
 - `distributed/`、`memory/`、`modules/`、`optimizer/`、`quantization/` 之间**不得**相互依赖；
-- `training/` 是唯一允许编排（依赖）其他模块的顶层入口。
+- `training/` 是唯一允许编排（依赖）其他模块的顶层入口，但**不得**依赖 `models/`（见规则 8）；
+- `models/` 是叶子模块，任何模块都不得依赖它（见规则 8）。
 
 正确：`memory/recompute/` 只 `import` 标准库、`torch`、`fsdp_turbo.ops`、`fsdp_turbo.utils`。
 
@@ -211,6 +213,54 @@ tmp1 = compute()               # 无意义命名
 
 ---
 
+## 规则 8：`fsdp_turbo.models` 是叶子模块，且模型目录之间相互独立
+
+`fsdp_turbo/models/` 是模型适配代码的**叶子节点**：它只能被外部使用方（`examples/`、`tests/`、配置中的 `replacement` 等）引用，仓库内部不允许出现反向依赖。
+
+**8.1 包内禁止引用 `fsdp_turbo.models`**
+
+`fsdp_turbo/` 包内除 `models/` 自身以外的任何模块——`training/`、`distributed/`、`memory/`、`modules/`、`ops/`、`optimizer/`、`quantization/`、`utils/`、`fsdp_turbo.py`、`fsdp_turbo_config.py`——都**不得**导入 `fsdp_turbo.models`，包括绝对导入、相对导入和延迟到函数内的局部导入。需要模型参与的能力（如 CP 前向替换、算子替换）必须通过配置/注册机制或由使用方（`examples/`、`tests/`）注入，而不是在包内直接 import 模型。
+
+`examples/`、`tests/`、`docs/` 作为使用方**允许**引用 `fsdp_turbo.models`。
+
+**8.2 各模型目录相互独立**
+
+`fsdp_turbo/models/` 下的每个模型目录（当前为 `deepseek_v41/`、`kimi/`、`qwen/`）必须彼此独立：
+
+- 禁止任何形式的跨模型导入：`from fsdp_turbo.models.qwen...`、`from ..qwen...`、`from .. import ...` 均禁止；
+- 禁止依赖 `models/` 根目录下的共享代码（共享能力应下沉到 `ops/`、`utils/` 等公共底层）；
+- 模型目录内部统一使用相对导入（`from .module import Xxx`），并由目录自身的 `__init__.py` 对外暴露公共接口；
+- 新增或删除一个模型目录，不得影响其他模型目录的导入与运行。
+
+**8.3 边界**
+
+本规则只约束 `models/` 与包内其他模块、以及模型目录之间的关系；模型目录自身对其他公共模块（`ops/`、`utils/` 等）的依赖不在本规则范围内。
+
+正确：在 `examples/qwen3_5/train.py`（使用方）中：
+```python
+from fsdp_turbo.models.qwen.qwen3_5 import qwen3_5_model_forward  # 允许：examples 是使用方
+```
+
+正确：在 `models/kimi/modeling_kimi_k3.py` 内：
+```python
+from .configuration_kimi_k3 import KimiK3Config   # 允许：模型目录内部相对导入
+```
+
+错误：在 `training/`、`distributed/`、`memory/` 等包内非 `models/` 文件中：
+```python
+from fsdp_turbo.models.kimi import register_kimi_k3   # 禁止：包内反向依赖 models
+from fsdp_turbo.models.qwen.qwen3_5 import xxx        # 禁止
+```
+
+错误：在模型目录之间交叉引用：
+```python
+# 在 models/kimi/modeling_kimi_k3.py 中
+from fsdp_turbo.models.deepseek_v41 import DeepseekV41ForCausalLMAdapter  # 禁止：跨模型依赖
+from ..deepseek_v41.model import ModelArgs                                # 禁止
+```
+
+---
+
 ## 自检清单
 
 提交或输出代码前，逐条确认：
@@ -221,4 +271,5 @@ tmp1 = compute()               # 无意义命名
 4. [ ] 非 `training/` 模块未跨业务模块依赖（仅可依赖 `ops/`、`utils/`、标准库、`torch`）；
 5. [ ] 新配置字段已在 `FSDPTurboConfig.__post_init__` 校验，运行期只读；
 6. [ ] 无 `print`，日志均走 `print_rank` / `log_warning_once`；
-7. [ ] 命名直观自解释，无非常见缩写、无数字后缀。
+7. [ ] 命名直观自解释，无非常见缩写、无数字后缀；
+8. [ ] `fsdp_turbo/` 包内未引用 `fsdp_turbo.models`（仅 `examples/`、`tests/`、`docs/` 可引用），且 `models/` 下各模型目录之间无交叉导入、无 `models/` 根共享代码依赖。
