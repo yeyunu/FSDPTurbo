@@ -7,6 +7,7 @@ from torch import nn
 from fsdp_turbo.ops.vision_flash_attention import fused_vision_flash_attention
 from fsdp_turbo.ops.rope import rope
 from fsdp_turbo.ops.rms_norm import rms_norm
+from fsdp_turbo.ops.npu.mx_quant import swiglu_npu
 from .activation import packed_swiglu
 
 
@@ -113,10 +114,7 @@ class MLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up = self.w1(x)
         if gate_up.dtype == torch.bfloat16:
-            # Preserve the reference's BF16 rounding after SiLU. The fused
-            # activation can change it, causing output drift after w2.
-            gate, up = gate_up.chunk(2, dim=-1)
-            intermediate = F.silu(gate) * up
+            intermediate = swiglu_npu(gate_up)
         else:
             intermediate = packed_swiglu(gate_up)
         return self.w2(intermediate)
