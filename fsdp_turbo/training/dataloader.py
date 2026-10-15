@@ -186,6 +186,46 @@ def _process_multimodal_example(example, data_cfg, processor):
     )
 
 
+def _build_messages_with_image_markers(messages_raw, image_paths):
+    """Preserve image-marker positions and validate their correspondence to images."""
+    marker_count = sum(
+        message.get("content", "").count("<image>") for message in messages_raw if message.get("role") == "user"
+    )
+    if marker_count and marker_count != len(image_paths):
+        raise ValueError(f"Found {marker_count} <image> markers but received {len(image_paths)} images.")
+
+    messages = []
+    inserted_images = 0
+    for message in messages_raw:
+        role = message.get("role", "")
+        content = message.get("content", "")
+        if role == "user":
+            if marker_count and "<image>" in content:
+                parts = content.split("<image>")
+                user_content = []
+                for index, part in enumerate(parts):
+                    if part:
+                        user_content.append({"type": "text", "text": part})
+                    if index < len(parts) - 1:
+                        user_content.append({"type": "image"})
+                        inserted_images += 1
+                messages.append({"role": "user", "content": user_content})
+            elif not marker_count and image_paths and not inserted_images:
+                user_content = [{"type": "image"} for _ in image_paths]
+                if content:
+                    user_content.append({"type": "text", "text": content})
+                messages.append({"role": "user", "content": user_content})
+                inserted_images = len(image_paths)
+            else:
+                messages.append({"role": "user", "content": content})
+        elif role == "assistant":
+            messages.append({"role": "assistant", "content": content})
+
+    if inserted_images != len(image_paths):
+        raise ValueError(f"Rendered {inserted_images} image markers for {len(image_paths)} images.")
+    return messages
+
+
 def _render_multimodal_record(messages_raw, images_raw, processor, image_column):
     if isinstance(messages_raw, str):
         messages_raw = json.loads(messages_raw)
@@ -194,23 +234,26 @@ def _render_multimodal_record(messages_raw, images_raw, processor, image_column)
         images_raw = json.loads(images_raw)
 
     image_paths = images_raw or []
-    messages = []
-    image_inserted = False
-    for message in messages_raw:
-        role = message.get("role", "")
-        content = message.get("content", "")
-        if role == "user":
-            if image_paths and not image_inserted:
-                user_content = [{"type": "image"}]
-                text = content.replace("<image>", "").strip()
-                if text:
-                    user_content.append({"type": "text", "text": text})
-                messages.append({"role": "user", "content": user_content})
-                image_inserted = True
-            else:
-                messages.append({"role": "user", "content": content})
-        elif role == "assistant":
-            messages.append({"role": "assistant", "content": content})
+    if getattr(processor, "preserves_image_marker_positions", False):
+        messages = _build_messages_with_image_markers(messages_raw, image_paths)
+    else:
+        messages = []
+        image_inserted = False
+        for message in messages_raw:
+            role = message.get("role", "")
+            content = message.get("content", "")
+            if role == "user":
+                if image_paths and not image_inserted:
+                    user_content = [{"type": "image"}]
+                    text = content.replace("<image>", "").strip()
+                    if text:
+                        user_content.append({"type": "text", "text": text})
+                    messages.append({"role": "user", "content": user_content})
+                    image_inserted = True
+                else:
+                    messages.append({"role": "user", "content": content})
+            elif role == "assistant":
+                messages.append({"role": "assistant", "content": content})
 
     return {
         "text": processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False),
@@ -219,11 +262,14 @@ def _render_multimodal_record(messages_raw, images_raw, processor, image_column)
 
 
 class _MultimodalCollator:
-    def __init__(self, processor, image_column, media_key="images", data_cfg=None):
+    def __init__(self, processor, image_column, media_key="images", data_cfg=None, max_seq_length=None):
         self.processor = processor
         self.image_column = image_column
         self.media_key = media_key
         self.data_cfg = data_cfg
+        self.max_seq_length = (
+            max_seq_length if max_seq_length is not None else getattr(data_cfg, "max_seq_length", None)
+        )
 
     def __call__(self, features):
         from PIL import Image
@@ -251,6 +297,8 @@ class _MultimodalCollator:
             "truncation": True,
             "return_tensors": "pt",
         }
+        if self.max_seq_length is not None and getattr(self.processor, "supports_image_safe_truncation", False):
+            processor_kwargs["max_length"] = self.max_seq_length
         if images:
             if self.media_key == "medias":
                 medias = [

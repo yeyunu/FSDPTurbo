@@ -1,6 +1,7 @@
 """Training processor for DeepSeek-V4.1 interleaved text and images."""
 
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 
@@ -38,6 +39,88 @@ def prepare_deepseek_v41_tokenizer(tokenizer, model_args) -> bool:
     if image_token_id != model_args.image_token_id:
         raise ValueError(f"Image token id mismatch: tokenizer={image_token_id}, model={model_args.image_token_id}.")
     return added_tokens
+
+
+def infer_seqlen(source_len: int, target_len: int, max_seq_length: int) -> tuple[int, int]:
+    """Allocate a length budget to prompt and response, following MindSpeed-MM."""
+    if target_len * 2 < max_seq_length:
+        max_target_len = max_seq_length
+    elif source_len * 2 < max_seq_length:
+        max_target_len = max_seq_length - source_len
+    else:
+        max_target_len = int(max_seq_length * target_len / (source_len + target_len))
+
+    new_target_len = min(max_target_len, target_len)
+    new_source_len = min(max(max_seq_length - new_target_len, 0), source_len)
+    return new_source_len, new_target_len
+
+
+def _response_start(prompt, tokens, image_inputs, tokenizer):
+    """Locate the final response in the expanded token stream."""
+    marker_start = prompt.rfind(THINKING_END_TOKEN)
+    if marker_start < 0:
+        return len(tokens)
+
+    source_text = prompt[: marker_start + len(THINKING_END_TOKEN)]
+    original_tokens = tokenizer.encode(prompt)
+    source_tokens = tokenizer.encode(source_text)
+    plain_start = 0
+    while (
+        plain_start < len(original_tokens)
+        and plain_start < len(source_tokens)
+        and original_tokens[plain_start] == source_tokens[plain_start]
+    ):
+        plain_start += 1
+    image_count = source_text.count(IMAGE_PLACEHOLDER)
+    return min(
+        plain_start + sum(len(image.types) - 1 for image in (image_inputs or [])[:image_count]),
+        len(tokens),
+    )
+
+
+def _truncate_vl_example(prompt, tokens, token_types, image_inputs, tokenizer, max_seq_length):
+    """Apply the SFT token budget without splitting a DeepSeek image span."""
+    if max_seq_length <= 0:
+        raise ValueError("max_seq_length must be positive.")
+    if len(tokens) <= max_seq_length:
+        return tokens, token_types, image_inputs
+
+    source_len = _response_start(prompt, tokens, image_inputs, tokenizer)
+    images = image_inputs or []
+    # Images inside an assistant response are uncommon; treat the full sample
+    # as a source sequence so that every image can be kept atomically.
+    if any(image.start + len(image.types) > source_len for image in images):
+        source_len = len(tokens)
+    target_len = len(tokens) - source_len
+    source_budget, _ = infer_seqlen(source_len, target_len, max_seq_length)
+
+    protected = set()
+    for image in images:
+        protected.update(range(image.start, image.start + len(image.types)))
+    if target_len:
+        suffix_len = len(tokenizer.encode(ASSISTANT_TOKEN + THINKING_END_TOKEN, add_special_tokens=False))
+        protected.update(range(max(0, source_len - suffix_len), source_len))
+
+    minimum_target = int(target_len > 0)
+    if len(protected) + minimum_target > max_seq_length:
+        raise ValueError(
+            "DeepSeek-V4.1 image spans and chat delimiters exceed max_seq_length; "
+            "reduce the number or size of images, or increase max_seq_length."
+        )
+    source_budget = max(source_budget, len(protected))
+    source_budget = min(source_budget, max_seq_length - minimum_target)
+    target_budget = min(target_len, max_seq_length - source_budget)
+
+    keep_source = set(protected)
+    for index in range(source_len):
+        if len(keep_source) >= source_budget:
+            break
+        keep_source.add(index)
+    kept_indices = sorted(keep_source)
+    new_tokens = [tokens[index] for index in kept_indices] + tokens[source_len : source_len + target_budget]
+    new_types = [token_types[index] for index in kept_indices] + token_types[source_len : source_len + target_budget]
+    new_images = [replace(image, start=sum(index < image.start for index in kept_indices)) for image in images]
+    return new_tokens, new_types, new_images or None
 
 
 def _render_content(content) -> str:
@@ -78,6 +161,9 @@ def encode_chat_messages(messages: Sequence[dict]) -> str:
 
 class DeepSeekV41Processor:
     """Convert chat records and images into the reference model's VL inputs."""
+
+    preserves_image_marker_positions = True
+    supports_image_safe_truncation = True
 
     def __init__(self, tokenizer, model_args):
         self.tokenizer = tokenizer
@@ -126,10 +212,14 @@ class DeepSeekV41Processor:
                 self.tokenizer,
                 self.model_args,
             )
-            if truncation and max_length is not None and len(tokens) > max_length:
-                raise ValueError(
-                    "DeepSeek-V4.1 multimodal sample exceeds max_seq_length after "
-                    "image-span expansion; truncating an image span is unsafe."
+            if truncation and max_length is not None:
+                tokens, token_types, image_inputs = _truncate_vl_example(
+                    prompt,
+                    tokens,
+                    token_types,
+                    image_inputs,
+                    self.tokenizer,
+                    max_length,
                 )
             token_sequences.append(tokens)
             token_type_sequences.append(token_types)

@@ -62,6 +62,40 @@ JSONL 后，用本目录的 `pack_deepseek_v41_tnd.py` 打包。图像路径应�
 {"messages":[{"role":"user","content":"描述这张图片"},{"role":"assistant","content":"图片内容是……"}],"images":["/path/to/image.jpg"]}
 ```
 
+## 使用虚构图文数据测试
+
+`generate_mock_data_for_vlmodel.py` 改编自 MindSpeed-MM 的同名脚本，可生成固定图片尺寸、
+图片数量和文本长度的重复样本，用于验证训练链路与测量吞吐。它使用本模型的 tokenizer、
+对话模板和图片网格规则，统计图片展开后的序列长度。
+
+在仓库根目录执行（先安装 FSDPTurbo 依赖）：
+
+```bash
+python examples/deepseek_v41/generate_mock_data_for_vlmodel.py \
+  --tokenizer_path /path/to/DeepSeek-V4.1-Flash \
+  --pic_width 512 --pic_height 512 --num_pics 2 \
+  --text_length 1024 \
+  --num_samples 512 --save_dir ./data/mocked_v41
+```
+
+默认输出 JSONL 和一张供所有样本复用的随机 JPEG。每条样本的 `images` 都引用该图片的
+绝对路径，因此训练进程需要能访问生成目录；多机运行时应将其放在共享存储上。生成器会输出
+实际文本 token 数和图文展开后的总 token 数。`--text_length` 是 user 与 assistant
+重复文本合计的 token 下限；生成器沿用 MindSpeed-MM 的重复次数公式，并按实际分词结果
+补足长度。生成器不限制图文展开后的总长度；超出训练 YAML 的 `data.max_seq_length` 时，
+数据加载器会截断文本并保留完整图片。若图片和必要的对话标记本身
+超过训练长度，数据加载器会报错。可用 `--output_format json` 输出数组格式。
+
+将生成器输出的 JSONL 绝对路径填入 `data.dataset_path`，保持 `data.is_multimodal: true`，
+再运行 `bash examples/deepseek_v41/run.sh`。该数据由重复文本和随机图片组成，仅用于
+功能与性能测试。
+
+训练时，`data.max_seq_length` 同时控制纯文本 tokenizer 的截断长度和图文样本在图片
+展开后的长度。图文样本超长时，DeepSeek-V4.1 processor 按 prompt/response 长度分配
+预算，截去超出的文本；图片 token 区间会完整保留，并同步更新图片在序列中的位置。
+若图片和必要的对话标记本身已超过预算，数据处理会报错，需要减少图片数量或尺寸，
+或增大 `max_seq_length`。
+
 ## 数据格式转换
 如果使用数据格式为原生的llava格式，不是上述中json格式，如原llava_instruct.json格式为：
 ```json

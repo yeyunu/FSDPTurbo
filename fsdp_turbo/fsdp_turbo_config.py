@@ -308,6 +308,8 @@ class FSDPTurboConfig:
 
     def validate_data_config(self):
         """Validate and normalize dataloader configuration."""
+        if self.data.max_seq_length <= 0:
+            raise ValueError("data.max_seq_length must be positive.")
         supported_media_keys = {"images", "medias"}
         if self.data.media_key not in supported_media_keys:
             raise ValueError(

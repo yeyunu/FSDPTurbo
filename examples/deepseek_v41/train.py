@@ -27,7 +27,10 @@ logger = logging.getLogger(__name__)
 class DeepseekV41Trainer(BaseTrainer):
     def _model_args(self):
         if not hasattr(self, "_cached_model_args"):
-            self._cached_model_args = build_deepseek_v41_model_args()
+            self._cached_model_args = replace(
+                build_deepseek_v41_model_args(),
+                max_seq_len=self.config.data.max_seq_length,
+            )
         return self._cached_model_args
 
     def build_processor(self):
