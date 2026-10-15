@@ -1,4 +1,3 @@
-# Host-offload design adapted from cann/torchtitan-npu PR 768 (BSD-style).
 """Ascend Host-offloaded sparse embedding used by DeepSeek-V4.1 Engram.
 
 The authoritative EP-local BF16 weight and FP32 Adam moments stay on CPU. CANN's
@@ -461,8 +460,10 @@ class _TorchHostFetch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, weight, row_ids, table, keepalive):
         flat_ids = row_ids.reshape(-1)
-        if flat_ids.numel() and (bool((flat_ids < 0).any()) or bool((flat_ids >= table.logical_num_embeddings).any())):
-            raise IndexError(f"Engram row IDs must be in [0, {table.logical_num_embeddings}).")
+        if flat_ids.numel():
+            invalid_ids = ((flat_ids < 0) | (flat_ids >= table.logical_num_embeddings)).any()
+            if bool(invalid_ids):
+                raise IndexError(f"Engram row IDs must be in [0, {table.logical_num_embeddings}).")
 
         unique_ids, inverse = torch.unique(flat_ids, return_inverse=True)
         owners = torch.div(unique_ids, table.local_rows, rounding_mode="floor")
@@ -472,8 +473,13 @@ class _TorchHostFetch(torch.autograd.Function):
         recv_counts = torch.empty_like(send_counts)
         group = table.mesh.get_group()
         dist.all_to_all_single(recv_counts, send_counts, group=group)
-        send_sizes = send_counts.tolist()
-        recv_sizes = recv_counts.tolist()
+        # Materialize both count vectors with one D2H synchronization. These
+        # lists are reused by every collective in forward and backward.
+        split_values = torch.cat((send_counts, recv_counts)).to(device="cpu")
+        split_values = split_values.numpy().tolist()
+        mesh_size = table.mesh.size()
+        send_sizes = split_values[:mesh_size]
+        recv_sizes = split_values[mesh_size:]
         recv_ids = torch.empty(sum(recv_sizes), device=row_ids.device, dtype=row_ids.dtype)
         dist.all_to_all_single(
             recv_ids,

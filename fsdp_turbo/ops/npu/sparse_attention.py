@@ -470,9 +470,7 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
                 ctx.residual,
                 batch_size,
                 query.device,
-                # SparseFlashMlaGrad requires this input whenever
-                # cmp_mask_mode=3, including ratio-one layers with residual 0.
-                ctx.has_compressed_kv,
+                ctx.has_compressed_kv and ctx.compress_ratio != 1,
             ),
             ori_topk_length=None,
             cmp_topk_length=None,

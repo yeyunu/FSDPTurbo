@@ -74,10 +74,10 @@ class GroupedMatmul(torch.autograd.Function):
             group_list_type=group_list_type,
         )[0]
 
-        # Transpose to match original weight format [output_dim, input_dim]
-        grad_weight_chunks = [w.T for w in grad_weight]
-
-        return grad, torch.stack(grad_weight_chunks), None, None, None
+        # Preserve the GEMM and reduction order, but return the [E,N,K] view.
+        # AccumulateGrad/FSDP can copy it into its destination layout directly;
+        # eagerly stacking per-expert transposes adds a separate materialization.
+        return grad, grad_weight.transpose(-1, -2), None, None, None
 
 
 @register_op('grouped_matmul', 'npu')

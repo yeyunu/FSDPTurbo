@@ -24,6 +24,131 @@ def _reorder_router_weights(weights, row_map, fused):
     return weights.index_select(0, row_map.long())
 
 
+def _build_fixed_dispatch_metadata(
+    num_tokens: int,
+    topk: int,
+    num_global_experts: int,
+    ep_size: int,
+    ep_rank: int,
+    device: torch.device,
+):
+    """Build device-independent routing metadata for the debug fixed router.
+
+    Every EP rank receives the same round-robin route in fixed-router mode, so
+    its split sizes can be computed on the host without a histogram, all-gather,
+    D2H copy, or Tensor.tolist() in the training step.
+    """
+    counts = [0] * num_global_experts
+    for token in range(num_tokens):
+        for choice in range(topk):
+            counts[(token + choice) % num_global_experts] += 1
+
+    num_local_experts = num_global_experts // ep_size
+    send_splits = [sum(counts[rank * num_local_experts : (rank + 1) * num_local_experts]) for rank in range(ep_size)]
+    recv_splits = [send_splits[ep_rank]] * ep_size
+    local_start = ep_rank * num_local_experts
+    local_counts_list = [counts[local_start + index] * ep_size for index in range(num_local_experts)]
+    global_indices_list = []
+    for _ in range(ep_size):
+        for local_index in range(num_local_experts):
+            global_indices_list.extend([local_index] * counts[local_start + local_index])
+
+    local_counts = torch.tensor(local_counts_list, dtype=torch.int64, device=device)
+    global_indices = torch.tensor(global_indices_list, dtype=torch.int32, device=device)
+    return (local_counts, global_indices), (send_splits, recv_splits)
+
+
+def dispatch_preprocess(ep_group, top_k_index, num_global_experts, expert_ids_per_ep_rank):
+    from fsdp_turbo.distributed.dist_ops import gather_along_first_dim_expert_parallel
+
+    ep_size = torch.distributed.get_world_size(ep_group)
+    ep_rank = torch.distributed.get_rank(ep_group)
+    num_local_experts = num_global_experts // ep_size
+    local_experts_start_id = num_local_experts * ep_rank
+    local_experts_end_id = local_experts_start_id + num_local_experts
+
+    # [B*S, K] --> [E]
+    num_local_tokens_per_expert = torch.histc(
+        top_k_index.float(), bins=num_global_experts, min=0, max=num_global_experts
+    ).long()
+    # [E] --> [EP*E]
+    num_global_tokens_per_expert, _ = gather_along_first_dim_expert_parallel(num_local_tokens_per_expert, ep_group)
+    # [EP*E] --> [EP, local_E]
+    num_global_tokens_per_local_expert = num_global_tokens_per_expert.reshape(ep_size, num_global_experts)[
+        :, local_experts_start_id:local_experts_end_id
+    ]
+    # [EP, local_E] --> [local_E]
+    num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(axis=0)
+    # [E] --> [EP, local_E] --> [EP]
+    input_split = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(axis=1)
+    # [EP, local_E] --> [EP]
+    output_splits = num_global_tokens_per_local_expert.sum(axis=-1)
+    # all_to_all_single currently requires host-side split lists. Copy both
+    # vectors together and materialize them once: the old path called
+    # Tensor.tolist() again for dispatch, router weights, and combine, which
+    # expanded into thousands of aten::item calls for a deep MoE model.
+    split_values = torch.cat((input_split, output_splits)).to(torch.device("cpu"))
+    split_values = split_values.numpy().tolist()
+    input_split = split_values[:ep_size]
+    output_splits = split_values[ep_size:]
+    # [EP, local_E] --> [E*select]
+    global_indices = torch.repeat_interleave(expert_ids_per_ep_rank, num_global_tokens_per_local_expert.ravel())
+    return (num_tokens_per_local_expert, global_indices), (input_split, output_splits)
+
+
+def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes, fused):
+    from torch.distributed._functional_collectives import all_to_all_single_autograd
+    from fsdp_turbo.ops.moe import permute
+
+    local_indices, global_indices = indices
+    input_split, output_splits = split_sizes
+
+    hidden_states, unpermute_indices1 = permute(hidden_states, top_k_index, use_eager=not fused)
+    hidden_states = all_to_all_single_autograd(hidden_states, output_splits, input_split, ep_group)
+    hidden_states, unpermute_indices2 = permute(hidden_states, global_indices, use_eager=not fused)
+
+    return hidden_states, (unpermute_indices1, unpermute_indices2)
+
+
+def _unpermute_preweighted(hidden_states, sorted_indices, routing_shape):
+    """Restore expert slots and sum them in the eager weighted path's order.
+
+    Router weights have already been applied before the down projection.
+    Avoid multiplying by ones, which also saves an autograd copy of the
+    restored activations. Keep the same FP32 sum as the caller's input.
+    """
+    num_tokens, topk = routing_shape
+    restored = hidden_states.new_zeros((num_tokens * topk, hidden_states.shape[-1]))
+    restored.index_copy_(0, sorted_indices.long(), hidden_states)
+    return restored.reshape(num_tokens, topk, hidden_states.shape[-1]).sum(dim=1)
+
+
+def alltoall_combine(
+    ep_group,
+    hidden_states,
+    top_k_weights,
+    unpermute_indices,
+    split_sizes,
+    fused,
+    *,
+    weights_applied=False,
+):
+    from torch.distributed._functional_collectives import all_to_all_single_autograd
+    from fsdp_turbo.ops.moe import unpermute
+
+    if weights_applied and fused:
+        raise ValueError("Preweighted combine currently supports only the eager permutation path.")
+    unpermute_indices1, unpermute_indices2 = unpermute_indices
+    input_split, output_splits = split_sizes
+    hidden_states = unpermute(hidden_states, unpermute_indices2, use_eager=not fused)
+    hidden_states = all_to_all_single_autograd(hidden_states, input_split, output_splits, ep_group)
+    if weights_applied:
+        hidden_states = _unpermute_preweighted(hidden_states, unpermute_indices1, top_k_weights.shape)
+    else:
+        hidden_states = unpermute(hidden_states, unpermute_indices1, top_k_weights, use_eager=not fused)
+    return hidden_states
+
+
 class DeepSeekV41Experts(nn.Module):
     """Store routed experts as two stacked linear-weight tensors.
 
@@ -192,11 +317,6 @@ class DeepSeekV41Experts(nn.Module):
         )
         from torch.distributed.tensor import DTensor
 
-        from fsdp_turbo.distributed.expert_parallel.dispatcher import (
-            alltoall_combine,
-            alltoall_dispatch,
-            dispatch_preprocess,
-        )
         from fsdp_turbo.distributed.expert_parallel.utils import (
             fixed_router_for_debug,
             normalize_expert_args,
@@ -207,18 +327,39 @@ class DeepSeekV41Experts(nn.Module):
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         topk_indices, topk_weights = normalize_expert_args(topk_indices, topk_weights)
         if fixed_router:
-            topk_indices, topk_weights = fixed_router_for_debug(
-                topk_indices,
-                topk_weights,
-                self.num_global_experts,
+            topk = 1 if topk_indices.dim() == 1 else topk_indices.shape[1]
+            cache_key = (
+                topk_indices.shape[0],
+                topk,
+                topk_indices.device,
+                topk_indices.dtype,
+                topk_weights.dtype,
             )
-
-        indices, split_sizes = dispatch_preprocess(
-            ep_group,
-            topk_indices,
-            self.num_global_experts,
-            self.expert_ids_per_ep_rank,
-        )
+            cached = getattr(self, "_fixed_router_cache", None)
+            if cached is None or cached[0] != cache_key:
+                fixed_indices, fixed_weights = fixed_router_for_debug(
+                    topk_indices,
+                    topk_weights,
+                    self.num_global_experts,
+                )
+                metadata = _build_fixed_dispatch_metadata(
+                    fixed_indices.shape[0],
+                    topk,
+                    self.num_global_experts,
+                    torch.distributed.get_world_size(ep_group),
+                    torch.distributed.get_rank(ep_group),
+                    fixed_indices.device,
+                )
+                cached = (cache_key, fixed_indices, fixed_weights, metadata)
+                self._fixed_router_cache = cached
+            _, topk_indices, topk_weights, (indices, split_sizes) = cached
+        else:
+            indices, split_sizes = dispatch_preprocess(
+                ep_group,
+                topk_indices,
+                self.num_global_experts,
+                self.expert_ids_per_ep_rank,
+            )
         local_counts, global_indices = indices
         input_split, output_splits = split_sizes
         fused_permute = _use_fused_permute(hidden_states, global_indices)
@@ -235,8 +376,8 @@ class DeepSeekV41Experts(nn.Module):
         router_weights = _reorder_router_weights(topk_weights.reshape(-1), source_order, fused_permute)
         router_weights = all_to_all_single_autograd(
             router_weights,
-            output_splits.tolist(),
-            input_split.tolist(),
+            output_splits,
+            input_split,
             ep_group,
         )
         router_weights = _reorder_router_weights(router_weights, expert_order, fused_permute)
@@ -265,10 +406,10 @@ class DeepSeekV41Experts(nn.Module):
             use_eager=False,
         )
 
-        # The probabilities are already applied. Ones preserve the original
-        # [tokens, top-k] combine shape. Converting before the shared combine
-        # makes both its return AllToAll and final expert sum operate in FP32.
-        combine_weights = torch.ones_like(topk_weights, dtype=torch.float32)
+        # Probabilities are already applied. Fused routing needs its paired
+        # inverse map and unit weights; eager routing can skip that multiply.
+        # Keep return AllToAll and summation FP32 in both paths.
+        combine_weights = torch.ones_like(topk_weights, dtype=torch.float32) if fused_permute else topk_weights
         output = alltoall_combine(
             ep_group,
             expert_output.float(),
@@ -276,6 +417,7 @@ class DeepSeekV41Experts(nn.Module):
             unpermute_indices,
             split_sizes,
             fused=fused_permute,
+            weights_applied=not fused_permute,
         )
         return output.view(*original_shape)
 

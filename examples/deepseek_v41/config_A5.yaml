@@ -4,9 +4,11 @@
 
 # --- Model Configuration ---
 model:
-  model_name_or_path: "/mnt/share/g00878035/DSV41/models/DeepSeek-V4.1-Flash"
-  tokenizer_name_or_path: "/mnt/share/g00878035/DSV41/models/DeepSeek-V4.1-Flash"
+  model_name_or_path: "./DSV41/models/DeepSeek-V4.1-Flash"
+  tokenizer_name_or_path: "./DSV41/models/DeepSeek-V4.1-Flash"
   torch_dtype: "bf16"
+  # Head projection precision: fp32, bf16, or hf32 (NPU); cross entropy remains FP32.
+  head_compute_dtype: "bf16"
   engram_storage_backend: "elastic_buffer"
   # Use CANN SparseFlashMla/SparseFlashMlaGrad instead of eager indexed attention.
   use_sparse_flash_attn: true
@@ -48,22 +50,10 @@ run:
     active_steps: 1
     repeat: 1
     skip_first: 5
-    output_dir: "/mnt/share/g00878035/DSV41/profiles/dsv41_8p"
+    output_dir: "./DSV41/profiles/dsv41_8p"
     record_shapes: true
     profile_memory: false
-    with_stack: true
-
-  # profile:
-  #   enabled: true
-  #   wait_steps: 0
-  #   warmup_steps: 0
-  #   active_steps: 5
-  #   repeat: 1
-  #   skip_first: 0
-  #   output_dir: "/mnt/share/g00878035/DSV41/profiles/dsv41_8p_first"
-  #   record_shapes: true
-  #   profile_memory: false
-  #   with_stack: false
+    with_stack: false
 
 # --- Checkpoint Configuration ---
 checkpoint:
@@ -76,7 +66,7 @@ checkpoint:
 
 # --- Data Configuration ---
 data:
-  dataset_path: "/mnt/share/g00815994/kimi-k3-0825/LLaVA-Instruct-150K/llava_instruct_150k_fsdp_turbo_10k_len2165.json"
+  dataset_path: "./DSV41/datasets/mock/mock_data_pic_num_2_textlen_4096.jsonl"
   dataset_config: null
   text_column: "text"
   image_column: "images"
@@ -84,7 +74,7 @@ data:
   media_key: "images"
   split: "train"
   batch_size: 1
-  max_seq_length: 2048
+  max_seq_length: 4096
   num_workers: 8
   pin_memory: true
   shuffle: false
@@ -125,8 +115,8 @@ distributed:
     # DeepSeek controls numerical dtypes inside the model. In particular,
     # blanket casting would truncate FP32 HC pre-mix coefficients to BF16.
     cast_forward_inputs: false
-    num_to_forward_prefetch: 2
-    num_to_backward_prefetch: 2
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
     hook_modules:
       - model.layers.{*}
       - model.vision
@@ -164,8 +154,9 @@ distributed:
 memory:
   # V4.1 attention shares runtime state between layers. Recompute requires a
   # model-specific state capture and is intentionally disabled in this adapter.
-  recompute: false
-  recompute_plan: []
+  recompute: true
+  recompute_plan:
+    - model.layers.{*}.ffn
 
 # --- Quantization Configuration ---
 quantization:

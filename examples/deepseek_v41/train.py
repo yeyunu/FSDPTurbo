@@ -90,10 +90,12 @@ class DeepseekV41Trainer(BaseTrainer):
             ),
             "eps": self.config.optimizer.adam_epsilon,
         }
-        if self.config.optimizer.mem_fraction_static is not None:
-            kwargs["mem_fraction_static"] = self.config.optimizer.mem_fraction_static
-        if self.config.optimizer.state_keys is not None:
-            kwargs["state_keys"] = self.config.optimizer.state_keys
+        if self.config.optimizer.optimizer_type == "AdamWSwap":
+            if self.config.optimizer.mem_fraction_static is not None:
+                kwargs["mem_fraction_static"] = self.config.optimizer.mem_fraction_static
+            if self.config.optimizer.state_keys is not None:
+                kwargs["state_keys"] = self.config.optimizer.state_keys
+            kwargs["param_prefetch"] = self.config.optimizer.param_prefetch
 
         engram_tables = host_engram_tables(self.model)
         if not engram_tables:

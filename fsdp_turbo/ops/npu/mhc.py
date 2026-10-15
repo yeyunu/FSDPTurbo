@@ -163,9 +163,10 @@ class _MhcPreSinkhornPremixFunction(torch.autograd.Function):
             norm_out,
             ctx.hc_eps,
         )
-        direct_grad_x = (grad_h_in.unsqueeze(-2).float() * premix.unsqueeze(-1)).to(x.dtype)
+        grad_h_in_fp32 = grad_h_in.unsqueeze(-2).float()
+        direct_grad_x = (grad_h_in_fp32 * premix.unsqueeze(-1)).to(x.dtype)
         grad_x = grad_x + direct_grad_x
-        grad_premix = (grad_h_in.unsqueeze(-2).float() * x.float()).sum(dim=-1)
+        grad_premix = (grad_h_in_fp32 * x.float()).sum(dim=-1)
         return (
             grad_x,
             grad_phi,

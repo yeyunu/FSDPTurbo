@@ -54,8 +54,13 @@ def indexed_sparse_attention_torch(
         )
         attention_scores = attention_scores.masked_fill(~selected_key_mask.unsqueeze(2), -torch.inf)
 
-    sink_scores = attention_sink.float().view(1, 1, -1, 1).expand(batch_size, sequence_length, -1, -1)
-    attention_probabilities = torch.softmax(torch.cat((attention_scores, sink_scores), dim=-1), dim=-1)[..., :-1]
+    # NPU cat may read an expanded zero-stride view as an invalid GM address for
+    # long sequences. Materialize both inputs before concatenation so the eager
+    # fallback presents dense, contiguous storage to the device kernel.
+    sink_scores = attention_sink.float().view(1, 1, -1, 1).expand(batch_size, sequence_length, -1, -1).contiguous()
+    attention_probabilities = torch.softmax(torch.cat((attention_scores.contiguous(), sink_scores), dim=-1), dim=-1)[
+        ..., :-1
+    ]
     attention_output = torch.einsum(
         "bshk,bskd->bshd",
         attention_probabilities.to(selected_key_value.dtype),

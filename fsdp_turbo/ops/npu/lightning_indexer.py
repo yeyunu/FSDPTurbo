@@ -11,8 +11,12 @@ import torch.nn.functional as F
 
 from fsdp_turbo.ops.registry import register_op
 
+try:
+    import torch_npu
+except ImportError:
+    torch_npu = None
 
-_FP4_THRESHOLDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+
 _MX_BLOCK_SIZE = 32
 
 
@@ -143,6 +147,26 @@ def _get_candidate_ops():
         ) from error
 
 
+def _pack_mxfp4_npu(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack an operand with the fused TorchNPU quantizer used by DS41 QLI/QSLI."""
+    if torch_npu is None:
+        raise RuntimeError("MXFP4 lightning indexer quantization requires torch_npu")
+
+    data, scale = torch_npu.npu_dynamic_mx_quant(
+        x.contiguous(),
+        axis=-1,
+        dst_type=torch_npu.float4_e2m1fn_x2,
+        block_size=_MX_BLOCK_SIZE,
+        round_mode="rint",
+        scale_alg=2,
+        dst_type_max=0.0,
+    )
+    return (
+        data.view(torch.uint8).reshape(*x.shape[:-1], x.shape[-1] // 2).contiguous(),
+        scale.view(torch.uint8).reshape(*x.shape[:-1], x.shape[-1] // 64, 2).contiguous(),
+    )
+
+
 def _pack_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize the last dimension in 32-value MXFP4 groups.
 
@@ -152,24 +176,9 @@ def _pack_mxfp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """
     if x.shape[-1] != 128:
         raise ValueError(f"MXFP4 lightning indexer requires D=128, got {x.shape[-1]}")
-
-    blocks = x.float().reshape(*x.shape[:-1], 4, 32)
-    amax = blocks.abs().amax(dim=-1)
-    minimum_amax = 6.0 * (2.0**-126)
-    exponent = torch.ceil(torch.log2(amax.clamp_min(minimum_amax) / 6.0))
-    exponent = exponent.clamp(-126, 127)
-    scale = torch.exp2(exponent).unsqueeze(-1)
-    scaled = (blocks / scale).clamp(-6.0, 6.0)
-
-    magnitude = scaled.abs()
-    code = torch.zeros_like(magnitude, dtype=torch.uint8)
-    for threshold in _FP4_THRESHOLDS:
-        code.add_(magnitude >= threshold)
-    code = code | ((scaled < 0).to(torch.uint8) << 3)
-    code = code.flatten(-2)
-    packed = code[..., 0::2] | (code[..., 1::2] << 4)
-    scale_bytes = (exponent.to(torch.int16) + 127).to(torch.uint8)
-    return packed.contiguous(), scale_bytes.reshape(*x.shape[:-1], 2, 2).contiguous()
+    if x.device.type != "npu":
+        raise ValueError("MXFP4 lightning indexer quantization requires an NPU tensor")
+    return _pack_mxfp4_npu(x)
 
 
 def _make_paged_key(key: torch.Tensor, page_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -355,7 +364,11 @@ def _fused_quant_lightning_indexer(
         )
         candidates = candidate_lengths = None
 
-    return indices.reshape(batch_size, sequence_length, topk), candidates, candidate_lengths
+    return (
+        indices.reshape(batch_size, sequence_length, topk),
+        candidates,
+        candidate_lengths,
+    )
 
 
 def _fused_candidate_lightning_indexer(

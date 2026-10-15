@@ -4,23 +4,23 @@
 
 # --- Model Configuration ---
 model:
-  model_name_or_path: "/home/g00878035/DSV41/models/DeepSeek-V4.1-Flash"
-  tokenizer_name_or_path: "/home/g00878035/DSV41/models/DeepSeek-V4.1-Flash"
+  model_name_or_path: "./DSV41/models/DeepSeek-V4.1-Flash"
+  tokenizer_name_or_path: "./DSV41/models/DeepSeek-V4.1-Flash"
   torch_dtype: "bf16"
   # Head projection precision: fp32, bf16, or hf32 (NPU); cross entropy remains FP32.
-  head_compute_dtype: "fp32"
+  head_compute_dtype: "bf16"
   engram_storage_backend: "host_offload"
   # Use CANN SparseFlashMla/SparseFlashMlaGrad instead of eager indexed attention.
-  use_sparse_flash_attn: false
+  use_sparse_flash_attn: true
   # Select candidate indexers on Atlas A3/Ascend 910B/910C and quantized
   # indexers on Ascend950DT.
-  use_fused_lightning_indexer: false
+  use_fused_lightning_indexer: true
   # Use CANN Compressor/CompressorGrad for compressed-KV pooling.
   use_fused_compressor: false
   # Use CANN MhcPreSinkhornPremix/MhcPost training kernels.
-  use_fused_mhc: false
+  use_fused_mhc: true
   # Use CANN FlashAttentionScore/FlashAttentionScoreGrad for vision attention.
-  use_fused_vision_flash_attn: false
+  use_fused_vision_flash_attn: true
 
 # --- Optimizer Configuration ---
 optimizer:
@@ -50,7 +50,7 @@ run:
     active_steps: 1
     repeat: 1
     skip_first: 5
-    output_dir: "/home/g00878035/DSV41/profiles/dsv41_8p"
+    output_dir: "./DSV41/profiles/dsv41_8p"
     record_shapes: true
     profile_memory: false
     with_stack: false
@@ -66,7 +66,7 @@ checkpoint:
 
 # --- Data Configuration ---
 data:
-  dataset_path: "/home/g00878035/DSV41/datasets/fsdp_turbo/processed_llava.json"
+  dataset_path: "./DSV41/datasets/mock/mock_data_pic_num_2_textlen_4096.jsonl"
   dataset_config: null
   text_column: "text"
   image_column: "images"
@@ -154,8 +154,9 @@ distributed:
 memory:
   # V4.1 attention shares runtime state between layers. Recompute requires a
   # model-specific state capture and is intentionally disabled in this adapter.
-  recompute: false
-  recompute_plan: []
+  recompute: true
+  recompute_plan:
+    - model.layers.{*}.ffn
 
 # --- Quantization Configuration ---
 quantization:
