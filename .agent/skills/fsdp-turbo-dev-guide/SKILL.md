@@ -1,11 +1,11 @@
 ---
 name: "fsdp-turbo-dev-guide"
-description: "FSDPTurbo 仓库开发守则：device 抽象、ops 隔离、config 校验、日志、命名、models 叶子隔离等 8 条规则。在编写或修改 fsdp_turbo 代码时必须遵循。"
+description: "FSDPTurbo 仓库开发守则：device 抽象、ops 隔离、config 校验、日志、命名、models 叶子隔离、modeling 禁止 patch、代码精简、工具函数复用等 11 条规则。在编写或修改 fsdp_turbo 代码时必须遵循。"
 ---
 
 # FSDPTurbo 开发守则
 
-本守则是 FSDPTurbo 仓库的强制开发规范。当 Agent 在 `fsdp_turbo/` 目录下新增、修改、审查代码，或回答该仓库相关实现问题时，**必须**遵循以下 8 条规则，并在生成代码后逐条自检。
+本守则是 FSDPTurbo 仓库的强制开发规范。当 Agent 在 `fsdp_turbo/` 目录下新增、修改、审查代码，或回答该仓库相关实现问题时，**必须**遵循以下 11 条规则，并在生成代码后逐条自检。
 
 仓库顶层模块结构（用于理解规则的作用范围）：
 
@@ -261,6 +261,118 @@ from ..deepseek_v41.model import ModelArgs                                # 禁�
 
 ---
 
+## 规则 9：`fsdp_turbo.models` 下的 modeling 禁止 patch，必须继承 transformers 类覆写
+
+`fsdp_turbo/models/` 中的 modeling 适配代码（新增或修改）**不得**以任何运行期改写（patch）的方式改变模型行为，必须通过**继承 transformers 对应类并覆写**来表达。
+
+**9.1 禁止的 patch 方式**
+
+- 禁止 `*_patch.py` + `apply_*_patch()` 式「运行时替换类引用」：如 `modeling_kimi_linear.KimiSparseMoeBlock = PatchKimiSparseMoeBlock`；
+- 禁止对类/实例做 `setattr` 挂载或替换成员来改变行为：如 `setattr(module, "forward", new_forward)`、改写 `Class.method`、改动 `ALL_ATTENTION_FUNCTIONS` 等库内注册表来偷换实现；
+- 禁止在 `models/` 下提供「自由函数 forward」交由配置 `module_patches.replacement`（或 `utils/patch.py` 的 `patch_namespace_members` 等）在运行期替换 transformers 成员；
+- 禁止用 `PatchXxx` 命名定义**非继承**的替代类去顶替 transformers 同名类（如 `class PatchKimiSparseMoeBlock(nn.Module)`）。
+
+**9.2 正确做法：继承 + 覆写**
+
+```python
+# models/qwen/modeling_qwen3_5.py（示意）
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5DecoderLayer,
+    Qwen3_5ForCausalLM,
+)
+
+
+class FSDPTurboQwen3_5DecoderLayer(Qwen3_5DecoderLayer):
+    """只覆写差异部分，其余逻辑复用父类。"""
+
+    def forward(self, hidden_states, *args, **kwargs):
+        # 适配点：NPU 融合算子 / CP 序列切分
+        return super().forward(hidden_states, *args, **kwargs)
+
+
+class FSDPTurboQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
+    def __init__(self, config):
+        super().__init__(config)
+        # 组件级替换：在子类中装配子类化的 layer / MoE block
+        self.model.layers = nn.ModuleList(
+            [FSDPTurboQwen3_5DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+```
+
+要点：
+
+1. 覆写优先 `super()` 复用父类逻辑，只改真正需要变化的代码路径；
+2. 组件级替换（attention / MoE block / decoder layer）用「子类 + 在子类 `__init__` 中装配」，**不得**回头改写父类或原始模块的类对象；
+3. 需要按配置开关时，通过构造参数或 config 字段**选择使用哪个子类**（如工厂函数返回不同子类），而不是运行时打补丁；
+4. 仓库内 vendored 的参考实现（如 `models/kimi/modeling_kimi_linear.py` 中的类）同样适用：继承其参考类覆写，而不是替换类引用。
+
+**9.3 边界与存量待整改**
+
+- 本规则只约束 `fsdp_turbo/models/`。`distributed/context_parallel/patch.py`、`utils/patch.py` 提供的框架级 `module_patches` 能力本身不受限，但**不得**再被 `models/` 当作建模适配手段；
+- 存量待整改（不要求本次立即重构，但改动到相关文件时应一并整改）：
+  - `models/kimi/kimi_moe_patch.py`：`apply_kimi_k3_moe_patch()` 换类引用，以及 `PatchKimiSparseMoeBlock` / `PatchKimiMoeExperts` 非继承式替代类；
+  - `models/kimi/modeling_kimi_k3.py`：对 `apply_kimi_k3_moe_patch()` 的调用；
+  - `models/qwen/qwen3_5.py`、`models/qwen/qwen3_5_moe.py`：自由函数 forward（`qwen3_5_model_forward` / `qwen3_5_moe_model_forward`）依赖配置 `replacement` 的运行期替换。
+
+---
+
+## 规则 10：代码简单干净，只做必要的检查
+
+写代码的目标是**能用最少的代码把事做对**，不是把每个位置都包上防御逻辑。
+
+- 边界校验只做一次：外部输入与配置在入口校验（配置统一收敛到 `FSDPTurboConfig.__post_init__`，见规则 5）；内部调用链**不得**对已校验过的同一条件重复校验；
+- 只做必要的检查，不要为了「看起来稳健」堆叠 `assert` / `if not isinstance(...)` / `try-except`；异常处理只包住真正会抛且需要兜底的点，能直接调用就直接调用；
+- 不实现当前用不到的能力、参数、开关、配置项（YAGNI），不为「以后可能要扩展」预留空壳；
+- 不加与本次改动无关的代码：不做顺手重构、不留注释掉的死代码与调试残留；
+- 优先复用标准库、`torch`、`transformers` 的既有能力，能一行表达就不写十行；
+- 改动中发现可直接删除的冗余逻辑，一并清理（但不得越过规则 4、规则 8 的模块边界）。
+
+错误：
+```python
+# 内部调用链重复校验已在入口校验过的条件（validate_chunk_batch_config 已校验）
+def chunk_batch(tensor, chunk_size):
+    if chunk_size <= 0:                               # 禁止：重复校验
+        raise ValueError("chunk_size must be positive")
+    if not isinstance(tensor, torch.Tensor):          # 禁止：调用方已保证类型
+        raise TypeError("tensor must be a torch.Tensor")
+```
+
+---
+
+## 规则 11：工具函数复用优先，其次才考虑抽象
+
+写代码的目标是把事做对，不是把每段逻辑都抽成函数。动手写工具函数之前，按顺序确认：
+
+1. **项目内是否已有**：先搜 [fsdp_turbo/utils/](fsdp_turbo/utils/)（`log.py`、`device.py`、`dtype.py`、`model.py`、`random.py`、`str_match.py`、`gmm_layout.py`、`patch.py` 等），再搜同模块或同领域的既有实现；
+2. **标准库 / `torch` / `transformers` 是否已提供**；
+3. 以上都不满足时，再判断复用范围：
+   - 会被多个模块复用 → 抽到 `fsdp_turbo/utils/`；领域专用的放对应领域的公共文件（如算子相关的放 `ops/`）；
+   - 只服务一处 → 就近定义，**不要**为「以后可能用到」提前抽象；
+   - 新增公共函数需保证：命名与签名一眼可懂（见规则 7）、只依赖标准库/`torch`/公共底层、可被独立复用。
+
+**禁止**：重复实现已有工具（如自己解析环境变量推断设备，而不用 `get_accelerator_name()`）；把只在一处使用的一次性逻辑硬抽成公共函数（过度抽象）。
+
+正确：先用已有工具，不重复造轮子。
+```python
+from fsdp_turbo.utils.device import get_accelerator_name
+from fsdp_turbo.utils.log import print_rank
+
+print_rank(logger.info, f"running on {get_accelerator_name()}")
+```
+
+错误：
+```python
+# 1) 重复实现既有工具：utils/device.py 已有 get_accelerator_name()
+def detect_device():
+    return os.environ.get("DEVICE_TYPE", "npu")        # 禁止
+
+# 2) 过度抽象：全仓只有一处调用的两行逻辑，硬抽成公共函数
+def default_expert_scale(num_experts: int) -> float:
+    return 1.0 / max(num_experts, 1)                   # 禁止：就近写在调用处即可
+```
+
+---
+
 ## 自检清单
 
 提交或输出代码前，逐条确认：
@@ -272,4 +384,7 @@ from ..deepseek_v41.model import ModelArgs                                # 禁�
 5. [ ] 新配置字段已在 `FSDPTurboConfig.__post_init__` 校验，运行期只读；
 6. [ ] 无 `print`，日志均走 `print_rank` / `log_warning_once`；
 7. [ ] 命名直观自解释，无非常见缩写、无数字后缀；
-8. [ ] `fsdp_turbo/` 包内未引用 `fsdp_turbo.models`（仅 `examples/`、`tests/`、`docs/` 可引用），且 `models/` 下各模型目录之间无交叉导入、无 `models/` 根共享代码依赖。
+8. [ ] `fsdp_turbo/` 包内未引用 `fsdp_turbo.models`（仅 `examples/`、`tests/`、`docs/` 可引用），且 `models/` 下各模型目录之间无交叉导入、无 `models/` 根共享代码依赖；
+9. [ ] `models/` 下的 modeling 未使用 patch（无 `*_patch.py`/`apply_*_patch()`、无 `setattr` 换成员、无靠配置 `replacement` 替换的自由函数 forward、无 `PatchXxx` 非继承替代类），适配一律继承 transformers 类覆写；
+10. [ ] 代码量已最小化且只做必要检查（未重复校验已在入口校验的条件、无 YAGNI 参数/空壳、无死代码、无与改动无关的代码）；
+11. [ ] 工具函数优先复用 `fsdp_turbo/utils/` 及标准库/`torch`/`transformers` 既有实现，未重复造轮子；新增抽象仅限会被多处复用的逻辑，未过度抽象。
