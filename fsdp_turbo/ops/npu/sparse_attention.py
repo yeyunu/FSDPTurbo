@@ -2,6 +2,8 @@
 """NPU implementations for differentiable indexed sparse attention."""
 
 import os
+from contextlib import nullcontext
+from functools import lru_cache
 
 import torch
 
@@ -182,7 +184,125 @@ def _validate_sparse_flash_mla_inputs(
     )
 
 
+@lru_cache(maxsize=128)
+def _cached_forward_metadata(
+    device_type,
+    device_index,
+    stream_id,
+    deterministic,
+    residual,
+    *,
+    num_heads_q,
+    num_heads_kv,
+    head_dim,
+    batch_size,
+    max_seqlen_q,
+    max_seqlen_ori_kv,
+    max_seqlen_cmp_kv,
+    cmp_topk,
+    cmp_ratio,
+    cmp_mask_mode,
+    ori_win_left,
+    has_cmp_kv,
+):
+    """Create BSND forward metadata; stream and deterministic mode isolate cache entries."""
+    device = torch.device(device_type, device_index)
+    device_context = torch.npu.device(device) if device_type == "npu" else nullcontext()
+    with device_context:
+        return _get_cann_ops().sparse_flash_mla_metadata(
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            head_dim=head_dim,
+            cu_seqlens_q=None,
+            cu_seqlens_ori_kv=None,
+            cu_seqlens_cmp_kv=None,
+            cmp_residual_kv=_residual_tensor(residual, batch_size, device, has_cmp_kv and cmp_ratio != 1),
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_ori_kv=max_seqlen_ori_kv,
+            max_seqlen_cmp_kv=max_seqlen_cmp_kv,
+            ori_topk=0,
+            cmp_topk=cmp_topk,
+            cmp_ratio=cmp_ratio,
+            ori_mask_mode=4,
+            cmp_mask_mode=cmp_mask_mode,
+            ori_win_left=ori_win_left,
+            ori_win_right=0,
+            layout_q="BSND",
+            layout_kv="BSND",
+            has_ori_kv=True,
+            has_cmp_kv=has_cmp_kv,
+        )
+
+
+@lru_cache(maxsize=128)
+def _cached_backward_metadata(
+    device_type,
+    device_index,
+    stream_id,
+    deterministic,
+    residual,
+    *,
+    num_heads_q,
+    num_heads_kv,
+    head_dim,
+    batch_size,
+    max_seqlen_q,
+    max_seqlen_ori_kv,
+    max_seqlen_cmp_kv,
+    cmp_topk,
+    cmp_ratio,
+    cmp_mask_mode,
+    ori_win_left,
+    has_cmp_kv,
+):
+    """Create BSND backward metadata; stream and deterministic mode isolate cache entries."""
+    device = torch.device(device_type, device_index)
+    device_context = torch.npu.device(device) if device_type == "npu" else nullcontext()
+    with device_context:
+        return _get_cann_ops().sparse_flash_mla_grad_metadata(
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            head_dim=head_dim,
+            cu_seqlens_q=None,
+            cu_seqlens_ori_kv=None,
+            cu_seqlens_cmp_kv=None,
+            cmp_residual_kv=_residual_tensor(residual, batch_size, device, has_cmp_kv and cmp_ratio != 1),
+            batch_size=batch_size,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_ori_kv=max_seqlen_ori_kv,
+            max_seqlen_cmp_kv=max_seqlen_cmp_kv,
+            ori_topk=0,
+            cmp_topk=cmp_topk,
+            cmp_ratio=cmp_ratio,
+            ori_mask_mode=4,
+            cmp_mask_mode=cmp_mask_mode,
+            ori_win_left=ori_win_left,
+            ori_win_right=0,
+            layout_q="BSND",
+            layout_kv="BSND",
+            has_ori_kv=True,
+            has_cmp_kv=has_cmp_kv,
+        )
+
+
+def _metadata_cache_context(layout, residual, device_type, device_index, cu_seqlens, cu_seqlens_cmp):
+    """Resolve BSND cache eligibility, device index, and current stream."""
+    cacheable = layout == "BSND" and cu_seqlens is None and cu_seqlens_cmp is None and isinstance(residual, int)
+    stream_id = None
+    if cacheable and device_type == "npu":
+        if device_index is None:
+            device_index = torch.npu.current_device()
+        with torch.npu.device(torch.device(device_type, device_index)):
+            stream_id = torch.npu.current_stream().npu_stream
+            is_capturing = getattr(torch.npu, "is_current_stream_capturing", None)
+            if is_capturing is not None and is_capturing():
+                cacheable = False
+    return cacheable, device_index, stream_id
+
+
 def _forward_metadata(
+    *,
     batch_size,
     num_query_heads,
     num_kv_heads,
@@ -201,51 +321,65 @@ def _forward_metadata(
     cu_seqlens,
     cu_seqlens_cmp,
 ):
-    device = torch.device(device_type, device_index)
-    cu_seqlens = _as_int32_cu_seqlens(cu_seqlens)
-    cu_seqlens_cmp = _as_int32_cu_seqlens(cu_seqlens_cmp)
-    return _get_cann_ops().sparse_flash_mla_metadata(
+    """Reuse cached BSND forward metadata; generate TND metadata for each call."""
+    attributes = dict(
         num_heads_q=num_query_heads,
         num_heads_kv=num_kv_heads,
         head_dim=head_dim,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_ori_kv=cu_seqlens,
-        cu_seqlens_cmp_kv=cu_seqlens_cmp,
         batch_size=batch_size,
         max_seqlen_q=query_length,
         max_seqlen_ori_kv=original_kv_length,
         max_seqlen_cmp_kv=compressed_kv_length,
-        cmp_residual_kv=_residual_tensor(
-            residual,
-            batch_size,
-            device,
-            has_compressed_kv and compress_ratio != 1,
-        ),
-        ori_topk=0,
         cmp_topk=topk if has_compressed_kv else 0,
         cmp_ratio=compress_ratio,
-        ori_mask_mode=4,
         cmp_mask_mode=_cmp_mask_mode(has_compressed_kv),
         ori_win_left=window_size - 1,
-        ori_win_right=0,
-        layout_q=layout,
-        layout_kv=layout,
-        has_ori_kv=True,
         has_cmp_kv=has_compressed_kv,
     )
+    cacheable, device_index, stream_id = _metadata_cache_context(
+        layout, residual, device_type, device_index, cu_seqlens, cu_seqlens_cmp
+    )
+    if cacheable:
+        return _cached_forward_metadata(
+            device_type,
+            device_index,
+            stream_id,
+            torch.are_deterministic_algorithms_enabled(),
+            residual,
+            **attributes,
+        )
+
+    device = torch.device(device_type, device_index)
+    device_context = torch.npu.device(device) if device_type == "npu" else nullcontext()
+    with device_context:
+        cu_seqlens = _as_int32_cu_seqlens(cu_seqlens)
+        return _get_cann_ops().sparse_flash_mla_metadata(
+            **attributes,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_ori_kv=cu_seqlens,
+            cu_seqlens_cmp_kv=_as_int32_cu_seqlens(cu_seqlens_cmp),
+            cmp_residual_kv=_residual_tensor(residual, batch_size, device, has_compressed_kv and compress_ratio != 1),
+            ori_topk=0,
+            ori_mask_mode=4,
+            ori_win_right=0,
+            layout_q=layout,
+            layout_kv=layout,
+            has_ori_kv=True,
+        )
 
 
 def _backward_metadata(
+    *,
     batch_size,
-    query_length,
-    original_kv_length,
-    compressed_kv_length,
     num_query_heads,
     num_kv_heads,
     head_dim,
     topk,
     has_compressed_kv,
     compress_ratio,
+    query_length,
+    original_kv_length,
+    compressed_kv_length,
     residual,
     window_size,
     device_type,
@@ -254,38 +388,51 @@ def _backward_metadata(
     cu_seqlens,
     cu_seqlens_cmp,
 ):
-    device = torch.device(device_type, device_index)
-    cu_seqlens = _as_int32_cu_seqlens(cu_seqlens)
-    cu_seqlens_cmp = _as_int32_cu_seqlens(cu_seqlens_cmp)
-    return _get_cann_ops().sparse_flash_mla_grad_metadata(
+    """Reuse cached BSND backward metadata; generate TND metadata for each call."""
+    attributes = dict(
         num_heads_q=num_query_heads,
         num_heads_kv=num_kv_heads,
         head_dim=head_dim,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_ori_kv=cu_seqlens,
-        cu_seqlens_cmp_kv=cu_seqlens_cmp,
-        cmp_residual_kv=_residual_tensor(
-            residual,
-            batch_size,
-            device,
-            has_compressed_kv and compress_ratio != 1,
-        ),
         batch_size=batch_size,
         max_seqlen_q=query_length,
         max_seqlen_ori_kv=original_kv_length,
         max_seqlen_cmp_kv=compressed_kv_length,
-        ori_topk=0,
         cmp_topk=topk if has_compressed_kv else 0,
         cmp_ratio=compress_ratio,
-        ori_mask_mode=4,
         cmp_mask_mode=_cmp_mask_mode(has_compressed_kv),
         ori_win_left=window_size - 1,
-        ori_win_right=0,
-        layout_q=layout,
-        layout_kv=layout,
-        has_ori_kv=True,
         has_cmp_kv=has_compressed_kv,
     )
+    cacheable, device_index, stream_id = _metadata_cache_context(
+        layout, residual, device_type, device_index, cu_seqlens, cu_seqlens_cmp
+    )
+    if cacheable:
+        return _cached_backward_metadata(
+            device_type,
+            device_index,
+            stream_id,
+            torch.are_deterministic_algorithms_enabled(),
+            residual,
+            **attributes,
+        )
+
+    device = torch.device(device_type, device_index)
+    device_context = torch.npu.device(device) if device_type == "npu" else nullcontext()
+    with device_context:
+        cu_seqlens = _as_int32_cu_seqlens(cu_seqlens)
+        return _get_cann_ops().sparse_flash_mla_grad_metadata(
+            **attributes,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_ori_kv=cu_seqlens,
+            cu_seqlens_cmp_kv=_as_int32_cu_seqlens(cu_seqlens_cmp),
+            cmp_residual_kv=_residual_tensor(residual, batch_size, device, has_compressed_kv and compress_ratio != 1),
+            ori_topk=0,
+            ori_mask_mode=4,
+            ori_win_right=0,
+            layout_q=layout,
+            layout_kv=layout,
+            has_ori_kv=True,
+        )
 
 
 class _SparseFlashMlaFunction(torch.autograd.Function):
@@ -338,37 +485,26 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
             else 0
         )
         topk = compressed_indices.shape[-1] if has_compressed_kv else 0
-        shape = (
-            batch_size,
-            query_length,
-            original_kv_length,
-            compressed_kv_length,
-            num_query_heads,
-            num_kv_heads,
-            head_dim,
-            topk,
-            query.device.type,
-            query.device.index,
+        metadata_kwargs = dict(
+            batch_size=batch_size,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            topk=topk,
+            has_compressed_kv=has_compressed_kv,
+            compress_ratio=compress_ratio,
+            query_length=query_length,
+            original_kv_length=original_kv_length,
+            compressed_kv_length=compressed_kv_length,
+            residual=residual,
+            window_size=window_size,
+            device_type=query.device.type,
+            device_index=query.device.index,
+            layout=layout,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_cmp=cu_seqlens_cmp,
         )
-        metadata = _forward_metadata(
-            batch_size,
-            num_query_heads,
-            num_kv_heads,
-            head_dim,
-            topk,
-            has_compressed_kv,
-            compress_ratio,
-            query_length,
-            original_kv_length,
-            compressed_kv_length,
-            residual,
-            window_size,
-            query.device.type,
-            query.device.index,
-            layout,
-            cu_seqlens,
-            cu_seqlens_cmp,
-        )
+        metadata = _forward_metadata(**metadata_kwargs)
         result, softmax_lse = _get_cann_ops().sparse_flash_mla(
             query,
             ori_kv=original_kv,
@@ -405,7 +541,7 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
         ctx.compress_ratio = compress_ratio
         ctx.window_size = window_size
         ctx.residual = residual
-        ctx.shape = shape
+        ctx.metadata_kwargs = metadata_kwargs
         ctx.layout = layout
         ctx.cu_seqlens = cu_seqlens
         ctx.cu_seqlens_cmp = cu_seqlens_cmp
@@ -417,40 +553,11 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
         query, original_kv, result, softmax_lse, attention_sink, *optional = ctx.saved_tensors
         compressed_kv = optional[0] if ctx.has_compressed_kv else None
         compressed_indices = optional[1] if ctx.has_compressed_kv else None
-        (
-            batch_size,
-            query_length,
-            original_kv_length,
-            compressed_kv_length,
-            num_query_heads,
-            num_kv_heads,
-            head_dim,
-            topk,
-            device_type,
-            device_index,
-        ) = ctx.shape
+        batch_size = ctx.metadata_kwargs["batch_size"]
         layout = ctx.layout
         cu_seqlens = ctx.cu_seqlens
         cu_seqlens_cmp = ctx.cu_seqlens_cmp
-        metadata = _backward_metadata(
-            batch_size,
-            query_length,
-            original_kv_length,
-            compressed_kv_length,
-            num_query_heads,
-            num_kv_heads,
-            head_dim,
-            topk,
-            ctx.has_compressed_kv,
-            ctx.compress_ratio,
-            ctx.residual,
-            ctx.window_size,
-            device_type,
-            device_index,
-            layout,
-            cu_seqlens,
-            cu_seqlens_cmp,
-        )
+        metadata = _backward_metadata(**ctx.metadata_kwargs)
         gradients = _get_cann_ops().sparse_flash_mla_grad(
             query,
             grad_output.contiguous(),
