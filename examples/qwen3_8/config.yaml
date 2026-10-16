@@ -1,0 +1,194 @@
+# ============================================================
+# Qwen3.8-Flash-Next (qwen4_exp) FSDP2 Training Configuration
+# ============================================================
+# Model: 48 layers, 512 experts (top-10), hidden=2560
+#        12 full-attn layers (every 4th) + 36 linear-attn (GDN) layers
+#        PLE n-gram embedding on layer 1 (128 shards, ~51B params)
+#        QSA indexer on full-attn layers
+# Weight: 336 GB (bf16, 131 safetensors shards)
+# Hardware: 64x Ascend910 (64GB HBM each, 4 nodes × 16 chips)
+# ============================================================
+
+# --- Model Configuration ---
+# Note: model-specific knobs (attn_implementation, gdn_implementation,
+# qsa_implementation, ple_embedding_on_cpu, use_grouped_expert_matmul, etc.)
+# are set directly on the HuggingFace config in train.py::_overwrite_qwen4_exp_config,
+# not here — matching the convention used by the qwen3_5 / qwen3_5_moe examples.
+model:
+  model_name_or_path: "/path/to/Qwen3.8-Flash-Next"
+  tokenizer_name_or_path: "/path/to/Qwen3.8-Flash-Next"
+  torch_dtype: "bf16"
+  num_hidden_layers: null          # null = full 48 layers; set 2-4 for debug
+  mtp_num_layers: 1                # MTP layers; 0 = disabled, 1 = enabled
+  mtp_loss_scaling_factor: 0.1     # MTP loss scaling factor
+
+# --- Optimizer Configuration ---
+optimizer:
+  optimizer_type: "AdamW"
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1e-8
+  lr: 1.0e-5
+  warmup_ratio: 0.1
+  lr_scheduler_type: "CosineAnnealingLR"
+  min_lr: 0.0
+  clip_grad: 1.0
+  clip_grad_norm_type: 2.0
+
+# --- Run Configuration ---
+run:
+  seed: 42
+  max_steps: 100
+  num_train_epochs: 10
+  gradient_accumulation_steps: 1
+  logging_steps: 1
+  profile:
+    enabled: false
+    wait_steps: 0
+    warmup_steps: 0
+    active_steps: 10
+    repeat: 1
+    skip_first: 0
+    output_dir: "./profile"
+    record_shapes: false
+    profile_memory: false
+    with_stack: false
+
+# --- Checkpoint Configuration ---
+checkpoint:
+  output_dir: "./output/qwen3_8_flash_next"
+  save_steps: 10000
+  strict: true
+  save_optim: true
+  load_optim: true
+  resume_from_checkpoint: null
+
+# --- Data Configuration ---
+data:
+  dataset_path: "/path/to/multimodal_data.json"
+  dataset_config: null
+  text_column: "text"
+  image_column: "images"
+  media_key: "images"
+  conversation_column: "messages"
+  split: "train"
+  batch_size: 1
+  max_seq_length: 32768
+  num_workers: 8
+  pin_memory: true
+  shuffle: true
+  is_multimodal: true
+
+# --- Distributed Configuration ---
+# 64x Ascend910: FSDP=64, EP=64, Ulysses CP=2
+# CP mesh: data=32 × ulysses=2 → 32 data-parallel groups, 2 CP ranks each
+# PLE embedding (~51B params fp32) MUST be VP-sharded or excluded
+distributed:
+  fully_shard_parallel_size: 64      # FSDP2: 64 cards full-shard
+  tensor_parallel_size: 1             # TP: off
+  ulysses_parallel_size: 2            # Ulysses CP: split sequence across 2 ranks (32k→16k/rank)
+  expert_parallel_size: 64           # EP: 64 cards (512 experts / 64 = 8 per card)
+  expert_fully_shard_parallel_size: 1
+  expert_data_parallel_size: 1
+
+  # VP/VFSDP for huge PLE n-gram embedding (~51B params fp32, 128 shards)
+  # When ple_embedding_on_cpu=true (default), VP is NOT needed — the table
+  # stays on CPU (frozen). Enable VP only if you want the table on GPU.
+  # vocab_parallel_size: 16
+  # vocab_fully_shard_parallel_size: 1
+  # vocab_data_parallel_size: 1
+  # vp_plan:
+  #   apply_modules:
+  #     - model.language_model.layers.1.ple.ple_embedding
+
+  # --- FSDP Plan ---
+  fsdp_plan:
+    ignored_modules:
+      - model.language_model.layers.1.ple.ple_embedding   # PLE on CPU, excluded from FSDP
+    apply_modules:
+      model.visual:
+        {}
+      model.visual.blocks.{*}:
+        {}
+      model.language_model.embed_tokens:
+        {}
+      model.language_model:
+        {}
+      model.language_model.layers.{*}:
+        {}
+      model.language_model.layers.{*}.linear_attn:
+        {}
+      model.language_model.layers.{*}.mlp.experts:
+        {}
+      mtp:
+        {}
+      mtp.hyper_connection_mixer:
+        {}
+      mtp.layers.{*}:
+        {}
+      mtp.layers.{*}.linear_attn:
+        {}
+      mtp.layers.{*}.mlp.experts:
+        {}
+      lm_head:
+        {}
+    param_dtype: "bf16"
+    reduce_dtype: "fp32"
+    output_dtype: "bf16"
+    cast_forward_inputs: true
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+    hook_modules:
+      - model.language_model.layers.{*}
+      - mtp.layers.{*}
+    fsdp_implementation: "native"
+
+  # --- Tensor Parallel Plan ---
+  tp_plan:
+    colwise_parallel: ['*.q_proj', '*.k_proj', '*.v_proj']
+    rowwise_parallel: ['*.o_proj']
+    sequence_parallel: []
+
+  # --- Context Parallel Plan (Ulysses CP) ---
+  # Patches full-attention and GDN (linear-attention) forwards with Ulysses
+  # all-to-all wrappers, and the causal-LM loss with CP-aware cross-entropy.
+  cp_plan:
+    ulysses_function_patches:
+      - target_functions:
+          - transformers.integrations.sdpa_attention.sdpa_attention_forward
+        type: full_attention
+      - target_functions:
+          - transformers.models.qwen4_exp.modeling_qwen4_exp.Qwen4ExpTextGatedDeltaNet.forward
+        type: gated_delta_net
+    loss_function_patches:
+      - target_functions:
+          - transformers.loss.loss_utils.ForCausalLMLoss
+        type: causal_lm_loss
+
+  # --- Expert Parallel Plan ---
+  ep_plan:
+    apply_modules:
+      - model.language_model.layers.{*}.mlp.experts
+      - mtp.layers.{*}.mlp.experts
+    dispatcher: "fused"
+    apply_efsdp_modules:
+      - model.language_model.layers.{*}.mlp
+      - mtp.layers.{*}.mlp
+
+# --- Memory Configuration ---
+memory:
+  recompute: true
+  recompute_plan:
+    - model.visual.blocks.{*}
+    - model.language_model.layers.{*}
+  chunk_batch: false
+  swap_activation: true
+  swap_activation_plan:
+    apply_modules:
+      - model.language_model.layers.{*}
+      - mtp.layers.{*}
+
+# --- Quantization Configuration ---
+quantization:
+  quantization_plan: null

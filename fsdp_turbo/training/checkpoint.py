@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 # torch.distributed.checkpoint (DCP) — available in PyTorch >= 2.2.
 try:
     import torch.distributed.checkpoint as dcp
+    from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
     from torch.distributed.checkpoint.state_dict import (
         get_state_dict,
         set_state_dict,
@@ -25,6 +26,11 @@ try:
     _HAS_DCP = True
 except ImportError:
     _HAS_DCP = False
+
+# Prefix of optimizer-state keys in DCP's flattened state-dict namespace:
+# {"app": {"optim": {"state": {<param fqn>: {...}}}}}. Keep in sync with the
+# literals used in ``_save_dcp``/``_load_dcp`` and ``_AppState.state_dict``.
+_OPTIM_STATE_KEY_PREFIX = "app.optim.state."
 
 
 def dataset_fingerprint(data_cfg) -> str:
@@ -140,6 +146,50 @@ if _HAS_DCP:
             self.consumed_samples = int(state_dict.get("consumed_samples", 0))
             self.dataset_fingerprint = state_dict.get("dataset_fingerprint", "")
             self.dataloader_state_dict = state_dict.get("dataloader_state_dict", None)
+
+    class _OptimStateTolerantLoadPlanner(DefaultLoadPlanner):
+        """DCP load planner that tolerates missing *optimizer-state* keys only.
+
+        Optimizer state is created lazily, when a parameter receives its first
+        gradient.  Parameters whose output never joins the differentiable path
+        (e.g. the qwen4_exp QSA indexer, whose forward returns a discrete
+        token-selection mask) finish a run with no optimizer state, so their
+        ``step``/``exp_avg``/``exp_avg_sq`` keys are absent from the saved
+        checkpoint.  The DCP load template, in contrast, pre-initializes state
+        for *every* trainable parameter, so a strict resume would otherwise
+        abort with ``Missing key in checkpoint state_dict:
+        app.optim.state.<param>.step``.
+
+        This planner drops such keys from the load plan: the affected
+        parameters keep the fresh zero state produced by template generation
+        (they are never updated anyway, since they receive no gradients).
+        Every other key — model weights, scheduler, metadata — stays strict,
+        so genuine architecture mismatches still fail the load.
+        """
+
+        def __init__(self, optim_state_prefix: str = _OPTIM_STATE_KEY_PREFIX, **kwargs):
+            super().__init__(**kwargs)
+            self._optim_state_prefix = optim_state_prefix
+
+        def create_local_plan(self):
+            # Only meaningful for flattened keys ("a.b.c" strings); with
+            # flatten_state_dict=False the keys are tuples and the default
+            # strict behavior applies.
+            if self.metadata is not None and self.flatten_state_dict:
+                saved_keys = set(self.metadata.state_dict_metadata.keys())
+                tolerable = [
+                    key for key in self.state_dict if key.startswith(self._optim_state_prefix) and key not in saved_keys
+                ]
+                for key in tolerable:
+                    del self.state_dict[key]
+                if tolerable:
+                    print_rank(
+                        logger.info,
+                        f"DCP load: {len(tolerable)} optimizer-state keys absent from "
+                        f"checkpoint (parameters that never received gradients, "
+                        f"e.g. '{tolerable[0]}'); keeping fresh optimizer state for them",
+                    )
+            return super().create_local_plan()
 
 
 class Checkpointer:
@@ -295,7 +345,11 @@ class Checkpointer:
             strict: If True, ``model.load_state_dict`` requires exact
                 key match.  If False, missing keys are ignored (useful
                 when loading a checkpoint trained with a different
-                model architecture or partial checkpoint).
+                model architecture or partial checkpoint).  Under
+                strict mode, optimizer-state keys of parameters that
+                never received gradients (and thus were never saved)
+                are still tolerated: those parameters resume with
+                fresh optimizer state.
 
         Returns:
             A dict with saved metadata (``global_step``,
@@ -315,7 +369,17 @@ class Checkpointer:
         optim_to_load = optimizer if self.load_optim else None
         app = _AppState(model, optim_to_load, scheduler, strict=strict)
         state_dict = {"app": app}
-        dcp.load(state_dict, checkpoint_id=checkpoint_path)
+        if strict:
+            # Tolerate optimizer-state keys of parameters that never received
+            # gradients (they have no state in the checkpoint); everything
+            # else (model/scheduler/metadata) stays strict.
+            planner = _OptimStateTolerantLoadPlanner()
+        else:
+            # Non-strict load: skip any key missing from the checkpoint so
+            # partial/different-architecture checkpoints can be loaded, as
+            # documented for ``strict=False``.
+            planner = DefaultLoadPlanner(allow_partial_load=True)
+        dcp.load(state_dict, checkpoint_id=checkpoint_path, planner=planner)
 
         print_rank(logger.info, f"DCP checkpoint loaded from {checkpoint_path}")
         return {

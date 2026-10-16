@@ -312,48 +312,43 @@ class BaseTrainer:
 
     @classmethod
     def sync_loss(cls, accumulated_losses: dict) -> dict:
-        """Synchronize accumulated losses across the CDP communication domain.
+        """Return detached FP32 step-loss sums averaged over data and CP ranks.
 
-        For each key in *accumulated_losses*, sums the list of detached loss
-        tensors locally, then performs an all-reduce average across ranks in
-        the CDP (Context Data Parallel) group.  When CDP is not enabled
-        (world_size == 1) the local sums are returned unchanged.
+        train_step already divides the main loss by gradient_accumulation_steps,
+        so summing its micro-step losses gives the local optimizer-step mean.
+        Do not divide by the micro-step count again. Other metrics must supply
+        their own normalization before being passed here.
 
-        The method is generic and supports any number of named losses (e.g.
-        "loss", "aux_loss", or additional custom losses).
+        Average across the data mesh (the same mesh used by DistributedSampler),
+        including FSDP ranks that consume distinct samples. Also retain the CP
+        average: a CP-normalized loss replicated on CP ranks stays unchanged.
+        TP replicas are not additional data samples and need no reduction.
 
-        Args:
-            accumulated_losses: Dict mapping loss names to lists of detached
-                loss tensors accumulated across gradient-accumulation
-                micro-steps.
-
-        Returns:
-            Dict mapping the same loss names to scalar tensors with the
-            CDP-averaged sums.  Keys whose list is empty map to
-            None.
+        This only reduces detached logging values; backward losses and gradients
+        are not modified. Empty metric lists return None and must be consistent
+        across ranks participating in a reduction.
         """
-        from fsdp_turbo.distributed.parallel_state import get_parallel_state
+        reduction_groups = []
+        if torch.distributed.is_initialized():
+            from fsdp_turbo.distributed.parallel_state import get_parallel_state
 
-        parallel_state = get_parallel_state()
-
-        cp_enabled = parallel_state.is_cp_enable()
-        if cp_enabled:
-            cp_group = parallel_state.get_cp_group()
-            cp_world_size = parallel_state.get_cp_group_size()
+            parallel_state = get_parallel_state()
+            for mesh_name in ("data", "cp"):
+                group_size = parallel_state.get_group_size(mesh_name)
+                if group_size > 1:
+                    reduction_groups.append((parallel_state.get_group(mesh_name), group_size))
 
         result = {}
         for name, losses in accumulated_losses.items():
             if not losses:
                 result[name] = None
                 continue
-            summed = torch.stack(losses).sum()
-            if cp_enabled:
-                synced = summed.clone()
-                torch.distributed.all_reduce(synced, op=torch.distributed.ReduceOp.SUM, group=cp_group)
-                synced.div_(cp_world_size)
-                result[name] = synced
-            else:
-                result[name] = summed
+            # Convert before summation to avoid BF16 accumulation rounding.
+            synced = torch.stack([loss.detach().float() for loss in losses]).sum()
+            for group, group_size in reduction_groups:
+                torch.distributed.all_reduce(synced, op=torch.distributed.ReduceOp.SUM, group=group)
+                synced.div_(group_size)
+            result[name] = synced
         return result
 
     # ------------------------------------------------------------------

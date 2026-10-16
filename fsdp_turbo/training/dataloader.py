@@ -244,7 +244,7 @@ def _render_multimodal_record(messages_raw, images_raw, processor, image_column)
             content = message.get("content", "")
             if role == "user":
                 if image_paths and not image_inserted:
-                    user_content = [{"type": "image"}]
+                    user_content = [{"type": "image"} for _ in image_paths]
                     text = content.replace("<image>", "").strip()
                     if text:
                         user_content.append({"type": "text", "text": text})
@@ -291,6 +291,19 @@ class _MultimodalCollator:
                 with Image.open(path) as image:
                     images.append(image.convert("RGB"))
 
+        # When a batch has no images, create a dummy image and append fake image
+        # tokens so that every rank calls the vision encoder forward. Without this,
+        # ranks with text-only samples skip self.visual(...) entirely, causing the
+        # FSDP all-gather for the vision encoder to hang (HCCL timeout).
+        fake_image_appended = False
+        if not images:
+            dummy_image = Image.new("RGB", (64, 64), (255, 255, 255))
+            images = [dummy_image]
+            fake_messages = [{"role": "user", "content": [{"type": "image"}]}]
+            fake_text = self.processor.apply_chat_template(fake_messages, tokenize=False, add_generation_prompt=False)
+            texts[0] = texts[0] + fake_text
+            fake_image_appended = True
+
         processor_kwargs = {
             "text": texts,
             "padding": "longest",
@@ -324,6 +337,19 @@ class _MultimodalCollator:
         media_token_id = getattr(self.processor.tokenizer, "media_placehodler_token_id", None)
         if media_token_id is not None:
             labels[labels == media_token_id] = -100
+
+        # Mask the fake image tokens appended to the first sample so they do not
+        # affect attention or loss. The original text had no vision tokens, so the
+        # first vision_start_token_id marks the beginning of the fake text.
+        if fake_image_appended:
+            vision_start_token_id = getattr(self.processor.tokenizer, "vision_start_token_id", None)
+            if vision_start_token_id is not None:
+                vs_positions = (batch["input_ids"][0] == vision_start_token_id).nonzero(as_tuple=True)[0]
+                if len(vs_positions) > 0:
+                    fake_start = vs_positions[0].item()
+                    batch["attention_mask"][0, fake_start:] = 0
+                    labels[0, fake_start:] = -100
+
         batch["labels"] = labels
         return batch
 

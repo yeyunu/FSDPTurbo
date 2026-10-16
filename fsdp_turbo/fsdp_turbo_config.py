@@ -29,6 +29,10 @@ class ModelConfig:
     # DeepSeek-V4.1 head projection precision; cross entropy remains FP32.
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32"
     attn_implementation: str = 'eager'
+    # MTP (Multi-Token Prediction) layers to train. 0 disables MTP.
+    mtp_num_layers: int = 0
+    # Scaling factor applied to the mean MTP loss before adding to the main loss.
+    mtp_loss_scaling_factor: float = 0.1
 
 
 @dataclass

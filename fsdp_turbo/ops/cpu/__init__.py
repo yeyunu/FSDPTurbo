@@ -12,6 +12,7 @@ from fsdp_turbo.ops.cpu.mx_quant import (
     mx_to_block_mx_quant_cpu,
 )
 from fsdp_turbo.ops.cpu.permute import permute_cpu, unpermute_cpu
+from fsdp_turbo.ops.cpu.qsa import qsa_reference_mask, qsa_selected_token_mask_cpu
 from fsdp_turbo.ops.cpu.rms_norm import rms_norm_cpu
 from fsdp_turbo.ops.cpu.rope import rope_torch
 from fsdp_turbo.ops.cpu.sinkhorn import hc_split_sinkhorn_cpu
@@ -33,6 +34,8 @@ __all__ = [
     'swiglu_cpu',
     'permute_cpu',
     'unpermute_cpu',
+    'qsa_reference_mask',
+    'qsa_selected_token_mask_cpu',
     'rms_norm_cpu',
     'rope_torch',
     'hc_split_sinkhorn_cpu',
