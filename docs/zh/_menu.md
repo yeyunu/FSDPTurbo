@@ -20,6 +20,7 @@
     - [MXFP8量化训练](./features/quantization.md)
     - [低精度AllGather](./features/quantization.md)
   - [其他]()
+    - [显存快照](./features/memory_snapshot.md)
     - [环境变量](./features/environment_variable.md)
 - [性能调优](./training/tuning/performance_tuning.md)
 - [特性开发](./develop/feature_development.md)

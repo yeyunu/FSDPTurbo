@@ -54,6 +54,17 @@ run:
     record_shapes: true
     profile_memory: false
     with_stack: false
+  # Device memory snapshot collection (0-based micro steps; the window is
+  # inclusive on both ends).
+  memory_snapshot:
+    enable: false        # true: record allocator history from start_step and dump at end_step
+    start_step: 1
+    end_step: 2          # the single dump step; without it one snapshot per step from start_step
+    save_path: ./memory_snapshot  # None -> <checkpoint.output_dir>/memory_snapshot
+    dump_ranks: [0]      # ranks that record and dump; null/omitted -> all ranks
+    stacks: all          # allocation stack scope: all / python
+    max_entries: null    # allocator history entry cap; null -> unbounded
+    mem_info: false      # per-step memory stats line (independent of enable)
 
 # --- Checkpoint Configuration ---
 checkpoint:

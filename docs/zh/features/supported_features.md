@@ -67,7 +67,11 @@
       <td>FSDP2通信低精度化</td>
     </tr>
     <tr>
-      <td>其他</td>
+      <td rowspan="2">其他</td>
+      <td><a href="./memory_snapshot.md">显存快照</a></td>
+      <td>采集分配器历史与快照用于显存分析，YAML配置开启，支持OOM自动落档</td>
+    </tr>
+    <tr>
       <td><a href="./environment_variable.md">环境变量</a></td>
       <td>集群配置与NPU性能调优环境变量</td>
     </tr>

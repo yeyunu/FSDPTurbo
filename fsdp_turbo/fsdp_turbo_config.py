@@ -78,6 +78,31 @@ class ProfileConfig:
 
 
 @dataclass
+class MemorySnapshotConfig:
+    """Device memory snapshot collection (``run.memory_snapshot``).
+
+    ``enable`` turns snapshot dumps on: with ``end_step`` set, allocator
+    history is recorded from ``start_step`` and one snapshot is written at
+    ``end_step``; without one, one snapshot is written per step from
+    ``start_step``. ``mem_info`` independently prints a per-step memory line.
+    Steps are 0-based micro steps and the window is inclusive on both ends.
+    The OOM trap (``OOM_SNAPSHOT_ENABLE``/``OOM_SNAPSHOT_PATH``) stays
+    environment-variable controlled and is not part of this schema.
+    """
+
+    enable: bool = False
+    start_step: int = 0
+    end_step: Optional[int] = None
+    # Snapshot directory; None means <checkpoint.output_dir>/memory_snapshot.
+    save_path: Optional[str] = None
+    # Global ranks that record and dump; None means all ranks.
+    dump_ranks: Optional[List[int]] = None
+    stacks: str = "all"
+    max_entries: Optional[int] = None
+    mem_info: bool = False
+
+
+@dataclass
 class DataConfig:
     dataset_path: str = ""
     dataset_config: Optional[str] = None
@@ -106,6 +131,7 @@ class TrainRunConfig:
     gradient_accumulation_steps: int = 1
     logging_steps: int = 1
     profile: ProfileConfig = field(default_factory=ProfileConfig)
+    memory_snapshot: MemorySnapshotConfig = field(default_factory=MemorySnapshotConfig)
 
 
 @dataclass
@@ -303,6 +329,7 @@ class FSDPTurboConfig:
         self.validate_swap_activation_config()
         self.validate_quantization_config()
         self.validate_fsdp_config()
+        self.validate_memory_snapshot_config()
 
     def validate_model_config(self):
         """Validate model loading configuration."""
@@ -353,6 +380,33 @@ class FSDPTurboConfig:
             self.distributed.fsdp_plan.ignored_modules = list(
                 set(self.distributed.fsdp_plan.ignored_modules)
             )  # remove duplicates
+
+    def validate_memory_snapshot_config(self):
+        """Validate the run.memory_snapshot collection section."""
+        profile = self.run.memory_snapshot
+        if profile.start_step < 0:
+            raise ValueError(f"run.memory_snapshot.start_step must be >= 0; got {profile.start_step}.")
+        if profile.end_step is not None:
+            if profile.end_step < profile.start_step:
+                raise ValueError(
+                    "run.memory_snapshot.end_step must be >= start_step "
+                    f"(the window is inclusive on both ends); got start_step={profile.start_step}, "
+                    f"end_step={profile.end_step}."
+                )
+        if profile.save_path is not None:
+            if not isinstance(profile.save_path, str) or not profile.save_path.strip():
+                raise ValueError("run.memory_snapshot.save_path must be a non-empty string or null.")
+        if profile.dump_ranks is not None:
+            if not isinstance(profile.dump_ranks, (list, tuple)) or any(
+                not isinstance(rank, int) or rank < 0 for rank in profile.dump_ranks
+            ):
+                raise ValueError("run.memory_snapshot.dump_ranks must be a list of non-negative integers or null.")
+        stacks = str(profile.stacks).strip().lower()
+        if stacks not in ("all", "python"):
+            raise ValueError(f"run.memory_snapshot.stacks must be 'all' or 'python'; got {profile.stacks!r}.")
+        profile.stacks = stacks
+        if profile.max_entries is not None and profile.max_entries < 1:
+            raise ValueError(f"run.memory_snapshot.max_entries must be >= 1 or null; got {profile.max_entries}.")
 
     def validate_tp_config(self):
         """tensor parallelize plan

@@ -167,6 +167,8 @@ class BaseTrainer:
         print_rank(logger.info, "\n" + str(self.config))
 
         self._prepare_training(resume_from_checkpoint)
+        memory_tracker = self._create_memory_tracker()
+        memory_tracker.on_train_begin()
         max_steps = self._resolve_max_steps()
 
         print_rank(logger.info, "***** Running training *****")
@@ -206,8 +208,13 @@ class BaseTrainer:
                     if epoch == start_epoch and step < skip_batches:
                         continue
                     self._monitor.on_step_start()
-                    batch = self.prepare_batch(batch)
-                    loss, aux_loss = self.train_step(batch)
+                    memory_tracker.on_step_start()
+                    try:
+                        batch = self.prepare_batch(batch)
+                        loss, aux_loss = self.train_step(batch)
+                    except Exception as error:
+                        memory_tracker.on_error(self._global_step, error)
+                        raise
                     self._accumulated_losses["loss"].append(loss.detach())
                     if aux_loss is not None:
                         self._accumulated_losses["aux_loss"].append(aux_loss.detach())
@@ -235,7 +242,13 @@ class BaseTrainer:
                         synced = self.sync_loss(self._accumulated_losses)
                         loss = synced["loss"]
                         aux_loss = synced.get("aux_loss")
-                        grad_norm = self._on_optimizer_step()
+                        try:
+                            grad_norm = self._on_optimizer_step()
+                        except Exception as error:
+                            # The first optimizer step allocates optimizer
+                            # states, a common OOM point; let the tracker see it.
+                            memory_tracker.on_error(self._global_step, error)
+                            raise
                         for v in self._accumulated_losses.values():
                             v.clear()
                         self._global_step += 1
@@ -243,6 +256,8 @@ class BaseTrainer:
                         self._on_checkpoint_step()
                         if prof is not None:
                             prof.step()
+
+                    memory_tracker.on_step_end(self._global_step)
 
                     if 0 < max_steps <= self._global_step:
                         break
@@ -511,6 +526,12 @@ class BaseTrainer:
         from fsdp_turbo.training.profiler import create_profiler
 
         return create_profiler(self.config.run.profile)
+
+    def _create_memory_tracker(self):
+        """Device memory snapshot tracker (config: run.memory_snapshot)."""
+        from fsdp_turbo.training.memory_snapshot import build_memory_snapshot_tracker
+
+        return build_memory_snapshot_tracker(self.config.run.memory_snapshot, self.config.checkpoint.output_dir)
 
     def _resolve_max_steps(self):
         if self.config.run.max_steps > 0:
