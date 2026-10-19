@@ -1,11 +1,11 @@
 ---
 name: "fsdp-turbo-dev-guide"
-description: "FSDPTurbo 仓库开发守则：device 抽象、ops 隔离、config 校验、日志、命名、models 叶子隔离、modeling 禁止 patch、代码精简、工具函数复用等 11 条规则。在编写或修改 fsdp_turbo 代码时必须遵循。"
+description: "FSDPTurbo 仓库开发守则：device 抽象、ops 隔离、config 校验、日志、命名、models 叶子隔离、modeling 禁止 patch、代码精简、工具函数复用、models 只放结构代码、models 两级目录、环境变量集中、文档同步、公共 API 注解、安全反序列化等 17 条规则。在编写或修改 fsdp_turbo 代码时必须遵循。"
 ---
 
 # FSDPTurbo 开发守则
 
-本守则是 FSDPTurbo 仓库的强制开发规范。当 Agent 在 `fsdp_turbo/` 目录下新增、修改、审查代码，或回答该仓库相关实现问题时，**必须**遵循以下 11 条规则，并在生成代码后逐条自检。
+本守则是 FSDPTurbo 仓库的强制开发规范。当 Agent 在 `fsdp_turbo/` 目录下新增、修改、审查代码，或回答该仓库相关实现问题时，**必须**遵循以下 17 条规则，并在生成代码后逐条自检。
 
 仓库顶层模块结构（用于理解规则的作用范围）：
 
@@ -13,10 +13,9 @@ description: "FSDPTurbo 仓库开发守则：device 抽象、ops 隔离、config
 fsdp_turbo/
 ├── distributed/      # 分布式并行（FSDP/TP/CP/EP）
 ├── memory/           # 显存优化（recompute/chunk_batch/swap）
-├── models/           # 各模型适配（叶子模块：包内其他模块禁止引用，模型目录之间相互独立）
+├── models/           # 各模型适配（叶子模块：包内其他模块禁止引用；两级目录：系列/结构；只放结构代码）
 ├── modules/          # 通用 module 组件
 ├── ops/              # 算子抽象层（cpu/npu/triton + registry）
-├── optimizer/        # 优化器
 ├── quantization/     # 量化
 ├── training/         # 训练入口（唯一可依赖其他模块的模块）
 ├── utils/            # 工具（log/device/dtype 等）
@@ -45,6 +44,15 @@ x = x.cuda()               # 禁止：直接调用 torch.cuda
 device = torch.npu.current_device()  # 禁止：直接调用 torch.npu
 ```
 
+**存量待整改**（按改动代价分类）：
+
+- 有 `torch.accelerator` 等价 API，可直接替换：
+  - `memory/swap_optimizer/swap_optimizer.py:88-89`：`torch.npu.is_available()` / `torch.npu.memory_allocated()`；
+  - `training/monitor.py:71,73`：`torch.npu.is_available()` / `torch.cuda.is_available()`；
+  - `training/memory_snapshot.py:108`：`torch.cuda.is_available()`。
+- 需先确认 `torch.accelerator` 是否有等价 API：`ops/npu/sparse_attention.py` 中的 `torch.npu.device` / `torch.npu.current_device()` / `torch.npu.current_stream()`（位于 `ops/npu/`，是否按规则 2 的口径豁免尚未确定，确认后再整改）。
+- 仅为类型注解或注释，改为设备无关写法：`distributed/fine_grained_fully_shard/param_group.py:212`、`distributed/expert_parallel/domino_dispatcher.py:302-305`（`torch.cuda.Stream/Event` 注解）、`modules/kcp.py:38`（注释）。
+
 ---
 
 ## 规则 2：`torch_npu` 只允许在 `ops/npu/` 内导入
@@ -63,6 +71,14 @@ import torch_npu  # 允许：位于 ops/npu/ 目录内
 import torch_npu                       # 禁止
 from torch_npu.contrib import transfer_to_npu  # 禁止
 ```
+
+**存量待整改**：
+
+- `models/kimi/modeling_kimi_k3.py:82`：模块顶层 `if get_accelerator_name() == "npu": import torch_npu`；
+- `training/profiler.py:40`：函数内 `import torch_npu`（`try` 包裹）；
+- `training/memory_snapshot.py:103`：函数内 `import torch_npu`（`try` 包裹）。
+
+三处都应下沉到 `ops/npu/` 的封装，或改用 `ops/` 提供的语义化接口后删除。
 
 ---
 
@@ -114,7 +130,7 @@ out = grouped_matmul(x, split_list, weights)
 依赖关系约束：
 
 - `ops/`、`utils/` 是公共底层依赖，任何模块可依赖；
-- `distributed/`、`memory/`、`modules/`、`optimizer/`、`quantization/` 之间**不得**相互依赖；
+- `distributed/`、`memory/`、`modules/`、`quantization/` 之间**不得**相互依赖；
 - `training/` 是唯一允许编排（依赖）其他模块的顶层入口，但**不得**依赖 `models/`（见规则 8）；
 - `models/` 是叶子模块，任何模块都不得依赖它（见规则 8）。
 
@@ -219,13 +235,13 @@ tmp1 = compute()               # 无意义命名
 
 **8.1 包内禁止引用 `fsdp_turbo.models`**
 
-`fsdp_turbo/` 包内除 `models/` 自身以外的任何模块——`training/`、`distributed/`、`memory/`、`modules/`、`ops/`、`optimizer/`、`quantization/`、`utils/`、`fsdp_turbo.py`、`fsdp_turbo_config.py`——都**不得**导入 `fsdp_turbo.models`，包括绝对导入、相对导入和延迟到函数内的局部导入。需要模型参与的能力（如 CP 前向替换、算子替换）必须通过配置/注册机制或由使用方（`examples/`、`tests/`）注入，而不是在包内直接 import 模型。
+`fsdp_turbo/` 包内除 `models/` 自身以外的任何模块——`training/`、`distributed/`、`memory/`、`modules/`、`ops/`、`quantization/`、`utils/`、`fsdp_turbo.py`、`fsdp_turbo_config.py`——都**不得**导入 `fsdp_turbo.models`，包括绝对导入、相对导入和延迟到函数内的局部导入。需要模型参与的能力（如 CP 前向替换、算子替换）必须通过配置/注册机制或由使用方（`examples/`、`tests/`）注入，而不是在包内直接 import 模型。
 
 `examples/`、`tests/`、`docs/` 作为使用方**允许**引用 `fsdp_turbo.models`。
 
 **8.2 各模型目录相互独立**
 
-`fsdp_turbo/models/` 下的每个模型目录（当前为 `deepseek_v41/`、`kimi/`、`qwen/`）必须彼此独立：
+`fsdp_turbo/models/` 下的每个模型结构目录（两级目录中的第二级，见规则 13）必须彼此独立：
 
 - 禁止任何形式的跨模型导入：`from fsdp_turbo.models.qwen...`、`from ..qwen...`、`from .. import ...` 均禁止；
 - 禁止依赖 `models/` 根目录下的共享代码（共享能力应下沉到 `ops/`、`utils/` 等公共底层）；
@@ -373,6 +389,169 @@ def default_expert_scale(num_experts: int) -> float:
 
 ---
 
+## 规则 12：`models/` 只放模型结构代码，参数配置 JSON 放 `examples/`
+
+`fsdp_turbo/models/` 只允许存放**模型结构代码**（modeling、adapter、processor、结构级组件等 `.py` 实现）。模型参数配置文件（`config.json` 及其多机多卡变体，如 `config_8p_A3.json`、`config_16p_A5.json`）属于**示例配置**，必须放在 `examples/<示例目录>/` 下，不得放进 `models/`。
+
+理由：`models/` 需要能被整体拷走复用（见规则 4、规则 8）；参数配置随硬件形态与并行度变化，属于使用侧数据，混入 `models/` 会让模型结构库带上环境相关参数，目录也会不断膨胀。
+
+正确：
+```
+examples/deepseek_v41/config.json
+examples/deepseek_v41/config_8p_A3.json
+fsdp_turbo/models/deepseek/deepseek_v41/          # 只有 .py
+```
+
+错误：
+```
+fsdp_turbo/models/deepseek_v41/config.json        # 禁止：配置混入模型结构目录
+fsdp_turbo/models/deepseek_v41/config_8p_A5.json  # 禁止
+```
+
+存量待整改：`fsdp_turbo/models/deepseek_v41/` 下现有 `config.json`、`config_8p_A3.json`、`config_8p_A5.json`、`config_16p_A5.json`，需迁移到 `examples/deepseek_v41/`，并同步修改读取它们的代码（如 `adapter.py` 的 `_load_model_args()` 从 `_REFERENCE_DIRECTORY / "config_8p_A5.json"` 读取）。不要求本次立即整改，但改动到该模型时应一并整改。
+
+---
+
+## 规则 13：`models/` 采用两级目录——模型系列 / 模型结构
+
+`fsdp_turbo/models/` 下固定为两级目录：第一级是**模型系列**，第二级是该系列下的**模型结构**。
+
+```
+fsdp_turbo/models/
+├── <模型系列>/            # 第一级：系列，如 deepseek、qwen、kimi
+│   ├── __init__.py        # 系列级导出（可选，仅做转发）
+│   └── <模型结构>/        # 第二级：具体结构，如 deepseek_v41、qwen3_5、kimi_k3
+│       ├── __init__.py    # 该结构的对外接口
+│       └── *.py
+```
+
+约束：
+
+- 一级目录只按**模型系列**划分，二级目录才是具体**模型结构**；导入路径固定为 `fsdp_turbo.models.<系列>.<结构>`；
+- 不得把结构文件直接放在系列目录下（`models/qwen/qwen3_5.py` 应改为 `models/qwen/qwen3_5/`）；
+- 不得省略系列层（如 `models/qwen3_5/`），也不得出现三级及更深的结构划分；
+- 规则 8 要求的相互独立、`__init__.py` 对外接口、目录内相对导入，均以**二级结构目录**为最小单元。
+
+正确（目录形态）：
+```
+fsdp_turbo/models/qwen/qwen3_5/__init__.py
+fsdp_turbo/models/qwen/qwen3_5/modeling_qwen3_5.py
+fsdp_turbo/models/kimi/kimi_k3/modeling_kimi_k3.py
+```
+
+错误（目录形态）：
+```
+fsdp_turbo/models/qwen3_5/...                        # 禁止：缺少系列层
+fsdp_turbo/models/qwen/qwen3_5.py                    # 禁止：结构文件直接放在系列目录下
+fsdp_turbo/models/qwen/qwen3_5/modeling/layers/...   # 禁止：超过两级
+```
+
+存量待整改：现有 `models/deepseek_v41/`、`models/kimi/`、`models/qwen/` 均只有一级，需重组为两级，例如：
+
+- `models/qwen/qwen3_5.py` → `models/qwen/qwen3_5/`
+- `models/qwen/qwen3_5_moe.py` → `models/qwen/qwen3_5_moe/`
+- `models/qwen/modeling_qwen4_exp.py` → `models/qwen/qwen4_exp/`
+- `models/deepseek_v41/` → `models/deepseek/deepseek_v41/`（系列名按家族命名）
+- `models/kimi/` 下的 `modeling_kimi_k3.py`、`modeling_kimi_linear.py` 按实际结构归属拆入对应二级目录
+
+具体系列命名与拆分粒度在整改时确定；存量不要求本次立即整改，但**新增模型必须直接按两级结构创建**。
+
+---
+
+## 规则 14：环境变量集中定义、集中读取并登记文档
+
+- 环境变量的**名字、默认值、解析逻辑**必须集中定义，统一收敛到 `fsdp_turbo/utils/env.py`（新建）；业务代码只调用该模块的读取函数或常量，**不得**再出现 `os.environ.get("XXX")` 字面量；
+- 新增环境变量必须同步在 [environment_variable.md](docs/zh/features/environment_variable.md) 登记：名称、取值、默认值、生效时机、影响范围；
+- 删除或重命名环境变量需保留旧名并告警一段时间，不得静默失效。
+
+理由：当前全仓 27 处 `os.environ` 分散在 7 个文件（`training/trainer.py` 10 处、`training/memory_snapshot.py` 4 处、`models/qwen/modeling_qwen4_exp.py` 4 处等），同一变量（如 `LOCAL_RANK`）在多处重复解析，默认值容易不一致。
+
+正确：
+```python
+from fsdp_turbo.utils.env import get_local_rank
+
+local_rank = get_local_rank()
+```
+
+错误：
+```python
+local_rank = int(os.environ.get("LOCAL_RANK", 0))   # 禁止：业务代码散落字面量
+```
+
+**存量待整改**：现有 27 处读取（`LOCAL_RANK`、`LOCAL_WORLD_SIZE`、`RANK`、`WORLD_SIZE`、`FLA_USE_FAST_OPS`、`FLA_NO_USE_TMA`、`CPU_AFFINITY_CONF`、`ASCEND_DEVICE_ID`）逐步迁移到 `utils/env.py`；其中 `FLA_USE_FAST_OPS`、`FLA_NO_USE_TMA` 目前尚未在环境变量文档中登记。
+
+---
+
+## 规则 15：文档必须随代码同步更新
+
+改动代码时必须同步对应文档，不允许「代码先行、文档后补」：
+
+| 改动类型 | 必须更新 |
+| --- | --- |
+| 新增/变更特性 | `docs/zh/features/<feature>.md`（无则新建） |
+| 新增/变更配置项（`FSDPTurboConfig` 字段） | `docs/zh/training/user_guide.md` 及对应 feature 文档 |
+| 新增/变更环境变量 | [environment_variable.md](docs/zh/features/environment_variable.md)（见规则 14） |
+| 新增/变更模型支持 | `docs/zh/models/supported_models.md`、`docs/zh/develop/model_adaptation.md` |
+
+- 新增文档必须在 [docs/zh/_menu.md](docs/zh/_menu.md) 登记，否则视为未交付；
+- 文档中的路径、模块名、函数名、配置键必须能在仓库中检索到；文档与代码不一致时优先修正文档，不得为迁就过时文档而改动已发布的接口。
+
+**存量待整改**：`docs/zh/_menu.md` 目前未收录 13 个文档——`appendixes.md`、`docs_guide.md`、`models/supported_models.md`、`training/user_guide.md`、`training/finetune/finetune.md`、`training/pretrain/pretrain.md`、`training/quick_start_fsdpturbo.md`、`training/geo3k_finetune_guide.md`、`project_guide.md`、`SECURITYNOTE.md`、`tools/profiling.md`、`develop/model_adaptation.md`、`release_notes_fsdpturbo.md`，需补齐或确认有意不收录。
+
+---
+
+## 规则 16：公共 API 必须有类型注解与 docstring
+
+「公共 API」指跨模块调用或对外暴露的函数、类与公开方法；模块内部的一次性辅助函数不受此约束（避免与规则 10 的「减少代码量」冲突）。
+
+- 参数与返回值必须标注类型，不得用 `Any` 兜底；无法精确表达时用 `Union` / `Protocol` / 泛型；
+- docstring 至少说明用途；涉及参数语义、返回值、异常、副作用或并行/分布式约束时必须写清楚；
+- 仅供类型检查使用的导入放在 `if TYPE_CHECKING:` 下，避免运行期开销；
+- 类型注解不得引入额外的运行期依赖或副作用。
+
+正确：
+```python
+from typing import Sequence
+
+def all_to_all(tokens: torch.Tensor, splits: Sequence[int]) -> torch.Tensor:
+    """Dispatch tokens to their expert owners.
+
+    Args:
+        tokens: Token features, shape ``[num_tokens, hidden]``.
+        splits: Token count per rank, length equals world size.
+
+    Returns:
+        Tokens received from all ranks, concatenated.
+    """
+```
+
+错误：
+```python
+def all_to_all(tokens, splits):   # 禁止：公共 API 缺类型注解与 docstring
+    ...
+```
+
+**存量待整改**：全仓 1203 个 `def` 中仅 208 个带返回注解（约 17%）；新增/修改代码按本规则执行，存量随改动逐步补齐。
+
+---
+
+## 规则 17：禁止不安全反序列化与命令执行
+
+- 禁止用 `torch.load(..., weights_only=False)` 加载来源不可信的文件；确需加载自产 checkpoint 时，必须在文档或 docstring 中写明信任边界，并保证文件路径来源受控；
+- 禁止 `eval` / `exec`、`os.system`、`os.popen`、`subprocess(..., shell=True)`；
+- 禁止用 `pickle.load`、未指定 `SafeLoader` 的 `yaml.load` 处理外部数据；
+- pre-commit 已挂 bandit、gitleaks，但工具只是兜底，不得以「工具没报」代替安全判断。
+
+错误：
+```python
+state = torch.load(user_supplied_path, weights_only=False)   # 禁止：任意 pickle 反序列化
+os.system(f"cp {src} {dst}")                                  # 禁止：命令注入风险
+```
+
+**存量待整改**：`training/checkpoint.py:396` 使用 `weights_only=False` 加载 checkpoint（自产文件），整改时评估切换 `weights_only=True` 或改为显式白名单类型。
+
+---
+
 ## 自检清单
 
 提交或输出代码前，逐条确认：
@@ -387,4 +566,10 @@ def default_expert_scale(num_experts: int) -> float:
 8. [ ] `fsdp_turbo/` 包内未引用 `fsdp_turbo.models`（仅 `examples/`、`tests/`、`docs/` 可引用），且 `models/` 下各模型目录之间无交叉导入、无 `models/` 根共享代码依赖；
 9. [ ] `models/` 下的 modeling 未使用 patch（无 `*_patch.py`/`apply_*_patch()`、无 `setattr` 换成员、无靠配置 `replacement` 替换的自由函数 forward、无 `PatchXxx` 非继承替代类），适配一律继承 transformers 类覆写；
 10. [ ] 代码量已最小化且只做必要检查（未重复校验已在入口校验的条件、无 YAGNI 参数/空壳、无死代码、无与改动无关的代码）；
-11. [ ] 工具函数优先复用 `fsdp_turbo/utils/` 及标准库/`torch`/`transformers` 既有实现，未重复造轮子；新增抽象仅限会被多处复用的逻辑，未过度抽象。
+11. [ ] 工具函数优先复用 `fsdp_turbo/utils/` 及标准库/`torch`/`transformers` 既有实现，未重复造轮子；新增抽象仅限会被多处复用的逻辑，未过度抽象；
+12. [ ] `fsdp_turbo/models/` 下未新增 `config.json` 等参数配置文件，配置均放在 `examples/<示例目录>/`；
+13. [ ] 新增模型按两级目录创建：`models/<模型系列>/<模型结构>/`，未出现只有一级、结构文件直放系列目录或超过两级的情况；
+14. [ ] 未新增散落的 `os.environ.get("XXX")` 字面量，环境变量已集中到 `utils/env.py` 并在环境变量文档中登记；
+15. [ ] 代码改动已同步对应文档（特性/配置项/环境变量/模型支持），新增文档已在 `docs/zh/_menu.md` 登记；
+16. [ ] 新增/修改的公共 API 有完整类型注解与 docstring，内部辅助函数未被迫补注解；
+17. [ ] 未引入不安全反序列化（`weights_only=False` 加载不可信文件、`pickle.load`、非 `SafeLoader` 的 `yaml.load`）与命令执行（`eval`/`exec`/`os.system`/`shell=True`）。
