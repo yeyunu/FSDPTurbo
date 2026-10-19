@@ -43,6 +43,8 @@ def unpermute_cpu(permuted_tokens, sorted_indices, probs=None):
         [num_tokens, permuted_tokens.shape[-1]], dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
     unpermuted_tokens.index_copy_(0, sorted_indices.long(), permuted_tokens)
+    if probs is None:
+        return unpermuted_tokens
     unpermuted_tokens = unpermuted_tokens.reshape(-1, topk, permuted_tokens.size(-1))
     if probs is not None:
         unpermuted_tokens *= probs.unsqueeze(-1)

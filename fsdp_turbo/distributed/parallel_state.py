@@ -57,10 +57,10 @@ class ParallelState(metaclass=Singleton):
     device_mesh_map: dict[str, DeviceMesh] = None
 
     def __post_init__(self):
-        if not torch.distributed.is_initialized():
-            from fsdp_turbo.utils.device import set_accelerator_compatible
+        from fsdp_turbo.utils.device import set_accelerator_compatible
 
-            device_backend = set_accelerator_compatible()  # 'hccl' | 'nccl'
+        device_backend = set_accelerator_compatible()
+        if not torch.distributed.is_initialized():
             device = get_accelerator_name()  # 'npu' | 'cuda'
             torch.distributed.init_process_group(backend=f"cpu:gloo,{device}:{device_backend}")
         if self.device_mesh_map is None:

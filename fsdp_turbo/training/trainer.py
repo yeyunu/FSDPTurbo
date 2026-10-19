@@ -372,12 +372,12 @@ class BaseTrainer:
 
     def _init_distributed(self):
         """Initialize distributed backend, process group, seed, and logging."""
-        if torch.distributed.is_initialized():
-            return
-
         from fsdp_turbo.utils.device import set_accelerator_compatible
 
         backend = set_accelerator_compatible()
+        if torch.distributed.is_initialized():
+            return
+
         set_log_level("INFO")
 
         local_rank = int(os.environ.get("LOCAL_RANK", -1))

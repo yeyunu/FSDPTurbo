@@ -86,8 +86,9 @@ def compute_grad_norm(
 ) -> float:
     """Compute the total p-norm of gradients across parameters.
 
-    Gradients are cast to FP32 for the norm computation to avoid
-    precision loss with BF16/FP16 gradients.  DTensor gradients are
+    Gradients are transferred to the reduction device and cast to FP32 one
+    at a time to avoid retaining all converted gradients simultaneously and
+    to avoid precision loss with BF16/FP16 gradients.  DTensor gradients are
     converted to their local shards before computation.
 
     When *group* is provided (or DTensor gradients are found), the
@@ -122,10 +123,6 @@ def compute_grad_norm(
     for p in parameters:
         if p.grad is not None:
             local_g = _to_local_if_dtensor(p.grad).detach()
-            # With cpu_offload, gradients are on CPU; pinned memory allows non_blocking H2D
-            if local_g.device != dev:
-                local_g = local_g.to(dev, non_blocking=True)
-            local_g = local_g.float()
             shard_groups = _get_shard_groups_if_dtensor(p.grad, group)
             sig = tuple(id(g) for g in shard_groups)
             grouped_grads[sig].append(local_g)
@@ -141,7 +138,7 @@ def compute_grad_norm(
         # every sharded dimension, then take the global max across groups.
         global_max = torch.zeros((), dtype=torch.float, device=dev)
         for sig, grads in grouped_grads.items():
-            local_max = max(g.abs().max() for g in grads)
+            local_max = max(local_gradient.to(dev, non_blocking=True).float().abs().max() for local_gradient in grads)
             local_max_t = local_max.to(torch.float).reshape(())
             for grp in grouped_groups[sig]:
                 torch.distributed.all_reduce(local_max_t, op=torch.distributed.ReduceOp.MAX, group=grp)
@@ -155,11 +152,11 @@ def compute_grad_norm(
     for sig, grads in grouped_grads.items():
         local_sum = torch.zeros((), dtype=torch.float, device=dev)
         if norm_type == 2.0:
-            for g in grads:
-                local_sum += g.norm() ** 2
+            for local_gradient in grads:
+                local_sum += local_gradient.to(dev, non_blocking=True).float().norm() ** 2
         else:
-            for g in grads:
-                local_sum += g.norm(norm_type) ** norm_type
+            for local_gradient in grads:
+                local_sum += local_gradient.to(dev, non_blocking=True).float().norm(norm_type) ** norm_type
         for grp in grouped_groups[sig]:
             torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM, group=grp)
         total_sum += local_sum
