@@ -63,6 +63,7 @@ class DeepseekV41Trainer(BaseTrainer):
             use_fused_lightning_indexer=(self.config.model.use_fused_lightning_indexer),
             use_fused_compressor=self.config.model.use_fused_compressor,
             use_fused_mhc=self.config.model.use_fused_mhc,
+            use_fused_clipped_swiglu=self.config.model.use_fused_clipped_swiglu,
             use_fused_vision_flash_attn=(self.config.model.use_fused_vision_flash_attn),
             head_compute_dtype=self.config.model.head_compute_dtype,
         )

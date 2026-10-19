@@ -25,6 +25,7 @@ class ModelConfig:
     use_fused_lightning_indexer: bool = False
     use_fused_compressor: bool = False
     use_fused_mhc: bool = False
+    use_fused_clipped_swiglu: bool = False
     use_fused_vision_flash_attn: bool = False
     # DeepSeek-V4.1 head projection precision; cross entropy remains FP32.
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32"
@@ -305,6 +306,8 @@ class FSDPTurboConfig:
 
     def validate_model_config(self):
         """Validate model loading configuration."""
+        if not isinstance(self.model.use_fused_clipped_swiglu, bool):
+            raise ValueError("model.use_fused_clipped_swiglu must be a boolean.")
         if self.model.head_compute_dtype not in ("fp32", "bf16", "hf32"):
             raise ValueError("model.head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
         if not isinstance(self.model.attn_implementation, str) or not self.model.attn_implementation:
@@ -478,6 +481,14 @@ class FSDPTurboConfig:
             if self.distributed.ep_plan is None
             else self.distributed.ep_plan
         )
+        if (
+            self.model.use_fused_clipped_swiglu
+            and self.distributed.ep_plan.apply_modules
+            and self.distributed.ep_plan.dispatcher != "custom_native_eager_forward"
+        ):
+            raise ValueError(
+                "model.use_fused_clipped_swiglu requires DeepSeek-V4.1's custom_native_eager_forward EP dispatcher."
+            )
         if self.distributed.ep_plan.gradient_divide_factor is None:
             # Divide across all expert mesh dims (edp * efsdp * ep). torchrun
             # sets WORLD_SIZE; fall back to 1 for non-distributed runs.

@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .activation import packed_swiglu, silu_mul
+from .activation import limited_swiglu
 
 
 def _use_fused_permute(hidden_states, global_indices):
@@ -165,6 +165,7 @@ class DeepSeekV41Experts(nn.Module):
         intermediate_size: int,
         *,
         swiglu_limit: float = 0.0,
+        use_fused_clipped_swiglu: bool = False,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
@@ -172,6 +173,7 @@ class DeepSeekV41Experts(nn.Module):
         self.hidden_dim = hidden_size
         self.intermediate_size = intermediate_size
         self.limit = swiglu_limit if swiglu_limit > 0 else None
+        self.use_fused_clipped_swiglu = use_fused_clipped_swiglu
         self.act_fn = F.silu
         self.gate_up_proj = nn.Parameter(
             torch.empty(
@@ -222,13 +224,7 @@ class DeepSeekV41Experts(nn.Module):
                 selected_hidden_states,
                 self.gate_up_proj[expert_index],
             ).float()
-            if self.limit is not None:
-                gate_states, up_states = gate_up_states.chunk(2, dim=-1)
-                gate_states = gate_states.clamp(max=self.limit)
-                up_states = up_states.clamp(min=-self.limit, max=self.limit)
-                intermediate_states = silu_mul(gate_states, up_states)
-            else:
-                intermediate_states = packed_swiglu(gate_up_states)
+            intermediate_states = limited_swiglu(gate_up_states, self.limit, fused=self.use_fused_clipped_swiglu)
             intermediate_states = intermediate_states * topk_weights[token_indices, topk_positions, None]
             expert_output = F.linear(
                 intermediate_states.to(hidden_states.dtype),
@@ -274,13 +270,7 @@ class DeepSeekV41Experts(nn.Module):
         intermediates = []
         for states, (rows, slots) in zip(gate_up.split(sizes), selections):
             states = states.float()
-            if self.limit is not None:
-                gate, up = states.chunk(2, dim=-1)
-                gate = gate.clamp(max=self.limit)
-                up = up.clamp(min=-self.limit, max=self.limit)
-                intermediate = silu_mul(gate, up)
-            else:
-                intermediate = packed_swiglu(states)
+            intermediate = limited_swiglu(states, self.limit, fused=self.use_fused_clipped_swiglu)
             # Match eager type promotion and apply probabilities before down.
             intermediate = intermediate * probs[rows, slots, None]
             intermediates.append(intermediate.to(x.dtype))
@@ -390,13 +380,7 @@ class DeepSeekV41Experts(nn.Module):
             gate_up_proj,
             use_eager=False,
         ).float()
-        if self.limit is not None:
-            gate, up = gate_up.chunk(2, dim=-1)
-            gate = gate.clamp(max=self.limit)
-            up = up.clamp(min=-self.limit, max=self.limit)
-            intermediate = silu_mul(gate, up)
-        else:
-            intermediate = packed_swiglu(gate_up)
+        intermediate = limited_swiglu(gate_up, self.limit, fused=self.use_fused_clipped_swiglu)
         # Do not mutate an activation output that a fused backward may save.
         intermediate = intermediate * router_weights.float().unsqueeze(-1)
         expert_output = grouped_matmul(

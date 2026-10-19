@@ -19,6 +19,16 @@ CI 门禁用例看护仓库重点模型和基础特性，覆盖冒烟测试场�
 | UT | quantization | MXFP8 量化转换 / GMM 量化 / 重计算相位 | [test_mx_convert.py](unit_tests/quantization/test_mx_convert.py) [test_mx_gmm_quant.py](unit_tests/quantization/test_mx_gmm_quant.py) [test_mx_grouped_matmul.py](unit_tests/quantization/test_mx_grouped_matmul.py) [test_mx_quant.py](unit_tests/quantization/test_mx_quant.py) [test_mxfp8_recompute.py](unit_tests/quantization/test_mxfp8_recompute.py) [test_recompute_phase.py](unit_tests/quantization/test_recompute_phase.py) | Y | | |
 | UT | training | dataloader / trainer | [test_dataloader.py](unit_tests/training/test_dataloader.py) [test_trainer.py](unit_tests/training/test_trainer.py) | Y | | |
 | UT | utils | module patch | [test_patch.py](unit_tests/utils/test_patch.py) | Y | | |
+| UT | ops | Clipped SwiGLU 参考实现、梯度、边界与接口约束；可选真实 NPU 前反向 | [test_clipped_swiglu.py](unit_tests/ops/test_clipped_swiglu.py) | Y | | |
+
+Clipped SwiGLU 用例使用合成张量，无权重或数据集依赖。默认执行 CPU 用例；真实 NPU
+用例需在空闲设备和兼容 CANN 环境中显式设置 `RUN_NPU_TESTS=1`，不属于 CPU UT
+通过即可证明的覆盖。依赖和配置说明见 [DeepSeek V4.1 示例](../examples/deepseek_v41/README.md)。
+
+```bash
+python -m pytest tests/unit_tests/ops/test_clipped_swiglu.py -q
+RUN_NPU_TESTS=1 python -m pytest tests/unit_tests/ops/test_clipped_swiglu.py -q
+```
 
 ## 开发流程
 

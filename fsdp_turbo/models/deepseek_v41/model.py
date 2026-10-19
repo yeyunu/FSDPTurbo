@@ -27,7 +27,7 @@ from .host_offload_embedding import (
     TorchHostOffloadEmbedding,
 )
 from .experts import DeepSeekV41Experts
-from .activation import silu_mul
+from .activation import silu_mul, limited_swiglu
 from .image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
 from torch import nn
 from .vision import Aligner, ViT
@@ -162,6 +162,7 @@ class ModelArgs:
     use_fused_compressor: bool = False
     # Fuse MHC projection/Sinkhorn/premix and post residual mixing on NPU.
     use_fused_mhc: bool = False
+    use_fused_clipped_swiglu: bool = False
     # Use CANN FlashAttentionScore/FlashAttentionScoreGrad in the vision tower.
     use_fused_vision_flash_attn: bool = False
     lightning_indexer_page_size: int = 128
@@ -1138,21 +1139,25 @@ class Expert(nn.Module):
     range: the up branch is clamped on both sides, the gate branch only from above.
     """
 
-    def __init__(self, dim: int, inter_dim: int, dtype=None, swiglu_limit=0.0):
+    def __init__(self, dim: int, inter_dim: int, dtype=None, swiglu_limit=0.0, use_fused_clipped_swiglu=False):
         super().__init__()
         self.w1 = Linear(dim, inter_dim, dtype=dtype)
         self.w2 = Linear(inter_dim, dim, dtype=dtype)
         self.w3 = Linear(dim, inter_dim, dtype=dtype)
         self.swiglu_limit = swiglu_limit
+        self.use_fused_clipped_swiglu = use_fused_clipped_swiglu
 
     def forward(self, x: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
         dtype = x.dtype
         gate = self.w1(x).float()
         up = self.w3(x).float()
-        if self.swiglu_limit > 0:
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-        x = silu_mul(gate, up)
+        if self.use_fused_clipped_swiglu and self.swiglu_limit > 0:
+            x = limited_swiglu(torch.cat((gate, up), dim=-1), self.swiglu_limit, fused=True)
+        else:
+            if self.swiglu_limit > 0:
+                up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
+                gate = torch.clamp(gate, max=self.swiglu_limit)
+            x = silu_mul(gate, up)
         if weights is not None:
             x = weights * x
         return self.w2(x.to(dtype))
@@ -1175,9 +1180,15 @@ class MoE(nn.Module):
             intermediate_size=args.moe_inter_dim,
             dtype=None,
             swiglu_limit=args.swiglu_limit,
+            use_fused_clipped_swiglu=args.use_fused_clipped_swiglu,
         )
         assert args.n_shared_experts == 1
-        self.shared_experts = Expert(args.dim, args.moe_inter_dim, swiglu_limit=args.swiglu_limit)
+        self.shared_experts = Expert(
+            args.dim,
+            args.moe_inter_dim,
+            swiglu_limit=args.swiglu_limit,
+            use_fused_clipped_swiglu=args.use_fused_clipped_swiglu,
+        )
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.size()

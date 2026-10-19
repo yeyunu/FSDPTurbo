@@ -190,6 +190,7 @@ def build_deepseek_v41_model(
     use_fused_lightning_indexer: bool = False,
     use_fused_compressor: bool = False,
     use_fused_mhc: bool = False,
+    use_fused_clipped_swiglu: bool = False,
     use_fused_vision_flash_attn: bool = False,
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
 ) -> DeepseekV41ForCausalLMAdapter:
@@ -209,6 +210,7 @@ def build_deepseek_v41_model(
         use_fused_lightning_indexer=use_fused_lightning_indexer,
         use_fused_compressor=use_fused_compressor,
         use_fused_mhc=use_fused_mhc,
+        use_fused_clipped_swiglu=use_fused_clipped_swiglu,
         use_fused_vision_flash_attn=use_fused_vision_flash_attn,
     )
     return _build_deepseek_v41_model(

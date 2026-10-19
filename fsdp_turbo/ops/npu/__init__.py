@@ -1,4 +1,5 @@
 from fsdp_turbo.ops.npu.attn_res import attn_res_npu
+from fsdp_turbo.ops.npu.clipped_swiglu import clipped_swiglu_npu
 from fsdp_turbo.ops.npu.causal_conv1d import causal_conv1d_npu, causal_conv1d_update_npu
 from fsdp_turbo.ops.npu.chunk_kda import chunk_kda_npu
 from fsdp_turbo.ops.npu.grouped_matmul import grouped_matmul_npu
@@ -34,6 +35,7 @@ from fsdp_turbo.ops.npu.hf32_linear import hf32_linear_npu
 
 __all__ = [
     'attn_res_npu',
+    'clipped_swiglu_npu',
     'causal_conv1d_npu',
     'causal_conv1d_update_npu',
     'chunk_kda_npu',

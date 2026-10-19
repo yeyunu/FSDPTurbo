@@ -1,4 +1,5 @@
 from fsdp_turbo.ops.cpu.attn_res import attn_res_cpu
+from fsdp_turbo.ops.cpu.clipped_swiglu import clipped_swiglu_cpu
 from fsdp_turbo.ops.cpu.causal_conv1d import causal_conv1d_cpu, causal_conv1d_update_cpu
 from fsdp_turbo.ops.cpu.chunk_kda import chunk_kda_cpu
 from fsdp_turbo.ops.cpu.grouped_matmul import grouped_matmul_cpu
@@ -21,6 +22,7 @@ from fsdp_turbo.ops.cpu.situ_glu import situ_glu_cpu
 
 __all__ = [
     'attn_res_cpu',
+    'clipped_swiglu_cpu',
     'causal_conv1d_cpu',
     'causal_conv1d_update_cpu',
     'chunk_kda_cpu',

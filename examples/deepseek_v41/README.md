@@ -166,6 +166,7 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 | CANN Compressor/CompressorGrad 融合压缩算子 | 可选；设置 `model.use_fused_compressor: true` |
 | Lightning Indexer 融合算子 | 可选；支持 Atlas A3（Ascend 910_93）、Ascend 910B/910C 和 Ascend950DT |
 | MhcPreSinkhornPremix/MhcPost 融合算子 | 可选；设置 `model.use_fused_mhc: true` |
+| Clipped SwiGLU 前反向融合 | 可选；设置 `model.use_fused_clipped_swiglu: true`，模型的 `swiglu_limit` 必须大于 0 |
 | 视觉 FlashAttentionScore/Grad 融合算子 | 可选；设置 `model.use_fused_vision_flash_attn: true`；仅支持 BF16 |
 | CSA2 activation recompute | 暂不支持 |
 | Engram BF16 训练、哈希表常驻行切分 | 支持（CPU 两进程已验证） |
@@ -197,6 +198,14 @@ MHC 融合开关同时替换每个 Attention/FFN 前的 projection、Sinkhorn、
 当前模型没有 compressor positional bias，因此向算子传入零 `ape`。该路径要求
 `cann_ops_transformer` 与 CANN/torch-npu 版本配套；默认保持关闭，关闭时继续运行
 原 FP32 投影、softmax pooling 实现。
+
+Clipped SwiGLU 融合开关开启后，`swiglu_limit > 0` 的共享专家和原生路由专家
+调用 CANN `ClippedSwiglu`，反向调用配套的 `ClippedSwigluGrad`，融合裁剪与激活计算。
+该路径要求 `cann_ops_nn` 同时提供前反向接口及配套 CANN 内核；使用 EP 时，
+dispatcher 须为 `custom_native_eager_forward`。激活保持 FP32 计算，路由权重仍在
+down projection 前乘入，不改变参数布局。默认保持关闭，关闭时继续使用原裁剪与
+SwiGLU 实现；`swiglu_limit <= 0` 时保持普通 SwiGLU。当前融合路径仅支持 eager
+autograd 一阶梯度，不包含 TorchAir 图模式或高阶梯度。
 
 默认 8 卡拓扑为 `FSDP=4, TP=2, EP=4, expert DP=2`。注意力包含 attention
 sink 与 indexed sparse-attention 的特殊头布局，因此当前保持复制，不能直接套用通用
