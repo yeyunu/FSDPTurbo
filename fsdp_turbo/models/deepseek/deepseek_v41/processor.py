@@ -1,5 +1,6 @@
 """Training processor for DeepSeek-V4.1 interleaved text and images."""
 
+from bisect import bisect_left
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -119,7 +120,7 @@ def _truncate_vl_example(prompt, tokens, token_types, image_inputs, tokenizer, m
     kept_indices = sorted(keep_source)
     new_tokens = [tokens[index] for index in kept_indices] + tokens[source_len : source_len + target_budget]
     new_types = [token_types[index] for index in kept_indices] + token_types[source_len : source_len + target_budget]
-    new_images = [replace(image, start=sum(index < image.start for index in kept_indices)) for image in images]
+    new_images = [replace(image, start=bisect_left(kept_indices, image.start)) for image in images]
     return new_tokens, new_types, new_images or None
 
 
@@ -144,11 +145,9 @@ def encode_chat_messages(messages: Sequence[dict]) -> str:
         role = message.get("role")
         content = _render_content(message.get("content", ""))
         if role == "system":
-            prompt_parts.append(SYSTEM_TOKEN)
-            prompt_parts.append(content)
+            prompt_parts.extend((SYSTEM_TOKEN, content))
         elif role == "user":
-            prompt_parts.append(USER_TOKEN)
-            prompt_parts.append(content)
+            prompt_parts.extend((USER_TOKEN, content))
             next_role = messages[message_index + 1].get("role") if message_index + 1 < len(messages) else None
             if next_role in {None, "assistant"}:
                 prompt_parts.extend((ASSISTANT_TOKEN, THINKING_END_TOKEN))

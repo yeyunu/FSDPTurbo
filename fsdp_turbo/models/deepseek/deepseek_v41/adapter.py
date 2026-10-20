@@ -13,15 +13,19 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .host_offload_embedding import HostOffloadEmbedding
+from .engram.host_offload_engram import HostOffloadEngram
 
 from . import model as reference_model
 
-_REFERENCE_DIRECTORY = Path(__file__).parent
 
-
-def _load_model_args() -> dict:
-    with (_REFERENCE_DIRECTORY / "config_8p_A5.json").open("r", encoding="utf-8") as config_file:
+def _load_model_args(*, config_path: str | Path | None = None, model_name_or_path: str | Path | None = None) -> dict:
+    if config_path is not None:
+        selected_path = Path(config_path)
+    elif model_name_or_path:
+        selected_path = Path(model_name_or_path) / "config.json"
+    else:
+        raise FileNotFoundError("Provide config_path or a model_name_or_path directory containing config.json.")
+    with selected_path.open("r", encoding="utf-8") as config_file:
         return json.load(config_file)
 
 
@@ -99,7 +103,7 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
                 raise ValueError(f"actual_seq_len must finish at the flattened token count {input_ids.numel()}.")
             cu_seqlens = F.pad(actual_seq_len, (1, 0), value=0).contiguous()
             sequence_lengths = torch.diff(cu_seqlens)
-            for ratio in set(self.model_args.compress_ratios):
+            for ratio in set(self.model_args.compress_ratios[: self.model_args.n_layers]):
                 if ratio and torch.any(sequence_lengths % ratio != 0).item():
                     raise ValueError(
                         "TND sequence lengths must be divisible by every active "
@@ -146,7 +150,10 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
                 ignore_index=-100,
+                reduction="sum",
             )
+            valid_target_count = (shift_labels != -100).sum().clamp_min(1)
+            loss = loss / valid_target_count
 
         return DeepseekV41CausalLMOutput(
             loss=loss,
@@ -155,9 +162,13 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         )
 
 
-def build_deepseek_v41_model_args():
-    """Build model arguments directly from the vendored training config."""
-    model_args = reference_model.ModelArgs(**_load_model_args())
+def build_deepseek_v41_model_args(
+    *, config_path: str | Path | None = None, model_name_or_path: str | Path | None = None
+):
+    """Build training arguments from an explicit JSON or model directory's config.json."""
+    model_args = reference_model.ModelArgs(
+        **_load_model_args(config_path=config_path, model_name_or_path=model_name_or_path)
+    )
     _validate_training_args(model_args)
     return model_args
 
@@ -170,12 +181,8 @@ def _build_deepseek_v41_model(
 ) -> DeepseekV41ForCausalLMAdapter:
     if head_compute_dtype not in ("fp32", "bf16", "hf32"):
         raise ValueError("head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
-    previous_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(torch.bfloat16)
-    try:
+    with reference_model.set_dtype(torch.bfloat16):
         backbone = reference_model.Transformer(model_args, tokenizer=tokenizer)
-    finally:
-        torch.set_default_dtype(previous_dtype)
     backbone.head.compute_dtype = torch.bfloat16 if head_compute_dtype == "bf16" else torch.float32
     backbone.head.use_hf32 = head_compute_dtype == "hf32"
     return DeepseekV41ForCausalLMAdapter(backbone, model_args)
@@ -184,6 +191,8 @@ def _build_deepseek_v41_model(
 def build_deepseek_v41_model(
     *,
     model_args: reference_model.ModelArgs | None = None,
+    config_path: str | Path | None = None,
+    model_name_or_path: str | Path | None = None,
     tokenizer=None,
     engram_storage_backend: Literal["host_offload", "elastic_buffer"] = "host_offload",
     use_sparse_flash_attn: bool = False,
@@ -194,13 +203,13 @@ def build_deepseek_v41_model(
     use_fused_vision_flash_attn: bool = False,
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
 ) -> DeepseekV41ForCausalLMAdapter:
-    """Build an uninitialized BF16 model from the vendored config JSON.
+    """Build an uninitialized BF16 model from model_args or a selected config JSON.
 
     Host Engram tables start on meta storage. FSDPTurbo later shards and
     initializes them without allocating their full storage.
     """
     if model_args is None:
-        model_args = build_deepseek_v41_model_args()
+        model_args = build_deepseek_v41_model_args(config_path=config_path, model_name_or_path=model_name_or_path)
     else:
         _validate_training_args(model_args)
     model_args = replace(
@@ -234,8 +243,7 @@ _MHC_PARAMETERS = {
 }
 
 
-def _depth_std(name: str, base_std: float) -> float:
-    layer_id = int(name.split(".layers.", 1)[1].split(".", 1)[0])
+def _depth_std(layer_id: int, base_std: float) -> float:
     return base_std / math.sqrt(2.0 * (layer_id + 1))
 
 
@@ -244,9 +252,15 @@ def initialize_deepseek_v41_model(model: nn.Module, standard_deviation: float = 
 
     Deferred host tables initialize themselves when their EP shard is materialized.
     """
+    layer_ids = {
+        id(module): layer.layer_id
+        for layer in model.modules()
+        if isinstance(layer, reference_model.Block)
+        for module in layer.modules()
+    }
     with torch.no_grad():
         for module_name, module in model.named_modules():
-            if isinstance(module, HostOffloadEmbedding):
+            if isinstance(module, HostOffloadEngram):
                 # This table owns its row-wise initialization. After parallelism
                 # it may already be materialized on the host, so never overwrite
                 # it through the generic rules below.
@@ -290,7 +304,7 @@ def initialize_deepseek_v41_model(model: nn.Module, standard_deviation: float = 
                         b=3.0 * output_std,
                     )
                 elif isinstance(module, reference_model.DeepSeekV41Experts):
-                    depth_std = _depth_std(name, standard_deviation)
+                    depth_std = _depth_std(layer_ids[id(module)], standard_deviation)
                     if local_name == "gate_up_proj":
                         # Initialize the packed, contiguous storage in one pass.  The
                         # two dim-1 chunks are non-contiguous across experts, making
@@ -304,7 +318,7 @@ def initialize_deepseek_v41_model(model: nn.Module, standard_deviation: float = 
                 elif name.endswith(".ffn.gate.weight") or name.endswith(
                     (".ffn.shared_experts.w2.weight", ".ffn.shared_experts.w3.weight")
                 ):
-                    nn.init.normal_(parameter, mean=0.0, std=_depth_std(name, standard_deviation))
+                    nn.init.normal_(parameter, mean=0.0, std=_depth_std(layer_ids[id(module)], standard_deviation))
                 elif local_name == "weight" or parameter.ndim > 1:
                     nn.init.normal_(parameter, mean=0.0, std=standard_deviation)
                 else:
@@ -327,7 +341,7 @@ def prepare_deepseek_v41_model_for_fsdp(model: nn.Module, *, device, parameter_d
     # Keep deferred Engram tables on meta until FSDPTurbo has its data mesh.
     # Move each module's own tensors so parent .to() cannot materialize them.
     for module in model.modules():
-        if isinstance(module, HostOffloadEmbedding) and module.weight.is_meta:
+        if isinstance(module, HostOffloadEngram) and module.weight.is_meta:
             continue
         module._apply(lambda tensor: tensor.to(device=device), recurse=False)
     return model

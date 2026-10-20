@@ -6,7 +6,7 @@ from dataclasses import replace
 import torch
 
 from fsdp_turbo.fsdp_turbo_config import load_config_from_yaml
-from fsdp_turbo.models.deepseek_v41 import (
+from fsdp_turbo.models.deepseek.deepseek_v41 import (
     DeepSeekV41Processor,
     build_deepseek_v41_model,
     build_deepseek_v41_model_args,
@@ -14,8 +14,11 @@ from fsdp_turbo.models.deepseek_v41 import (
     prepare_deepseek_v41_tokenizer,
     prepare_deepseek_v41_model_for_fsdp,
 )
-from fsdp_turbo.models.deepseek_v41.engram_optimizer import EngramSchedulerContainer
-from fsdp_turbo.models.deepseek_v41.host_offload_embedding import host_engram_tables
+from fsdp_turbo.models.deepseek.deepseek_v41.engram.engram_optimizer import (
+    EngramSchedulerContainer,
+    register_engram_optimizers,
+)
+from fsdp_turbo.models.deepseek.deepseek_v41.engram.host_offload_engram import host_engram_tables
 from fsdp_turbo.quantization.cache import hook_optimizer_step
 from fsdp_turbo.training.factories import OptimizerFactory, SchedulerFactory
 from fsdp_turbo.training.trainer import BaseTrainer
@@ -28,7 +31,10 @@ class DeepseekV41Trainer(BaseTrainer):
     def _model_args(self):
         if not hasattr(self, "_cached_model_args"):
             self._cached_model_args = replace(
-                build_deepseek_v41_model_args(),
+                build_deepseek_v41_model_args(
+                    config_path=self.config.model.config_path,
+                    model_name_or_path=self.config.model.model_name_or_path,
+                ),
                 max_seq_len=self.config.data.max_seq_length,
             )
         return self._cached_model_args
@@ -101,6 +107,7 @@ class DeepseekV41Trainer(BaseTrainer):
         engram_tables = host_engram_tables(self.model)
         if not engram_tables:
             return super().build_optimizer()
+        register_engram_optimizers(OptimizerFactory)
         optimizer = OptimizerFactory.create(
             "EngramOptimizer",
             self.model,

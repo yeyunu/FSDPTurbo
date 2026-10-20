@@ -5,6 +5,8 @@
 # --- Model Configuration ---
 model:
   model_name_or_path: "./DSV41/models/DeepSeek-V4.1-Flash"
+  # Optional architecture JSON override; otherwise read model_name_or_path/config.json.
+  config_path: "./model_config/config_8p_A5.json"
   tokenizer_name_or_path: "./DSV41/models/DeepSeek-V4.1-Flash"
   torch_dtype: "bf16"
   # Head projection precision: fp32, bf16, or hf32 (NPU); cross entropy remains FP32.

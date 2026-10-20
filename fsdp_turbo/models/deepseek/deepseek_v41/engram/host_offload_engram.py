@@ -30,6 +30,8 @@ except ImportError:
             _OpaqueHandleBase = object
 
 
+from fsdp_turbo.utils.log import print_rank
+
 logger = logging.getLogger(__name__)
 _ROW_ALIGNMENT = 128
 _TABLE_ROW_ALIGNMENT = 2048
@@ -184,7 +186,7 @@ class _HostFetch(torch.autograd.Function):
         return None, None, None, None, sink
 
 
-class HostOffloadEmbedding(nn.Module):
+class HostOffloadEngram(nn.Module):
     """CPU BF16 Engram table sharded over EP and served by ElasticBuffer."""
 
     uses_host_offload = True
@@ -273,7 +275,7 @@ class HostOffloadEmbedding(nn.Module):
         except RuntimeError:
             if not self.pin_memory:
                 raise
-            logger.warning("Pinned Host allocation is unavailable; allocating pageable Engram storage.")
+            print_rank(logger.warning, "Pinned Host allocation is unavailable; allocating pageable Engram storage.")
             local = torch.empty(self.local_rows, self.embedding_dim, dtype=self.weight.dtype)
         generator = torch.Generator(device="cpu")
         seed = (torch.initial_seed() + self.layer_id + self.row_start) % (2**64)
@@ -361,12 +363,15 @@ class HostOffloadEmbedding(nn.Module):
         self._buffer.engram_write(storage)
         self._storage_registered = getattr(self._buffer, "_engram_storage_ref", None) is storage
 
-    def forward(self, indices):
+    def _check_lookup_inputs(self, indices):
         if self.mesh is None or self.weight.is_meta:
             raise RuntimeError("Host Engram must be EP-sharded by FSDPTurbo before forward.")
         request_count = indices.numel()
         if request_count > self.num_max_tokens_per_rank:
             raise ValueError(f"Engram lookup has {request_count} rows but capacity is {self.num_max_tokens_per_rank}.")
+
+    def forward(self, indices):
+        self._check_lookup_inputs(indices)
         if not self._storage_registered:
             if torch.compiler.is_compiling():
                 raise RuntimeError(
@@ -420,6 +425,59 @@ class HostOffloadEmbedding(nn.Module):
 
     def mark_sparse_step_complete(self):
         self._pending_sparse_grad = None
+
+    @staticmethod
+    def custom_clip_grad_norm(
+        model: torch.nn.Module,
+        engram_tables: list,
+        max_norm: float,
+        norm_type: int | float,
+        group: dist.ProcessGroup | None,
+    ) -> float:
+        """Clip dense and pending Host Engram gradients by one global norm."""
+        from fsdp_turbo.training.clip_grads import _to_local_if_dtensor, compute_grad_norm
+
+        if norm_type != 2.0:
+            raise NotImplementedError("Host Engram currently supports global 2-norm clipping only.")
+        for table in sorted(engram_tables, key=lambda item: item.layer_id):
+            table.reduce_sparse_gradient_across_replicas()
+
+        if hasattr(model, "clip_grad_norm_"):
+            dense_norm = model.clip_grad_norm_(float("inf"), norm_type)
+        else:
+            dense_parameters = [
+                parameter for parameter in model.parameters() if not getattr(parameter, "_engram_host_offload", False)
+            ]
+            dense_norm = torch.tensor(compute_grad_norm(dense_parameters, norm_type, group=group))
+        if not isinstance(dense_norm, torch.Tensor):
+            dense_norm = torch.tensor(dense_norm)
+
+        # FSDP may return a CPU scalar while its process group requires an
+        # accelerator tensor. The keepalive tensor follows the Engram mesh.
+        collective_device = (
+            engram_tables[0]._grad_keepalive.device if engram_tables[0].mesh is not None else dense_norm.device
+        )
+        dense_norm = dense_norm.detach().to(device=collective_device, dtype=torch.float32)
+        sparse_squared_norm = torch.zeros((), dtype=torch.float32, device=collective_device)
+        for table in engram_tables:
+            pending_gradient = table.pending_sparse_grad()
+            if pending_gradient is not None:
+                sparse_squared_norm += pending_gradient.values().float().square().sum().to(sparse_squared_norm.device)
+        if engram_tables[0].mesh is not None:
+            dist.all_reduce(sparse_squared_norm, group=engram_tables[0].mesh.get_group())
+
+        total_norm = torch.sqrt(dense_norm.square() + sparse_squared_norm)
+        clip_coefficient = min(float(max_norm / (total_norm + 1e-6)), 1.0)
+        if clip_coefficient < 1.0:
+            if hasattr(model, "clip_grad_norm_"):
+                model.clip_grad_norm_(float(dense_norm) * clip_coefficient, norm_type)
+            else:
+                for parameter in dense_parameters:
+                    if parameter.grad is not None:
+                        _to_local_if_dtensor(parameter.grad).detach().mul_(clip_coefficient)
+            for table in engram_tables:
+                table.scale_pending_sparse_grad(clip_coefficient)
+        return float(total_norm)
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         super()._save_to_state_dict(destination, prefix, keep_vars)
@@ -540,7 +598,7 @@ class _TorchHostFetch(torch.autograd.Function):
         return None, None, None, grad_output.new_zeros(())
 
 
-class TorchHostOffloadEmbedding(HostOffloadEmbedding):
+class TorchHostOffloadEngram(HostOffloadEngram):
     """CPU BF16 Engram table routed over EP without ElasticBuffer."""
 
     requires_cann_alignment = False
@@ -554,12 +612,7 @@ class TorchHostOffloadEmbedding(HostOffloadEmbedding):
 
     @torch.compiler.disable
     def forward(self, indices):
-        if self.mesh is None or self.weight.is_meta:
-            raise RuntimeError("Host Engram must be EP-sharded by FSDPTurbo before forward.")
-        if indices.numel() > self.num_max_tokens_per_rank:
-            raise ValueError(
-                f"Engram lookup has {indices.numel()} rows but capacity is {self.num_max_tokens_per_rank}."
-            )
+        self._check_lookup_inputs(indices)
         fetched = _TorchHostFetch.apply(
             self.weight,
             indices.reshape(-1),
@@ -573,67 +626,8 @@ def host_engram_tables(model):
     return [module for module in model.modules() if getattr(module, "uses_host_offload", False)]
 
 
-def _clip_host_engram_grad_norm(
-    model: torch.nn.Module,
-    engram_tables: list,
-    max_norm: float,
-    norm_type: int | float,
-    group: dist.ProcessGroup | None,
-) -> float:
-    """Clip dense and pending Host Engram gradients by one global norm."""
-    from fsdp_turbo.training.clip_grads import (
-        _to_local_if_dtensor,
-        compute_grad_norm,
-    )
-
-    if norm_type != 2.0:
-        raise NotImplementedError("Host Engram currently supports global 2-norm clipping only.")
-    for table in sorted(engram_tables, key=lambda item: item.layer_id):
-        table.reduce_sparse_gradient_across_replicas()
-
-    if hasattr(model, "clip_grad_norm_"):
-        dense_norm = model.clip_grad_norm_(float("inf"), norm_type)
-    else:
-        dense_parameters = [
-            parameter for parameter in model.parameters() if not getattr(parameter, "_engram_host_offload", False)
-        ]
-        dense_norm = torch.tensor(compute_grad_norm(dense_parameters, norm_type, group=group))
-    if not isinstance(dense_norm, torch.Tensor):
-        dense_norm = torch.tensor(dense_norm)
-
-    # FSDP may return a CPU scalar while its process group requires an
-    # accelerator tensor. The keepalive tensor follows the Engram mesh.
-    collective_device = (
-        engram_tables[0]._grad_keepalive.device if engram_tables[0].mesh is not None else dense_norm.device
-    )
-    dense_norm = dense_norm.detach().to(device=collective_device, dtype=torch.float32)
-    sparse_squared_norm = torch.zeros((), dtype=torch.float32, device=collective_device)
-    for table in engram_tables:
-        pending_gradient = table.pending_sparse_grad()
-        if pending_gradient is not None:
-            sparse_squared_norm += pending_gradient.values().float().square().sum().to(sparse_squared_norm.device)
-    if engram_tables[0].mesh is not None:
-        dist.all_reduce(sparse_squared_norm, group=engram_tables[0].mesh.get_group())
-
-    total_norm = torch.sqrt(dense_norm.square() + sparse_squared_norm)
-    clip_coefficient = min(float(max_norm / (total_norm + 1e-6)), 1.0)
-    if clip_coefficient < 1.0:
-        if hasattr(model, "clip_grad_norm_"):
-            model.clip_grad_norm_(float(dense_norm) * clip_coefficient, norm_type)
-        else:
-            for parameter in dense_parameters:
-                if parameter.grad is not None:
-                    _to_local_if_dtensor(parameter.grad).detach().mul_(clip_coefficient)
-        for table in engram_tables:
-            table.scale_pending_sparse_grad(clip_coefficient)
-    return float(total_norm)
-
-
-HostOffloadEmbedding.custom_clip_grad_norm = staticmethod(_clip_host_engram_grad_norm)
-
-
 __all__ = [
-    "HostOffloadEmbedding",
-    "TorchHostOffloadEmbedding",
+    "HostOffloadEngram",
+    "TorchHostOffloadEngram",
     "host_engram_tables",
 ]

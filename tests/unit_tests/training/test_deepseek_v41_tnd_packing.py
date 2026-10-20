@@ -9,13 +9,12 @@ from unittest import mock
 import torch
 
 from fsdp_turbo.fsdp_turbo_config import DataConfig
-from fsdp_turbo.models.deepseek_v41.adapter import DeepseekV41ForCausalLMAdapter
-from fsdp_turbo.models.deepseek_v41.model import (
+from fsdp_turbo.models.deepseek.deepseek_v41.adapter import DeepseekV41ForCausalLMAdapter
+from fsdp_turbo.models.deepseek.deepseek_v41.model import (
     Compressor,
     Indexer,
     ModelArgs,
     shared_attn,
-    use_attention_mask,
 )
 from fsdp_turbo.training.dataloader import _MultimodalCollator
 from fsdp_turbo.ops.npu.sparse_attention import _cmp_mask_mode
@@ -83,6 +82,7 @@ class DeepseekV41TndPackingTests(unittest.TestCase):
             vision_enabled=False,
             use_sparse_flash_attn=True,
             compress_ratios=(2,),
+            n_layers=1,
             use_fused_compressor=False,
             use_fused_lightning_indexer=False,
         )
@@ -204,8 +204,7 @@ class DeepseekV41TndPackingTests(unittest.TestCase):
         cu_seqlens = torch.tensor([0, 4, 10], dtype=torch.int32)
 
         expected = torch.cat((compressor(packed[:, :4], 0), compressor(packed[:, 4:], 0)), dim=1)
-        with use_attention_mask(None, "TND", cu_seqlens):
-            actual = compressor(packed, 0)
+        actual = compressor(packed, 0, cu_seqlens=cu_seqlens)
 
         torch.testing.assert_close(actual, expected)
         actual.float().sum().backward()
@@ -254,8 +253,7 @@ class DeepseekV41TndPackingTests(unittest.TestCase):
             expected_parts.append(torch.nn.functional.pad(indices, (0, args.index_topk - indices.shape[-1]), value=-1))
         expected = torch.cat(expected_parts, dim=1)
 
-        with use_attention_mask(None, "TND", torch.tensor([0, 4, 10], dtype=torch.int32)):
-            actual = indexer(x, qr, latent, 0, 0)
+        actual = indexer(x, qr, latent, 0, 0, cu_seqlens=torch.tensor([0, 4, 10], dtype=torch.int32))
 
         torch.testing.assert_close(actual, expected)
         self.assertTrue(torch.all(actual[:, :4] < 2))
@@ -298,10 +296,9 @@ class DeepseekV41TndPackingTests(unittest.TestCase):
         cu_seqlens = torch.tensor([0, 3, 7], dtype=torch.int32)
 
         shared_attn.reset()
-        with use_attention_mask(None, "TND", cu_seqlens):
-            source(x, qr, latent, 0, 0)
-            self.assertEqual(len(shared_attn.packed_candidates), 2)
-            indices = consumer(x, qr, None, 0, 0)
+        source(x, qr, latent, 0, 0, cu_seqlens=cu_seqlens)
+        self.assertEqual(len(shared_attn.packed_candidates), 2)
+        indices = consumer(x, qr, None, 0, 0, cu_seqlens=cu_seqlens)
 
         self.assertEqual(indices.shape, (1, 7, args.index_topk))
         self.assertTrue(torch.all(indices[:, :3][indices[:, :3] >= 0] < 3))

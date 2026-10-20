@@ -1,4 +1,3 @@
-import logging
 import hashlib
 from dataclasses import dataclass
 from itertools import accumulate
@@ -8,8 +7,8 @@ import numpy as np
 import torch
 from torch import nn
 
-
-logger = logging.getLogger(__name__)
+from .host_offload_engram import HostOffloadEngram, TorchHostOffloadEngram
+from ..model_args import ModelArgs
 
 
 def _is_prime(candidate: int) -> bool:
@@ -175,15 +174,15 @@ class NgramHashState(nn.Module):
                 f"computed {vocab_size}, configured {args.engram_compressed_vocab_size}. "
                 "Use the tokenizer revision matching the Engram checkpoint."
             )
+        multipliers = compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, vocab_size)
         self.hash_fingerprint = hashlib.sha256(
             np.asarray(token_map, dtype=np.int64).tobytes()
             + np.asarray(layout.primes, dtype=np.int64).tobytes()
-            + compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, vocab_size).numpy().tobytes()
+            + multipliers.numpy().tobytes()
         ).hexdigest()
         self.pad_id = token_map[args.engram_pad_id]
         flat = [[p for per_ngram in layer for p in per_ngram] for layer in layout.primes]
         offsets = [[0, *accumulate(sizes[:-1])] for sizes in flat]
-        multipliers = compute_hash_multipliers(layout.layer_ids, layout.max_ngram_size, vocab_size)
         self.register_buffer("primes", torch.tensor(layout.primes), persistent=False)
         self.register_buffer("offsets", torch.tensor(offsets), persistent=False)
         self.register_buffer("multipliers", multipliers, persistent=False)
@@ -226,3 +225,66 @@ class NgramHashState(nn.Module):
             rolling = torch.bitwise_xor(rolling, products[..., i])
             hashes.append(rolling.unsqueeze(-1) % self.primes[:, i - 1])
         return torch.cat(hashes, dim=-1) + self.offsets
+
+
+class Engram(nn.Module):
+    """Writes an n-gram lookup into the residual stream, gated by how well it matches that stream.
+
+    The hash ids fetch `n_hash_cols` rows; `wkv` turns them into one key per hc copy plus a shared
+    value. The gate is a normalized dot product of stream against key.
+    """
+
+    def __init__(self, args: ModelArgs, layer_id: int, layout: EngramLayout):
+        # Resolve the base layer after module initialization to avoid a circular import.
+        from ..layers import Linear  # pylint: disable=cyclic-import
+
+        super().__init__()
+        self.layer_id = layer_id
+        self.layer_hash_index = layout.layer_ids.index(layer_id)
+        self.dim = args.dim
+        self.hc_mult = args.hc_mult
+        self.clamp_value = 1e-6
+
+        table_rows = layout.num_embeddings[self.layer_hash_index]
+        n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
+        if args.engram_storage_backend in ("host_offload", "elastic_buffer"):
+            embedding_type = (
+                HostOffloadEngram if args.engram_storage_backend == "elastic_buffer" else TorchHostOffloadEngram
+            )
+            self.embed = embedding_type(
+                table_rows,
+                layout.head_dim,
+                layer_id=layer_id,
+                num_max_tokens_per_rank=(args.max_batch_size * args.max_seq_len * n_hash_cols),
+                pin_memory=True,
+            )
+        else:
+            raise ValueError(
+                "engram_storage_backend must be one of "
+                "('host_offload', 'elastic_buffer'), got "
+                f"{args.engram_storage_backend!r}."
+            )
+        self.wkv = Linear(n_hash_cols * layout.head_dim, args.dim * (args.hc_mult + 1))
+        self.eps = args.norm_eps
+        self.q_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
+        self.k_weight = nn.Parameter(torch.ones(args.hc_mult, args.dim))
+
+    def forward(self, x: torch.Tensor, hash_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """x: [B, L, hc_mult, dim]; hash_ids: [B, L, n_hash_cols]; token_mask: [B, L], False shuts
+        the gate so those positions pass through untouched.
+        """
+        memory = self.embed(hash_ids).flatten(-2).to(dtype=x.dtype)
+        kv = self.wkv(memory)
+        key, value = kv.split([self.hc_mult * self.dim, self.dim], dim=-1)
+        key = key.float().unflatten(-1, (self.hc_mult, self.dim))
+        weight = self.q_weight.float() * self.k_weight.float()  # only ever used as a product
+        h, eps = x.float(), self.eps
+        # normalized per (token, hc copy) over `dim`, NOT jointly over the copies
+        rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(key.square().mean(-1) + eps)
+        dot = (h * weight * key).sum(-1) * rstd * self.dim**-0.5
+        # signed sqrt before the sigmoid, matching the training kernel
+        magnitude = dot.abs().clamp_min(self.clamp_value).sqrt()
+        gate = torch.sigmoid(torch.where(dot < 0, -magnitude, magnitude))
+        if token_mask is not None:
+            gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
+        return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)

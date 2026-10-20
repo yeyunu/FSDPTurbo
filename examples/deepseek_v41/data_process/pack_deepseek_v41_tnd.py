@@ -9,7 +9,7 @@ from pathlib import Path
 from PIL import Image
 from transformers import PreTrainedTokenizerFast
 
-from fsdp_turbo.models.deepseek_v41 import (
+from fsdp_turbo.models.deepseek.deepseek_v41 import (
     DeepSeekV41Processor,
     build_deepseek_v41_model_args,
     prepare_deepseek_v41_tokenizer,
@@ -71,6 +71,8 @@ def main():
     )
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--config-path", help="Explicit model architecture JSON file")
+    parser.add_argument("--model-name-or-path", help="Model directory containing config.json")
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--max-seq-length", type=int, default=1024)
     parser.add_argument("--max-documents-per-pack", type=int, default=0)
@@ -91,7 +93,7 @@ def main():
         parser.error("--max-documents-per-pack cannot be negative")
 
     tokenizer = PreTrainedTokenizerFast.from_pretrained(args.tokenizer)
-    model_args = build_deepseek_v41_model_args()
+    model_args = build_deepseek_v41_model_args(config_path=args.config_path, model_name_or_path=args.model_name_or_path)
     prepare_deepseek_v41_tokenizer(tokenizer, model_args)
     processor = DeepSeekV41Processor(tokenizer, model_args)
     alignment = math.lcm(*(ratio for ratio in model_args.compress_ratios if ratio > 0))

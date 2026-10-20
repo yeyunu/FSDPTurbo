@@ -12,9 +12,9 @@ import numpy as np
 from PIL import Image
 from transformers import PreTrainedTokenizerFast
 
-from fsdp_turbo.models.deepseek_v41 import build_deepseek_v41_model_args
-from fsdp_turbo.models.deepseek_v41.image_processor import IMAGE_PLACEHOLDER, num_image_tokens, plan_image_grid
-from fsdp_turbo.models.deepseek_v41.processor import DeepSeekV41Processor
+from fsdp_turbo.models.deepseek.deepseek_v41 import build_deepseek_v41_model_args
+from fsdp_turbo.models.deepseek.deepseek_v41.image_processor import IMAGE_PLACEHOLDER, num_image_tokens, plan_image_grid
+from fsdp_turbo.models.deepseek.deepseek_v41.processor import DeepSeekV41Processor
 from fsdp_turbo.training.dataloader import _render_multimodal_record
 
 
@@ -23,6 +23,8 @@ SEED_TEXT = "A moment frozen in the flow of time"
 
 def get_args(argv=None):
     parser = argparse.ArgumentParser(description="Mock image/text data for DeepSeek-V4.1-Flash")
+    parser.add_argument("--config_path", help="Explicit model architecture JSON file")
+    parser.add_argument("--model_name_or_path", help="Model directory containing config.json")
     parser.add_argument("--tokenizer_path", required=True, help="Local DeepSeek-V4.1-Flash tokenizer directory")
     parser.add_argument("--pic_width", type=int, default=1024)
     parser.add_argument("--pic_height", type=int, default=1024)
@@ -81,7 +83,7 @@ def fit_record(num_pics, image_path, tokenizer, processor, image_tokens, text_le
 
 def main(argv=None):
     args = get_args(argv)
-    model_args = build_deepseek_v41_model_args()
+    model_args = build_deepseek_v41_model_args(config_path=args.config_path, model_name_or_path=args.model_name_or_path)
     if args.num_pics and not model_args.vision_enabled:
         raise ValueError("The DeepSeek-V4.1 model config has no enabled vision tower.")
 

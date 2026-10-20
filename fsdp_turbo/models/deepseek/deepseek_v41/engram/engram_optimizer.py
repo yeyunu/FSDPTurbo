@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 
 
@@ -100,11 +102,7 @@ class ActiveRowAdam(torch.optim.Optimizer):
 class EngramOptimizer:
     """Present dense and Host active-row optimizers as one component."""
 
-    def __init__(self, model, tables, dense_optimizer_type, **kwargs):
-        from fsdp_turbo.training.factories.optimizer_factory import (
-            OptimizerFactory,
-        )
-
+    def __init__(self, model, tables, dense_optimizer_type, *, optimizer_factory, **kwargs):
         if dense_optimizer_type == "EngramOptimizer":
             raise ValueError("EngramOptimizer cannot use itself as its dense optimizer.")
 
@@ -112,12 +110,12 @@ class EngramOptimizer:
         sparse_parameters = [table.weight for table in tables]
         sparse_parameter_ids = {id(parameter) for parameter in sparse_parameters}
         dense_parameters = [parameter for parameter in model.parameters() if id(parameter) not in sparse_parameter_ids]
-        dense_optimizer = OptimizerFactory.create(
+        dense_optimizer = optimizer_factory.create(
             dense_optimizer_type,
             dense_parameters,
             **kwargs,
         )
-        sparse_optimizer = OptimizerFactory.create(
+        sparse_optimizer = optimizer_factory.create(
             "ActiveRowAdam",
             sparse_parameters,
             lr=kwargs.get("lr", 1e-3),
@@ -274,15 +272,10 @@ def load_engram_checkpoint_state(state_dict, model, optimizer, *, strict) -> Non
     optimizer.sparse_optimizer.load_state_dict(sparse_state[f"sparse_adam{suffix}"])
 
 
-def register_engram_optimizers() -> None:
+def register_engram_optimizers(optimizer_factory) -> None:
     """Register model-owned optimizers without coupling the generic factory to DeepSeek."""
-    from fsdp_turbo.training.factories.optimizer_factory import OptimizerFactory
-
-    OptimizerFactory.register("ActiveRowAdam", ActiveRowAdam)
-    OptimizerFactory.register("EngramOptimizer", EngramOptimizer)
-
-
-register_engram_optimizers()
+    optimizer_factory.register("ActiveRowAdam", ActiveRowAdam)
+    optimizer_factory.register("EngramOptimizer", partial(EngramOptimizer, optimizer_factory=optimizer_factory))
 
 
 __all__ = [

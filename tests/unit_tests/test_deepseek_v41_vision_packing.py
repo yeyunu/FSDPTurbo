@@ -2,8 +2,8 @@ from unittest import mock
 
 import torch
 
-from fsdp_turbo.models.deepseek_v41.model import ModelArgs
-from fsdp_turbo.models.deepseek_v41.vision import Aligner, ViT
+from fsdp_turbo.models.deepseek.deepseek_v41.model import ModelArgs
+from fsdp_turbo.models.deepseek.deepseek_v41.vision import Aligner, ViT
 
 
 def _model_args():

@@ -9,6 +9,7 @@ import torch
 import yaml
 
 from fsdp_turbo.utils.dtype import get_dtype
+from fsdp_turbo.utils.log import print_rank
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ModelConfig:
     model_name_or_path: str = ""
+    # Optional architecture JSON; DeepSeek-V4.1 otherwise reads model_name_or_path/config.json.
+    config_path: Optional[str] = None
     tokenizer_name_or_path: str = ""
     torch_dtype: torch.dtype = torch.bfloat16
     # Optional demo/debug knob for building a shallower language model.
@@ -361,6 +364,10 @@ class FSDPTurboConfig:
 
     def validate_model_config(self):
         """Validate model loading configuration."""
+        if self.model.config_path is not None and (
+            not isinstance(self.model.config_path, str) or not self.model.config_path.strip()
+        ):
+            raise ValueError("model.config_path must be a non-empty string when provided.")
         if not isinstance(self.model.use_fused_clipped_swiglu, bool):
             raise ValueError("model.use_fused_clipped_swiglu must be a boolean.")
         if self.model.head_compute_dtype not in ("fp32", "bf16", "hf32"):
@@ -852,21 +859,21 @@ def _coerce_value(value, field_type):
         try:
             return float(value)
         except (ValueError, TypeError):
-            logger.warning("Cannot convert '%s' to float, keeping as str", value)
+            print_rank(logger.warning, f"Cannot convert '{value}' to float, keeping as str")
             return value
 
     if field_type is int:
         try:
             return int(value)
         except (ValueError, TypeError):
-            logger.warning("Cannot convert '%s' to int, keeping as str", value)
+            print_rank(logger.warning, f"Cannot convert '{value}' to int, keeping as str")
             return value
 
     if field_type is torch.dtype:
         try:
             return get_dtype(value)
         except (ValueError, TypeError) as e:
-            logger.warning("Cannot convert '%s' to torch.dtype: %s, keeping as str", value, e)
+            print_rank(logger.warning, f"Cannot convert '{value}' to torch.dtype: {e}, keeping as str")
             return value
 
     return value
@@ -883,7 +890,7 @@ def _dict_to_dataclass(cls, data):
     kwargs = {}
     for key, value in data.items():
         if key not in field_types:
-            logger.warning("Ignoring unknown config key '%s' for %s", key, cls.__name__)
+            print_rank(logger.warning, f"Ignoring unknown config key '{key}' for {cls.__name__}")
             continue
         ft = field_types[key]
         origin = getattr(ft, "__origin__", None)
@@ -949,7 +956,7 @@ def load_config_from_yaml(yaml_path):
         distributed_valid_fields = {f.name for f in fields(DistributedConfig)}
         extra_keys = set(distributed_raw.keys()) - distributed_valid_fields
         if extra_keys:
-            logger.warning("Ignoring unknown distributed config keys: %s", extra_keys)
+            print_rank(logger.warning, f"Ignoring unknown distributed config keys: {extra_keys}")
         filtered_distributed_raw = {k: v for k, v in distributed_raw.items() if k in distributed_valid_fields}
 
         distributed_cfg = DistributedConfig(
@@ -984,7 +991,7 @@ def load_config_from_yaml(yaml_path):
     valid_fields = {f.name for f in fields(FSDPTurboConfig)}
     extra_keys = set(raw.keys()) - valid_fields
     if extra_keys:
-        logger.warning("Ignoring unknown top-level config keys: %s", extra_keys)
+        print_rank(logger.warning, f"Ignoring unknown top-level config keys: {extra_keys}")
     filtered_raw = {k: v for k, v in raw.items() if k in valid_fields}
 
     return FSDPTurboConfig(

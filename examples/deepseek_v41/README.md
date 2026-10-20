@@ -6,7 +6,7 @@ DeepSeek-V4-Flash 示例。
 
 官方模型仓库当前只发布了 `inference/model.py` 参考实现，没有发布可训练的
 Transformers `deepseek_v41` 建模模块。所需参考源码已固定复制到
-`fsdp_turbo/models/deepseek_v41/`：
+`fsdp_turbo/models/deepseek/deepseek_v41/`：
 
 - `inference/model.py`
 - `inference/engram.py`
@@ -14,11 +14,31 @@ Transformers `deepseek_v41` 建模模块。所需参考源码已固定复制到
 - `inference/image_processor.py`
 
 源码对应 revision `dba1be0a40aa45a94ad051997016db3960a90277`，运行示例时不再
-动态下载或加载模型 Python 文件。模型结构配置和 tokenizer 均从
-`model_name_or_path` 读取。
+动态下载或加载模型 Python 文件。模型结构优先读取 `model.config_path`，未设置时读取
+`model.model_name_or_path/config.json`；tokenizer 从 `model.tokenizer_name_or_path` 读取。
 
-`fsdp_turbo.models.deepseek_v41` 会关闭参考实现自身的 inference tensor parallel，
-通过 FSDPTurbo `ops/` 语义层分发可反向传播的 attention/mHC 算子（含 CPU 兜底和
+语言模型适配代码按职责拆分在同一模型目录内：
+
+| 文件 | 职责 |
+|---|---|
+| `model_args.py` | `ModelArgs` 模型结构参数 |
+| `layers.py` | 基础层、词表输出头、MoE 和 MHC 解码层 |
+| `engram/engram.py` | Engram 残差模块、哈希布局和 n-gram 哈希状态 |
+| `engram/host_offload_engram.py` | `HostOffloadEngram`（ElasticBuffer）与 `TorchHostOffloadEngram`（PyTorch）存储后端 |
+| `engram/engram_optimizer.py` | 稠密与稀疏优化器编排、活跃行 Adam、调度器及 checkpoint 工具 |
+| `runtime.py` | 跨层注意力缓存 |
+| `utils.py` | 模型内共用的序列边界、RoPE 频率拼接和临时 dtype 工具 |
+| `compressor.py` | KV 压缩投影与池化 |
+| `indexer.py` | 稀疏索引与候选块选择 |
+| `attention.py` | 滑动窗口和压缩稀疏注意力 |
+| `dspark.py` | DSpark 推测解码组件与采样 |
+| `model.py` | Transformer 装配、前向及原有类和函数的兼容导出 |
+
+组件导入统一使用 `from fsdp_turbo.models.deepseek.deepseek_v41.model import ...`。
+拆分不改变参数名称与 checkpoint 路径；各组件共用 `runtime.py` 的跨层注意力缓存。`attention_mask`、`sfa_layout` 和 `cu_seqlens` 通过前向参数显式传递，不再依赖全局上下文。
+
+`fsdp_turbo.models.deepseek.deepseek_v41` 已移除参考实现自身的 inference tensor parallel 分支及
+对应的 `world_size`、`rank` 全局状态，通过 FSDPTurbo `ops/` 语义层分发可反向传播的 attention/mHC 算子（含 CPU 兜底和
 NPU 实现），并提供图文 causal-LM loss 接口。模型专用 processor 按官方协议生成
 `images` 和 `token_types`，视觉塔与语言模型可联合反向。训练并行由 FSDPTurbo 统一
 管理：共享专家 SwiGLU 使用 TP，打包后的路由专家使用 EP，其余模块使用 FSDP2。
@@ -48,10 +68,16 @@ FP32，参数存储和优化器配置不变。该模式要求 NPU 及支持上�
 在 CPU/CUDA 或接口缺失时明确报错。HF32 同样存在精度差异，需要在目标设备上验证训练表现。
 接口语义参见[昇腾文档](https://www.hiascend.com/document/detail/zh/Pytorch/latest/apiref/customapi/docs/zh/custom_APIs/torch_npu-npu/torch_npu-npu-matmul-cubeMathType.md)。
 
-当前示例直接从 `fsdp_turbo/models/deepseek_v41/config.json` 读取训练模型参数。该文件配置
-4 个语言层、KV source 层 1/2、index source 层 1/2/3 和 Engram 层 1，覆盖
-DeepSeek-V4.1 的 CSA2、稀疏索引和 Engram 结构。它不读取官方发布的 FP8/FP4 权重；
-模型参数以 BF16 随机初始化。
+模型结构参数优先从 `model.config_path` 指定的 JSON 文件读取；未设置时读取
+`model.model_name_or_path/config.json`。选中的文件不存在时直接报错，不回退到仓库内置配置。
+`config_path` 是文件路径，`model_name_or_path` 是目录路径；相对路径按进程工作目录解析。
+该入口不读取官方发布的 FP8/FP4 权重，模型参数仍以 BF16 随机初始化。
+
+```yaml
+model:
+  model_name_or_path: /path/to/DeepSeek-V4.1-Flash
+  config_path: /path/to/custom_model_config.json  # 可省略，优先于模型目录中的 config.json
+```
 
 TND 示例配置使用 `data.dataset_path` 指向 packed JSONL 数据集；每条记录的
 `documents` 包含一个或多个已预处理文档。准备好 `messages + images` 格式的
@@ -73,6 +99,7 @@ JSONL 后，用本目录的 `pack_deepseek_v41_tnd.py` 打包。图像路径应�
 ```bash
 python examples/deepseek_v41/generate_mock_data_for_vlmodel.py \
   --tokenizer_path /path/to/DeepSeek-V4.1-Flash \
+  --model_name_or_path /path/to/DeepSeek-V4.1-Flash \
   --pic_width 512 --pic_height 512 --num_pics 2 \
   --text_length 1024 \
   --num_samples 512 --save_dir ./data/mocked_v41
@@ -135,6 +162,7 @@ python examples/deepseek_v41/pack_deepseek_v41_tnd.py \
   --input /path/to/normalized.jsonl \
   --output /path/to/packed.jsonl \
   --tokenizer examples/deepseekv4/tokenizer \
+  --model-name-or-path /path/to/DeepSeek-V4.1-Flash \
   --max-seq-length 1024
 
 # TND 配置默认使用 ./data/packed.jsonl；可在启动时传入实际数据路径。
@@ -271,8 +299,9 @@ model:
   engram_storage_backend: elastic_buffer
 ```
 
-训练入口从仓库内置的 `fsdp_turbo/models/deepseek_v41/config.json` 读取模型结构配置；
-`model.model_name_or_path` 不再用于解析模型结构。
+训练、数据生成和 TND 打包应使用同一份模型结构 JSON。训练 YAML 设置 `model.config_path`，
+数据生成脚本使用 `--config_path`，打包脚本使用 `--config-path`；未设置时分别从其
+`model_name_or_path` / `--model_name_or_path` / `--model-name-or-path` 目录读取 `config.json`。
 
 两个 Host 后端都会根据模型的 batch、序列长度和 N-gram 列数自动计算每 rank 的最大 token
 容量，并固定使用 pinned host memory。物理行数向上对齐到 2048，以便沿 EP 等分；补齐行
