@@ -4,11 +4,11 @@ from typing import Optional
 
 import torch
 
+from fsdp_turbo.distributed.expert_parallel.dispatcher_mx import MXExpertParallelForward
 from fsdp_turbo.ops.quantize import (
     dynamic_mx_quant,
     dynamic_mx_quant_with_dual_axis,
     mx_grouped_matmul,
-    swiglu,
     mx_to_block_mx_quant,
 )
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
@@ -161,14 +161,18 @@ def _mx_gmm_transform(module: torch.nn.Module, config: MXFP8LinearConfig):
     return MXFP8GMM.from_float(module, config=config)
 
 
-class MXFP8GMM(torch.nn.Module):
+class MXFP8GMM(MXExpertParallelForward, torch.nn.Module):
     """FP8-quantized MoE expert module that replaces a standard expert block.
 
-    Supports two modes:
-    - forward(): Full MoE pipeline (permute + quant GMM + swiglu + quant GMM + unpermute)
+    Supports three modes:
+    - forward(): Full MoE pipeline (permute + quant GMM + activation + quant GMM + unpermute).
       Used when EP is disabled.
-    - ep_forward(): Per-expert FP8 GMM computation only (no permute/unpermute).
-      Used when EP dispatcher handles token routing.
+    - ep_forward(): Per-expert FP8 GMM only (no permute/unpermute).
+      Used when an external EP dispatcher handles token routing.
+    - ep_forward_fused() / ep_forward_eager(): Full EP pipeline (AllToAll dispatch +
+      quant GMM + activation + quant GMM + AllToAll combine). Invoked by the
+      custom_ep_forward_fused / custom_ep_forward_eager EP dispatcher. SiTU activation
+      is handled correctly via _apply_activation when _is_situ is set by from_float.
     """
 
     def __init__(
@@ -245,7 +249,7 @@ class MXFP8GMM(torch.nn.Module):
             weight_attr="gate_up_proj",
         )
 
-        fc1_activation = swiglu(fc1_output, dim=-1)
+        fc1_activation = self._apply_activation(fc1_output)
 
         fc2_out = mx_quant_group_gemm(
             x=fc1_activation,
@@ -279,9 +283,12 @@ class MXFP8GMM(torch.nn.Module):
 
         quant_config = getattr(self, '_quant_config', None) or self.config
 
+        gate_up_w = self._get_local_weight_ep(self.gate_up_proj)
+        down_w = self._get_local_weight_ep(self.down_proj)
+
         fc1_output = mx_quant_group_gemm(
             x=hidden_states,
-            weight=self.gate_up_proj,
+            weight=gate_up_w,
             group_list=group_list_cumsum,
             config=quant_config,
             grad_enabled=torch.is_grad_enabled(),
@@ -289,11 +296,11 @@ class MXFP8GMM(torch.nn.Module):
             weight_attr="gate_up_proj",
         )
 
-        fc1_activation = swiglu(fc1_output, dim=-1)
+        fc1_activation = self._apply_activation(fc1_output)
 
         fc2_out = mx_quant_group_gemm(
             x=fc1_activation,
-            weight=self.down_proj,
+            weight=down_w,
             group_list=group_list_cumsum,
             config=quant_config,
             grad_enabled=torch.is_grad_enabled(),
@@ -396,10 +403,14 @@ class MXFP8GMM(torch.nn.Module):
             )
 
             new_mod._name = name
+            model_config = getattr(mod, 'config', None)
+            new_mod._is_situ = model_config is not None and getattr(model_config, 'hidden_act', None) == 'situ'
             return new_mod
 
         # Non-low-precision path: just patch the class
         mod.__class__ = cls
         mod._quant_config = config
         mod._name = name
+        model_config = getattr(mod, 'config', None)
+        mod._is_situ = model_config is not None and getattr(model_config, 'hidden_act', None) == 'situ'
         return mod

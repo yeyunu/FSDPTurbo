@@ -1,4 +1,4 @@
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from unittest.mock import Mock, patch
 
 import pytest
@@ -8,6 +8,7 @@ import torch
 import fsdp_turbo.ops.cpu.mx_quant  # noqa: F401
 from fsdp_turbo.quantization.core.post_quant_weight import PostQuantWeight
 from fsdp_turbo.quantization.mx_formats.mx_gmm import (
+    MXFP8GMM,
     mx_quant_group_gemm,
     weight_quant_gmm,
 )
@@ -282,8 +283,6 @@ def test_mxfp8_gmm_propagates_owner_and_attr(entry):
     and the canonical attribute names (real quantization runs, only the
     kernel/swiglu/permute are mocked).
     """
-    from fsdp_turbo.quantization.mx_formats.mx_gmm import MXFP8GMM
-
     hidden, intermediate, num_experts = 64, 128, 2
     config = Mock()
     config.get_key_dtype.return_value = torch.float8_e4m3fn
@@ -313,7 +312,7 @@ def test_mxfp8_gmm_propagates_owner_and_attr(entry):
     with ExitStack() as stack:
         stack.enter_context(
             patch(
-                "fsdp_turbo.quantization.mx_formats.mx_gmm.swiglu",
+                "fsdp_turbo.distributed.expert_parallel.dispatcher_mx.swiglu",
                 return_value=fc2_input,
             )
         )
@@ -351,3 +350,276 @@ def test_mxfp8_gmm_propagates_owner_and_attr(entry):
     assert fc1.args[-1] == "gate_up_proj"
     assert fc2.args[-2] is module
     assert fc2.args[-1] == "down_proj"
+
+
+# ============================================================================
+# ep_forward_fused / ep_forward_eager tests
+# ============================================================================
+
+_DISPATCHER = 'fsdp_turbo.distributed.expert_parallel.dispatcher'
+_DISPATCHER_MX = 'fsdp_turbo.distributed.expert_parallel.dispatcher_mx'
+_MX_GMM = 'fsdp_turbo.quantization.mx_formats.mx_gmm'
+
+# Shape constants shared by all EP tests.
+_EP_EXPERTS = 2
+_EP_HIDDEN = 8
+_EP_INTER = 16
+_EP_TOKENS = 4
+
+
+def _make_ep_module(is_situ=False):
+    """Return an MXFP8GMM configured for EP dispatch unit tests.
+
+    No process group is needed; distributed calls are stubbed out by _ep_stubs.
+    act_fn for is_situ=True halves the last dimension, mimicking gate+up -> intermediate.
+    """
+    config = Mock()
+    config.get_key_dtype.return_value = torch.float8_e4m3fn
+    config.quant_format = 'E4M3'
+    act_fn = Mock(side_effect=lambda x: x[..., : x.shape[-1] // 2]) if is_situ else None
+    module = MXFP8GMM(
+        config=config,
+        num_experts=_EP_EXPERTS,
+        hidden_size=_EP_HIDDEN,
+        moe_intermediate_size=_EP_INTER,
+        act_fn=act_fn,
+    )
+    module.gate_up_proj = torch.nn.Parameter(torch.randn(_EP_EXPERTS * _EP_HIDDEN, _EP_INTER * 2, dtype=torch.bfloat16))
+    module.down_proj = torch.nn.Parameter(torch.randn(_EP_EXPERTS * _EP_INTER, _EP_HIDDEN, dtype=torch.bfloat16))
+    module._is_situ = is_situ
+    module._num_local_experts = _EP_EXPERTS
+    module.num_global_experts = _EP_EXPERTS
+    module.expert_ids_per_ep_rank = torch.zeros(_EP_EXPERTS, dtype=torch.int32)
+    return module
+
+
+@contextmanager
+def _ep_stubs(tokens_per_expert=None):
+    """Stub all distributed EP primitives and the FP8 GMM kernel.
+
+    Yields (alltoall_combine_mock, mx_quant_group_gemm_mock).
+
+    The GMM stub returns [total, 2*INTER] on the first call (gate-up) and
+    [total, HIDDEN] on the second call (down), matching the real shapes.
+    tokens_per_expert defaults to an even split across _EP_EXPERTS.
+    """
+    if tokens_per_expert is None:
+        tokens_per_expert = [_EP_TOKENS // _EP_EXPERTS] * _EP_EXPERTS
+    expert_token_counts = torch.tensor(tokens_per_expert, dtype=torch.int64)
+    total = int(expert_token_counts.sum())
+
+    indices = (expert_token_counts, torch.zeros(total, dtype=torch.int32))
+    split_sizes = (
+        torch.ones(_EP_EXPERTS, dtype=torch.int64),
+        torch.ones(_EP_EXPERTS, dtype=torch.int64),
+    )
+    dispatched = torch.zeros(total, _EP_HIDDEN, dtype=torch.bfloat16)
+    unpermute = (torch.arange(total), torch.arange(total))
+    combined = torch.zeros(_EP_TOKENS, _EP_HIDDEN, dtype=torch.bfloat16)
+
+    gmm_count = [0]
+
+    def _gmm_effect(x, weight, group_list, config, **kwargs):
+        call_index = gmm_count[0]
+        gmm_count[0] += 1
+        out_dim = _EP_INTER * 2 if call_index == 0 else _EP_HIDDEN
+        return torch.zeros(x.shape[0], out_dim, dtype=torch.bfloat16)
+
+    with ExitStack() as stack:
+        stack.enter_context(patch(f'{_DISPATCHER}.dispatch_preprocess', return_value=(indices, split_sizes)))
+        stack.enter_context(patch(f'{_DISPATCHER}.alltoall_dispatch', return_value=(dispatched, unpermute)))
+        combine_mock = stack.enter_context(patch(f'{_DISPATCHER}.alltoall_combine', return_value=combined))
+        gmm_mock = stack.enter_context(patch(f'{_MX_GMM}.mx_quant_group_gemm', side_effect=_gmm_effect))
+        yield combine_mock, gmm_mock
+
+
+def _ep_call(module, fused=True, fixed_router=False):
+    """Invoke ep_forward_fused or ep_forward_eager with dummy inputs."""
+    tokens = torch.zeros(_EP_TOKENS, _EP_HIDDEN, dtype=torch.bfloat16)
+    index = torch.zeros(_EP_TOKENS, dtype=torch.int32)
+    weights = torch.ones(_EP_TOKENS, dtype=torch.float32)
+    fn = module.ep_forward_fused if fused else module.ep_forward_eager
+    return fn(tokens, index, weights, ep_group=Mock(), fixed_router=fixed_router)
+
+
+# -- delegation to _ep_forward -----------------------------------------------
+
+
+def test_ep_forward_fused_delegates_with_fused_true():
+    """ep_forward_fused must call _ep_forward(..., fused=True)."""
+    module = _make_ep_module()
+    module._ep_forward = Mock(return_value=torch.zeros(_EP_TOKENS, _EP_HIDDEN, dtype=torch.bfloat16))
+    _ep_call(module, fused=True)
+    assert module._ep_forward.call_args.kwargs['fused'] is True
+
+
+def test_ep_forward_eager_delegates_with_fused_false():
+    """ep_forward_eager must call _ep_forward(..., fused=False)."""
+    module = _make_ep_module()
+    module._ep_forward = Mock(return_value=torch.zeros(_EP_TOKENS, _EP_HIDDEN, dtype=torch.bfloat16))
+    _ep_call(module, fused=False)
+    assert module._ep_forward.call_args.kwargs['fused'] is False
+
+
+# -- weight owner / attr wiring ----------------------------------------------
+
+
+def test_ep_forward_propagates_weight_owner_and_attr():
+    """Both GMMs in _ep_forward must carry the module as weight_owner
+    and use the canonical attribute names 'gate_up_proj' / 'down_proj'.
+    """
+    module = _make_ep_module()
+    with _ep_stubs() as (_combine, gmm):
+        _ep_call(module)
+
+    assert gmm.call_count == 2
+    fc1, fc2 = gmm.call_args_list
+    assert fc1.kwargs['weight_owner'] is module
+    assert fc1.kwargs['weight_attr'] == 'gate_up_proj'
+    assert fc2.kwargs['weight_owner'] is module
+    assert fc2.kwargs['weight_attr'] == 'down_proj'
+
+
+def test_ep_forward_passes_local_shard_not_dtensor_to_gmm():
+    """_ep_forward must call _get_local_weight_ep on each parameter so that the
+    local DTensor shard (not the global DTensor) is passed to mx_quant_group_gemm.
+
+    With EP, parameters are distributed as DTensor (global shape [E, ...]).
+    Passing the global DTensor as the weight arg causes MxGroupedMatmulBackward
+    to return a local-shaped gradient [E/ep, ...] that is incompatible with the
+    DTensor's global shape [E, ...], crashing backward. _get_local_weight_ep strips
+    the DTensor; weight_owner/weight_attr handle gradient accumulation instead.
+    """
+    module = _make_ep_module()
+
+    sentinel_gate_up = torch.zeros(_EP_EXPERTS * _EP_HIDDEN, _EP_INTER * 2, dtype=torch.bfloat16)
+    sentinel_down = torch.zeros(_EP_EXPERTS * _EP_INTER, _EP_HIDDEN, dtype=torch.bfloat16)
+
+    call_count = [0]
+
+    def mock_local_weight(param):
+        call_index = call_count[0]
+        call_count[0] += 1
+        return sentinel_gate_up if call_index == 0 else sentinel_down
+
+    with _ep_stubs() as (_combine, gmm):
+        with patch(
+            f'{_DISPATCHER_MX}.swiglu',
+            return_value=torch.zeros(_EP_TOKENS, _EP_INTER, dtype=torch.bfloat16),
+        ):
+            with patch.object(module, '_get_local_weight_ep', side_effect=mock_local_weight):
+                _ep_call(module)
+
+    fc1, fc2 = gmm.call_args_list
+    assert fc1.kwargs['weight'] is sentinel_gate_up, (
+        "gate_up_proj must be replaced by its local shard (not the DTensor) before calling mx_quant_group_gemm"
+    )
+    assert fc2.kwargs['weight'] is sentinel_down, (
+        "down_proj must be replaced by its local shard (not the DTensor) before calling mx_quant_group_gemm"
+    )
+
+
+# -- activation dispatch -----------------------------------------------------
+
+
+def test_ep_forward_situ_applies_act_fn_to_full_gate_up_tensor():
+    """With _is_situ=True, _apply_activation must pass the full
+    [tokens, 2*intermediate] gate-up tensor to act_fn, not a gate-only split.
+    swiglu must not be called.
+    """
+    module = _make_ep_module(is_situ=True)
+    with _ep_stubs() as (_combine, _gmm):
+        with patch(f'{_DISPATCHER_MX}.swiglu') as swiglu_mock:
+            _ep_call(module)
+
+    assert module.act_fn.call_count == 1
+    act_input = module.act_fn.call_args.args[0]
+    assert act_input.shape[-1] == _EP_INTER * 2, (
+        f"act_fn received shape {act_input.shape}; expected last dim {_EP_INTER * 2} (full gate+up)"
+    )
+    swiglu_mock.assert_not_called()
+
+
+def test_ep_forward_non_situ_uses_swiglu():
+    """With _is_situ=False, _apply_activation must call swiglu (standard SiGLU)
+    and not invoke any act_fn.
+    """
+    module = _make_ep_module(is_situ=False)
+    with _ep_stubs() as (_combine, _gmm):
+        with patch(
+            f'{_DISPATCHER_MX}.swiglu',
+            return_value=torch.zeros(_EP_TOKENS, _EP_INTER, dtype=torch.bfloat16),
+        ) as swiglu_mock:
+            _ep_call(module)
+
+    swiglu_mock.assert_called_once()
+    assert module.act_fn is None
+
+
+# -- zero-token guard --------------------------------------------------------
+
+
+def test_ep_forward_zero_token_skips_gmm_and_preserves_output_shape():
+    """When alltoall_dispatch returns an empty tensor (no tokens on this EP rank),
+    mx_quant_group_gemm must not be called, and the final output must have the
+    same shape as the input.
+    """
+    module = _make_ep_module()
+    with _ep_stubs(tokens_per_expert=[0, 0]) as (_combine, gmm):
+        with patch(
+            f'{_DISPATCHER_MX}.swiglu',
+            return_value=torch.zeros(0, _EP_INTER, dtype=torch.bfloat16),
+        ):
+            result = _ep_call(module)
+
+    gmm.assert_not_called()
+    assert result.shape == (_EP_TOKENS, _EP_HIDDEN)
+
+
+# -- fused -> eager fallback -------------------------------------------------
+
+
+def test_ep_forward_fused_falls_back_to_eager_when_any_expert_has_zero_tokens():
+    """When any local expert receives zero tokens, _ep_forward must reset fused
+    to False before calling alltoall_dispatch and alltoall_combine, because the
+    fused permute kernel requires every expert to have at least one token.
+    """
+    module = _make_ep_module()
+
+    # Expert 0 gets 2 tokens, expert 1 gets 0 — triggers the .any() fallback.
+    expert_token_counts = torch.tensor([2, 0], dtype=torch.int64)
+    indices = (expert_token_counts, torch.zeros(2, dtype=torch.int32))
+    split_sizes = (
+        torch.ones(_EP_EXPERTS, dtype=torch.int64),
+        torch.ones(_EP_EXPERTS, dtype=torch.int64),
+    )
+    dispatched = torch.zeros(2, _EP_HIDDEN, dtype=torch.bfloat16)
+    unpermute = (torch.arange(2), torch.arange(2))
+    fused_seen = {}
+
+    def capture_dispatch(ep_group, hidden_states, top_k_index, local_indices, split_sizes_arg, fused):
+        fused_seen['dispatch'] = fused
+        return dispatched, unpermute
+
+    def capture_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes_arg, fused):
+        fused_seen['combine'] = fused
+        return torch.zeros(_EP_TOKENS, _EP_HIDDEN, dtype=torch.bfloat16)
+
+    gmm_count = [0]
+
+    def gmm_fn(x, weight, group_list, config, **kwargs):
+        call_index = gmm_count[0]
+        gmm_count[0] += 1
+        return torch.zeros(x.shape[0], _EP_INTER * 2 if call_index == 0 else _EP_HIDDEN, dtype=torch.bfloat16)
+
+    with ExitStack() as stack:
+        stack.enter_context(patch(f'{_DISPATCHER}.dispatch_preprocess', return_value=(indices, split_sizes)))
+        stack.enter_context(patch(f'{_DISPATCHER}.alltoall_dispatch', side_effect=capture_dispatch))
+        stack.enter_context(patch(f'{_DISPATCHER}.alltoall_combine', side_effect=capture_combine))
+        stack.enter_context(patch(f'{_MX_GMM}.mx_quant_group_gemm', side_effect=gmm_fn))
+        _ep_call(module, fused=True)
+
+    assert fused_seen['dispatch'] is False, (
+        "alltoall_dispatch should receive fused=False when any expert has zero tokens"
+    )
+    assert fused_seen['combine'] is False

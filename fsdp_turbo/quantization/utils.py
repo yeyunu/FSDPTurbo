@@ -151,11 +151,15 @@ def w8a16_module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) ->
 
 
 def moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
-    return "experts" in fqn.lower() and _apply_modules_match(fqn, config, 'mxfp8_apply_modules')
+    return "experts" in fqn.lower() and _apply_modules_match(
+        fqn, config, 'mxfp8_apply_modules', 'mxfp8_ignored_modules'
+    )
 
 
 def w8a16_moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
-    return "experts" in fqn.lower() and _apply_modules_match(fqn, config, 'w8a16_apply_modules')
+    return "experts" in fqn.lower() and _apply_modules_match(
+        fqn, config, 'w8a16_apply_modules', 'w8a16_ignored_modules'
+    )
 
 
 def view_as_n_dim(input_tensor, dim=2):
