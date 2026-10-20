@@ -7,7 +7,6 @@ from functools import lru_cache
 from importlib import import_module
 
 import torch
-import torch.nn.functional as F
 
 from fsdp_turbo.ops.registry import register_op
 
@@ -23,45 +22,55 @@ class _MhcOps:
 @lru_cache(maxsize=1)
 def _get_mhc_ops() -> _MhcOps:
     errors = []
+    operator_names = (
+        "mhc_pre_sinkhorn_premix",
+        "mhc_pre_sinkhorn_premix_backward",
+        "mhc_post",
+        "mhc_post_backward",
+    )
     for registration_package in (
         "cann_ops_transformer_customize",
         "cann_ops_transformer_custom",
+        "cann_ops_transformer",
     ):
         try:
             import_module(registration_package)
         except ImportError as error:
             errors.append(f"{registration_package}: {error!r}")
-
-    try:
-        ops = import_module("cann_ops_transformer.ops")
-        # Accessing the lazy exports registers the three formal operators.
-        getattr(ops, "mhc_pre_sinkhorn_backward")
-        getattr(ops, "mhc_post")
-        getattr(ops, "mhc_post_backward")
-    except (ImportError, AttributeError) as error:
-        errors.append(f"cann_ops_transformer.ops: {error!r}")
-
-    try:
-        # Full experimental builds expose this module even though it is not in
-        # the stable lazy-export table. A customize package may instead have
-        # registered the same torch operator while it was imported above.
-        import_module("cann_ops_transformer.ops.mhc.mhc_pre_sinkhorn_premix")
-    except ImportError as error:
-        errors.append(f"mhc_pre_sinkhorn_premix module: {error!r}")
+            continue
+        try:
+            ops = import_module(f"{registration_package}.ops")
+        except ImportError as error:
+            errors.append(f"{registration_package}.ops: {error!r}")
+            ops = None
+        for operator_name in operator_names:
+            try:
+                # Lazy exports and entry points register operators in the
+                # shared torch.ops.cann_ops_transformer namespace.
+                getattr(ops, operator_name)
+            except (ImportError, AttributeError) as error:
+                errors.append(f"{registration_package}.ops.{operator_name}: {error!r}")
+                module_name = f"{registration_package}.ops.mhc.{operator_name}"
+                try:
+                    # Experimental operators may be absent from lazy exports.
+                    import_module(module_name)
+                except ImportError as module_error:
+                    errors.append(f"{module_name}: {module_error!r}")
 
     try:
         namespace = torch.ops.cann_ops_transformer
         return _MhcOps(
             namespace.mhc_pre_sinkhorn_premix.default,
-            namespace.mhc_pre_sinkhorn_backward.default,
+            namespace.mhc_pre_sinkhorn_premix_backward.default,
             namespace.mhc_post.default,
             namespace.mhc_post_backward.default,
         )
     except AttributeError as error:
         raise RuntimeError(
             "use_fused_mhc=True requires mhc_pre_sinkhorn_premix, "
-            "mhc_pre_sinkhorn_backward, mhc_post and mhc_post_backward from "
-            "matching cann_ops_transformer packages. " + "; ".join(errors)
+            "mhc_pre_sinkhorn_premix_backward, mhc_post and mhc_post_backward from "
+            "matching cann_ops_transformer packages, including experimental premix "
+            "forward/backward operators (Ascend 950 requires PR #13280). " + "; ".join(errors)
         ) from error
 
 
@@ -115,11 +124,11 @@ class _MhcPreSinkhornPremixFunction(torch.autograd.Function):
             norm_out,
         )
         ctx.hc_eps = hc_eps
-        ctx.mark_non_differentiable(h_pre)
+        ctx.set_materialize_grads(False)
         return h_in, h_post, h_res, h_pre
 
     @staticmethod
-    def backward(ctx, grad_h_in, grad_h_post, grad_h_res, _grad_h_pre):
+    def backward(ctx, grad_h_in, grad_h_post, grad_h_res, grad_h_pre):
         (
             x,
             phi,
@@ -144,14 +153,16 @@ class _MhcPreSinkhornPremixFunction(torch.autograd.Function):
                 device=h_pre.device,
             )
 
-        # The formal backward assumes h_in used the internally calculated
-        # h_pre. With an external premix, h_in's direct gradients are handled
-        # below and only h_post/h_res gradients enter the formal backward.
-        formal_grad_h_in = torch.zeros_like(grad_h_in)
-        grad_x, grad_phi, grad_alpha, grad_bias = _get_mhc_ops().pre_backward(
-            formal_grad_h_in,
+        if grad_h_pre is None:
+            grad_h_pre = torch.zeros_like(h_pre)
+
+        # The premix backward handles both the external collapse weights and
+        # the cross-layer gradient of this call's h_pre. Its h_res contract is
+        # [B,S,N,N], while the raw forward returns [B,S,N*N].
+        grad_x, grad_phi, grad_alpha, grad_bias, grad_premix = _get_mhc_ops().pre_backward(
+            grad_h_in.contiguous(),
             grad_h_post.contiguous(),
-            grad_h_res.contiguous(),
+            grad_h_res.unflatten(-1, (h_pre.shape[-1], h_pre.shape[-1])).contiguous(),
             x,
             phi,
             alpha,
@@ -161,12 +172,10 @@ class _MhcPreSinkhornPremixFunction(torch.autograd.Function):
             inv_rms,
             sum_out,
             norm_out,
+            premix,
+            grad_h_pre.contiguous(),
             ctx.hc_eps,
         )
-        grad_h_in_fp32 = grad_h_in.unsqueeze(-2).float()
-        direct_grad_x = (grad_h_in_fp32 * premix.unsqueeze(-1)).to(x.dtype)
-        grad_x = grad_x + direct_grad_x
-        grad_premix = (grad_h_in_fp32 * x.float()).sum(dim=-1)
         return (
             grad_x,
             grad_phi,
@@ -217,12 +226,6 @@ def _validate_pre_inputs(
         raise ValueError("Fused MHC operators currently require hc_mult=4 and num_iters=20")
 
 
-def _supports_mhc_premix_autograd(x: torch.Tensor) -> bool:
-    device_name = torch.accelerator.get_device_name(x.device.index)
-    normalized_name = device_name.upper().replace("-", "").replace(" ", "")
-    return any(model in normalized_name for model in ("ASCEND910B", "ASCEND910C", "ASCEND910_93"))
-
-
 @register_op("fused_mhc_pre_sinkhorn_premix", "npu")
 def fused_mhc_pre_sinkhorn_premix(
     x: torch.Tensor,
@@ -246,38 +249,13 @@ def fused_mhc_pre_sinkhorn_premix(
         premix.float().contiguous(),
     )
 
-    if _supports_mhc_premix_autograd(x):
-        # Ascend 910B/910C and Atlas A3 provide the premix operator's
-        # registered autograd formula.
-        # Calling it directly preserves gradients from all four public outputs.
-        h_in, h_post, h_res, h_pre, *_ = _get_mhc_ops().pre(
-            *contiguous_inputs,
-            hc_mult,
-            num_iters,
-            hc_eps,
-            norm_eps,
-            True,
-        )
-        return h_in, h_post, h_res.unflatten(-1, (hc_mult, hc_mult)), h_pre
-
-    h_in, h_post, h_res, operator_h_pre = _MhcPreSinkhornPremixFunction.apply(
+    h_in, h_post, h_res, h_pre = _MhcPreSinkhornPremixFunction.apply(
         *contiguous_inputs,
         hc_mult,
         num_iters,
         hc_eps,
         norm_eps,
     )
-
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (x, phi, alpha, bias)):
-        flat_x = x.flatten(-2).float()
-        inv_rms = torch.rsqrt(flat_x.square().mean(dim=-1, keepdim=True) + norm_eps)
-        eager_h_pre = F.linear(flat_x, phi[:hc_mult].float()) * inv_rms
-        eager_h_pre = torch.sigmoid(eager_h_pre * alpha[0].float() + bias[:hc_mult].float()) + hc_eps
-        # Preserve the operator's forward values while routing the cross-layer
-        # h_pre gradient through the equivalent small eager projection.
-        h_pre = operator_h_pre + eager_h_pre - eager_h_pre.detach()
-    else:
-        h_pre = operator_h_pre
 
     return h_in, h_post, h_res.unflatten(-1, (hc_mult, hc_mult)), h_pre
 

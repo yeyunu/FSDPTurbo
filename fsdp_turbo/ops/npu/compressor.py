@@ -10,7 +10,10 @@ from fsdp_turbo.ops.registry import register_op
 
 def _get_compressor_op():
     try:
-        from cann_ops_transformer.ops.attention.compressor import compressor
+        # Respect the package's entry-point selection. Importing the standard
+        # implementation directly can register Autograd twice when a custom
+        # wheel already supplies compressor in the shared namespace.
+        from cann_ops_transformer.ops import compressor
     except (ImportError, AttributeError) as error:
         raise RuntimeError(
             "use_fused_compressor=True requires cann_ops_transformer with the "
