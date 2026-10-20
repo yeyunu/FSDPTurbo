@@ -9,6 +9,7 @@
     - [张量并行](./features/tensor_parallel.md)
     - [专家并行](./features/expert_parallel.md)
     - [上下文并行](./features/context_parallel.md)
+    - [词表并行](./features/vocab_parallel.md)
   - [内存优化特性]()
     - [激活重计算](./features/recompute.md)
     - [微批次切分](./features/chunk_batch.md)

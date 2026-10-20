@@ -580,6 +580,17 @@ class Qwen4ExpTextNGramEmbeddingCpu(Qwen4ExpTextNGramEmbedding):
         if ple_on_cpu:
             _save_ngram_dims(self, config)
             self.ngram_embedding = nn.Embedding(0, self.ngram_head_dim_per_ngram)
+        # Stash the config-derived head vocab sizes/offsets as plain Python
+        # lists: from_pretrained loads the checkpoint's buffer copies, which
+        # may reflect a different ngram_vocab_size_base
+        # (NGRAM_VOCAB_SIZE_BASE test override).  Tensor clones cannot be
+        # used — under low_cpu_mem_usage the buffers are still on the meta
+        # device at __init__ time.  restore_ngram_integer_buffers() rebuilds
+        # the buffers from these lists after loading.
+        self._ngram_config_values = {
+            "ngram_heads_vocab_sizes": list(self.head_vocab_sizes),
+            "ngram_heads_offsets": list(self.head_offsets),
+        }
 
 
 class Qwen4ExpTextPLELayer(HFQwen4ExpTextPLELayer):
@@ -1126,6 +1137,7 @@ def materialize_ngram_embedding_on_cpu(
     dtype: torch.dtype = torch.bfloat16,
     hf_dir: str | None = None,
     strict_weights: bool = False,
+    freeze: bool = True,
 ) -> None:
     """Materialize all CPU-resident ngram embedding tables of a Qwen4Exp model.
 
@@ -1134,6 +1146,10 @@ def materialize_ngram_embedding_on_cpu(
     shards are streamed from rank 0 and shared via /dev/shm mmap (page-cache
     shared, so world_size copies cost the same as one); otherwise all ranks
     generate identical random tables on rank 0 and share the same way.
+
+    When *freeze* is False (vocab-parallel mode), the table stays trainable:
+    it is materialized BEFORE ``FSDPTurbo`` so ``vocab_parallelize_modules``
+    can shard it onto the accelerator, and ``requires_grad`` is left on.
     """
     import torch.distributed as dist
 
@@ -1162,7 +1178,8 @@ def materialize_ngram_embedding_on_cpu(
         if use_real:
             if is_dist and local_rank != 0:
                 _share_ngram_table(module, group)
-                module.ngram_embedding.weight.requires_grad_(False)
+                if freeze:
+                    module.ngram_embedding.weight.requires_grad_(False)
                 continue
             print_rank(
                 logger.info,
@@ -1181,7 +1198,8 @@ def materialize_ngram_embedding_on_cpu(
             _materialize_on_cpu(module, dtype=dtype)
             if is_dist:
                 _share_ngram_table(module, group)
-        module.ngram_embedding.weight.requires_grad_(False)
+        if freeze:
+            module.ngram_embedding.weight.requires_grad_(False)
 
 
 def _materialize_on_cpu(module, dtype=torch.bfloat16, by_file=None, hf_dir=None):
@@ -1219,10 +1237,14 @@ def _load_shards_by_file(module, by_file, dtype, hf_dir):
                 if tensor.dtype != dtype:
                     tensor = tensor.to(dtype)
                 dst_start = shard_id * rows_per_shard
-                dst_end = (shard_id + 1) * rows_per_shard
                 if dst_start >= rows:
                     continue
-                weight[dst_start:dst_end] = tensor[: rows - dst_start]
+                # Take exactly this shard's destination window: with a shrunk
+                # table (NGRAM_VOCAB_SIZE_BASE) the on-disk shard is LARGER
+                # than rows_per_shard, and slicing beyond its end would clamp
+                # to the full shard and break the assignment shape.
+                take = min(rows_per_shard, rows - dst_start)
+                weight[dst_start : dst_start + take] = tensor[:take]
     return weight
 
 
@@ -1245,7 +1267,7 @@ _NGRAM_INT_BUFFERS = ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_hea
 
 
 def restore_ngram_integer_buffers(model: nn.Module) -> None:
-    """Restore ``torch.long`` dtype on PLE n-gram embedding integer buffers.
+    """Restore ``torch.long`` dtype AND config-derived values on PLE buffers.
 
     ``from_pretrained(torch_dtype=...)`` and ``convert_model_dtype`` cast *all*
     parameters and buffers to the target float dtype.  The PLE hashing buffers
@@ -1255,15 +1277,28 @@ def restore_ngram_integer_buffers(model: nn.Module) -> None:
     integer dtypes, so leaving them cast to bfloat16 raises a RuntimeError at
     training time.
 
+    Additionally, the checkpoint may carry buffer values computed for a
+    DIFFERENT ``ngram_vocab_size_base`` (e.g. the full-size table while the
+    model was built with the NGRAM_VOCAB_SIZE_BASE test override).  Loaded
+    verbatim, hashed ids would exceed the (shrunk) table and break VP owner
+    routing.  The values stashed at ``__init__`` time are deterministic
+    functions of the current config, so they are always restored.
+
     Call after ``convert_model_dtype`` (or ``from_pretrained`` with
     ``torch_dtype``) to undo the unwanted cast on these specific buffers.
     """
     for module in model.modules():
         if not isinstance(module, Qwen4ExpTextNGramEmbedding):
             continue
+        shadow = getattr(module, "_ngram_config_values", None)
         for name in _NGRAM_INT_BUFFERS:
             buf = getattr(module, name, None)
-            if buf is not None and buf.dtype != torch.long:
+            if buf is None:
+                continue
+            values = shadow.get(name) if shadow else None
+            if values is not None:
+                buf.data = torch.tensor(values, dtype=torch.long, device=buf.device)
+            elif buf.dtype != torch.long:
                 buf.data = buf.data.to(torch.long)
 
 

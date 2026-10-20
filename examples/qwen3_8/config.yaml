@@ -92,20 +92,26 @@ distributed:
   expert_fully_shard_parallel_size: 1
   expert_data_parallel_size: 1
 
-  # VP/VFSDP for huge PLE n-gram embedding (~51B params fp32, 128 shards)
-  # When ple_embedding_on_cpu=true (default), VP is NOT needed — the table
-  # stays on CPU (frozen). Enable VP only if you want the table on GPU.
-  # vocab_parallel_size: 16
-  # vocab_fully_shard_parallel_size: 1
-  # vocab_data_parallel_size: 1
-  # vp_plan:
-  #   apply_modules:
-  #     - model.language_model.layers.1.ple.ple_embedding
+  # VP/VFSDP for the huge PLE n-gram embedding (~51B params bf16).
+  # VP shards the table's vocab dim across ranks and routes lookups with an
+  # all-to-all dispatcher, keeping the table ON DEVICE and TRAINABLE
+  # Remove this whole section (vocab_* sizes and vp_plan) to fall back
+  # to the frozen CPU-offload path (vp_plan requires vocab_parallel_size > 1).
+  # Full-size table: ~12.8GB param + optimizer states per rank at vp=8
+  # shrink with NGRAM_VOCAB_SIZE_BASE for functional tests (see run.sh).
+  vocab_parallel_size: 8
+  vocab_fully_shard_parallel_size: 1
+  vocab_data_parallel_size: 1
+  vp_plan:
+    apply_modules:
+      - model.language_model.layers.{*}.ple.ple_embedding.ngram_embedding
 
   # --- FSDP Plan ---
   fsdp_plan:
     ignored_modules:
-      - model.language_model.layers.1.ple.ple_embedding   # PLE on CPU, excluded from FSDP
+      # PLE table excluded from FSDP: frozen on CPU (VP off) or VP-sharded
+      # on device and managed by vp_plan (VP on).
+      - model.language_model.layers.1.ple.ple_embedding
     apply_modules:
       model.visual:
         {}

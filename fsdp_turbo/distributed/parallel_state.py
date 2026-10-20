@@ -4,6 +4,7 @@ import types
 import logging
 from dataclasses import dataclass, asdict, fields
 from functools import reduce
+from typing import Optional
 
 import torch
 from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
@@ -54,6 +55,10 @@ class ParallelState(metaclass=Singleton):
     expert_fully_shard_parallel_size: int = 1
     expert_data_parallel_size: int = 1
 
+    vocab_parallel_size: int = 1
+    vocab_fully_shard_parallel_size: Optional[int] = None
+    vocab_data_parallel_size: int = 1
+
     device_mesh_map: dict[str, DeviceMesh] = None
 
     def __post_init__(self):
@@ -76,6 +81,17 @@ class ParallelState(metaclass=Singleton):
         self.expert_data_parallel_size = self._create_mesh(
             ('edp', 'efsdp', 'ep'),
             (self.expert_fully_shard_parallel_size, self.expert_parallel_size),
+        )
+
+        # create VDP/VFSDP/VP groups — vocabulary weights use an independent
+        # mesh so VP can coexist with EP.
+        if self.vocab_fully_shard_parallel_size is None:
+            self.vocab_fully_shard_parallel_size = get_last_mesh_dim(
+                (self.vocab_data_parallel_size, self.vocab_parallel_size)
+            )
+        self.vocab_data_parallel_size = self._create_mesh(
+            ('vdp', 'vfsdp', 'vp'),
+            (self.vocab_fully_shard_parallel_size, self.vocab_parallel_size),
         )
 
         if self.kcp_parallel_size > 1 and self.ulysses_parallel_size > 1:
@@ -103,6 +119,7 @@ class ParallelState(metaclass=Singleton):
         # 1, so FSDP2 takes the pure FSDP path and avoids HSDP's extra memory.
         self.add_sub_device_mesh(('dp', 'fsdp'), 'dp_fsdp', flatten=self.data_parallel_size == 1)
         self.add_sub_device_mesh(('edp', 'efsdp'), 'edp_efsdp', flatten=self.expert_data_parallel_size == 1)
+        self.add_sub_device_mesh(('vdp', 'vfsdp'), 'vdp_vfsdp', flatten=self.vocab_data_parallel_size == 1)
 
         print_rank(logger.info, f'Parallel state initialized:\n{self.__str__()}')
 

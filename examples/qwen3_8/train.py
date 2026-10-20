@@ -58,14 +58,22 @@ def _overwrite_qwen4_exp_config(model_config, config):
     text_cfg._experts_implementation = "eager"
     model_config._experts_implementation = "eager"
 
-    # PLE n-gram embedding CPU offload (MindSpeed-MM d776088a8)
-    # When VP is disabled, keep the ~51B param ngram table on CPU (frozen)
-    ple_on_cpu = getattr(config.distributed, "vocab_parallel_size", 1) == 1
-    if ple_on_cpu:
-        text_cfg.ple_embedding_on_cpu = True
-        text_cfg._ngram_hf_dir = config.model.model_name_or_path
-    else:
-        text_cfg.ple_embedding_on_cpu = False
+    # PLE n-gram embedding: the CPU-offload variant
+    # __init__ always builds a zero-size table so from_pretrained stays cheap;
+    # the full table is materialized on host afterwards.
+    #   - VP off: materialized AFTER FSDPTurbo, frozen, stays on CPU.
+    #   - VP on:  materialized BEFORE FSDPTurbo (trainable) so
+    #     vocab_parallelize_modules can shard it onto the accelerator.
+    text_cfg.ple_embedding_on_cpu = True
+    text_cfg._ngram_hf_dir = config.model.model_name_or_path
+
+    # Shrink the PLE n-gram table for functional tests. The checkpoint shards
+    # are then truncated deterministically.
+    ngram_vocab_size_base = os.environ.get("NGRAM_VOCAB_SIZE_BASE", "").strip()
+    if ngram_vocab_size_base:
+        text_cfg.ngram_vocab_size_base = int(ngram_vocab_size_base)
+        if text_cfg.ngram_vocab_size_base <= 0:
+            raise ValueError(f"Invalid NGRAM_VOCAB_SIZE_BASE='{ngram_vocab_size_base}'.")
 
     text_cfg.enable_chunk_loss = getattr(config.memory, "chunk_batch", False)
     text_cfg.enable_dynamic_chunk_loss = False
@@ -74,7 +82,7 @@ def _overwrite_qwen4_exp_config(model_config, config):
     text_cfg.max_dup_experts_num = 2
 
     # MTP (Multi-Token Prediction) — number of MTP layers to train.
-    # 0 disables MTP. Mirrors MindSpeed-MM 2b4ed9cdc overwrite_transformer_config.
+    # 0 disables MTP.
     text_cfg.mtp_num_layers = getattr(config.model, "mtp_num_layers", 0)
     if text_cfg.mtp_num_layers and text_cfg.mtp_num_layers < 0:
         raise ValueError(f"Invalid mtp_num_layers='{text_cfg.mtp_num_layers}'. Must be a non-negative integer.")
@@ -177,13 +185,29 @@ class Qwen38FlashNextTrainer(BaseTrainer):
 
         _fsp.get_fsdp_modules = _get_fsdp_modules_post_order
         try:
+            vp_enabled = self.config.distributed.vp_plan is not None
+            if vp_enabled:
+                # VP mode: materialize the trainable table on host BEFORE
+                # FSDPTurbo — apply_vp_modules shards it onto the accelerator
+                # (only this rank's slice is ever moved to the device).
+                from fsdp_turbo.models.qwen.modeling_qwen4_exp import (
+                    materialize_ngram_embedding_on_cpu,
+                )
+
+                materialize_ngram_embedding_on_cpu(
+                    model,
+                    dtype=torch.bfloat16,
+                    hf_dir=self.config.model.model_name_or_path,
+                    freeze=False,
+                )
             model = FSDPTurbo(self.config, model)
         finally:
             _fsp.get_fsdp_modules = _orig_get_fsdp_modules
 
-        # Materialize PLE tables on CPU *after* FSDPTurbo so model weights
-        # are already on device and CPU RAM is freed for the huge n-gram table.
-        if getattr(model_config.text_config, "ple_embedding_on_cpu", False):
+        # VP off (CPU offload): materialize the frozen PLE tables on CPU
+        # *after* FSDPTurbo so model weights are already on device and CPU
+        # RAM is freed for the huge n-gram table.
+        if getattr(model_config.text_config, "ple_embedding_on_cpu", False) and not vp_enabled:
             from fsdp_turbo.models.qwen.modeling_qwen4_exp import (
                 materialize_ngram_embedding_on_cpu,
             )
@@ -192,6 +216,7 @@ class Qwen38FlashNextTrainer(BaseTrainer):
                 model,
                 dtype=torch.bfloat16,
                 hf_dir=self.config.model.model_name_or_path,
+                freeze=True,
             )
 
         print_rank(logger.info, "> Model built successfully")

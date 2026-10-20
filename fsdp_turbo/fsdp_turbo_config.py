@@ -199,6 +199,23 @@ class EPPlanConfig:
 
 
 @dataclass
+class VPPlanConfig:
+    """Configuration for vocabulary-parallel embedding modules.
+
+    A ``[vocab, dim]`` embedding weight is sharded along the vocab dim
+    (``Shard(0)``) over the ``vp`` mesh and the module forward is replaced
+    with an all-to-all dispatcher.
+    """
+
+    apply_modules: List[str] = None
+    apply_vfsdp_modules: List[str] = None
+    # Gradient divide factor for the return all-to-all. When unset (None) it
+    # defaults to world size, matching the FSDP gradient averaging applied to
+    # dense parameters.
+    gradient_divide_factor: Optional[float] = None
+
+
+@dataclass
 class QuantizeConfig:
     quant_format: Optional[str] = None
     quant_recipe: Optional[str] = None
@@ -234,6 +251,16 @@ class DistributedConfig:
     expert_fully_shard_parallel_size: int = 1
     expert_data_parallel_size: int = 1
     ep_plan: EPPlanConfig = None
+
+    # VP/VFSDP for huge embedding tables (e.g. the qwen4_exp PLE n-gram table).
+    # vocab_data_parallel_size * vocab_fully_shard_parallel_size *
+    # vocab_parallel_size must equal world size. When
+    # vocab_fully_shard_parallel_size is None it is auto-computed as
+    # world_size // (vocab_parallel_size * vocab_data_parallel_size).
+    vocab_parallel_size: int = 1
+    vocab_fully_shard_parallel_size: Optional[int] = None
+    vocab_data_parallel_size: int = 1
+    vp_plan: VPPlanConfig = None
 
 
 @dataclass
@@ -329,6 +356,7 @@ class FSDPTurboConfig:
         self.validate_swap_activation_config()
         self.validate_quantization_config()
         self.validate_fsdp_config()
+        self.validate_vp_config()
         self.validate_memory_snapshot_config()
 
     def validate_model_config(self):
@@ -558,6 +586,61 @@ class FSDPTurboConfig:
             for ep_module in self.distributed.ep_plan.apply_modules:
                 if ep_module.endswith(".experts"):
                     self.distributed.ep_plan.apply_efsdp_modules.append(ep_module)
+
+    def validate_vp_config(self):
+        """vocab parallelize plan
+
+        config = FSDPTurboConfig(
+            distributed=DistributedConfig(
+                vp_plan=VPPlanConfig(
+                    apply_modules: ['model.language_model.layers.{*}.ple.ple_embedding.ngram_embedding']
+                )
+            )
+        )
+        """
+        vp_plan = self.distributed.vp_plan
+        if vp_plan is None:
+            return
+        if self.distributed.vocab_parallel_size <= 1:
+            raise ValueError(
+                "distributed.vp_plan requires distributed.vocab_parallel_size > 1; "
+                "remove vp_plan to use the frozen CPU-offload path."
+            )
+        if not vp_plan.apply_modules:
+            raise ValueError("distributed.vp_plan.apply_modules must not be empty when vp_plan is set.")
+        if vp_plan.apply_vfsdp_modules is None:
+            vp_plan.apply_vfsdp_modules = vp_plan.apply_modules
+        if vp_plan.gradient_divide_factor is None:
+            # Match the FSDP gradient averaging applied to dense parameters:
+            # the raw VP table gradient is a sum over all vp ranks' tokens.
+            # torchrun sets WORLD_SIZE; fall back to 1 for non-distributed runs.
+            vp_plan.gradient_divide_factor = float(int(os.environ.get("WORLD_SIZE", "1")))
+        if vp_plan.gradient_divide_factor <= 0:
+            raise ValueError("distributed.vp_plan.gradient_divide_factor must be positive.")
+        if self.distributed.vocab_fully_shard_parallel_size is None:
+            # torchrun sets WORLD_SIZE; fall back to 1 for non-distributed runs.
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+            self.distributed.vocab_fully_shard_parallel_size = world_size // (
+                self.distributed.vocab_data_parallel_size * self.distributed.vocab_parallel_size
+            )
+
+        fsdp_plan = self.distributed.fsdp_plan
+        # V-FSDP patterns are managed by VP / V-FSDP instead of the FSDP plan
+        # (apply_modules is a pattern -> plan dict).
+        fsdp_plan.apply_modules = {
+            pattern: module_plan
+            for pattern, module_plan in (fsdp_plan.apply_modules or {}).items()
+            if pattern not in vp_plan.apply_vfsdp_modules
+        }
+        # With singleton V-FSDP (vdp * vfsdp == 1) the pure-VP parameters must
+        # stay outside ancestor FSDP units; otherwise fully_shard takes
+        # ownership of them.
+        if self.distributed.vocab_data_parallel_size * self.distributed.vocab_fully_shard_parallel_size == 1:
+            if fsdp_plan.ignored_modules is None:
+                fsdp_plan.ignored_modules = []
+            for pattern in vp_plan.apply_vfsdp_modules:
+                if pattern not in fsdp_plan.ignored_modules:
+                    fsdp_plan.ignored_modules.append(pattern)
 
     def validate_engram_config(self):
         """Validate parallel topology required by Host-offload Engram."""
@@ -855,11 +938,13 @@ def load_config_from_yaml(yaml_path):
         tp_plan_raw = distributed_raw.pop("tp_plan", None)
         ep_plan_raw = distributed_raw.pop("ep_plan", None)
         cp_plan_raw = distributed_raw.pop("cp_plan", None)
+        vp_plan_raw = distributed_raw.pop("vp_plan", None)
 
         fsdp_plan = _dict_to_dataclass(FSDPPlanConfig, fsdp_plan_raw) if fsdp_plan_raw is not None else None
         tp_plan = _dict_to_dataclass(TPPlanConfig, tp_plan_raw) if tp_plan_raw is not None else None
         ep_plan = _dict_to_dataclass(EPPlanConfig, ep_plan_raw) if ep_plan_raw is not None else None
         cp_plan = _dict_to_dataclass(CPPlanConfig, cp_plan_raw) if cp_plan_raw is not None else None
+        vp_plan = _dict_to_dataclass(VPPlanConfig, vp_plan_raw) if vp_plan_raw is not None else None
 
         distributed_valid_fields = {f.name for f in fields(DistributedConfig)}
         extra_keys = set(distributed_raw.keys()) - distributed_valid_fields
@@ -872,6 +957,7 @@ def load_config_from_yaml(yaml_path):
             tp_plan=tp_plan,
             ep_plan=ep_plan,
             cp_plan=cp_plan,
+            vp_plan=vp_plan,
             **filtered_distributed_raw,
         )
     else:

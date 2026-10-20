@@ -55,6 +55,7 @@ echo "  MASTER_ADDR: $MASTER_ADDR"
 echo "  MASTER_PORT: $MASTER_PORT"
 echo "  CONFIG: $CONFIG_FILE"
 echo "  NUM_HIDDEN_LAYERS: ${NUM_HIDDEN_LAYERS:-full (48)}"
+echo "  NGRAM_VOCAB_SIZE_BASE: ${NGRAM_VOCAB_SIZE_BASE:-full (20000000)}"
 echo "  MODEL: /mnt/weight/Qwen3.8-Flash-Next (336 GB bf16)"
 echo "============================================================"
 

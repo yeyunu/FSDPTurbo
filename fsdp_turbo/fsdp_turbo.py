@@ -27,6 +27,12 @@ from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.distributed.expert_parallel.expert_parallel import (
     expert_parallelize_modules,
 )
+from fsdp_turbo.distributed.vocab_parallel.vocab_parallel import (
+    vocab_parallelize_modules,
+)
+from fsdp_turbo.distributed.vocab_parallel.vocab_fully_shard_parallel import (
+    vocab_fully_shard_modules,
+)
 from fsdp_turbo.utils.patch import apply_module_patches
 
 
@@ -43,6 +49,7 @@ class FSDPTurbo(torch.nn.Module):
         self.apply_cp_modules()
         self.apply_module_patches()
         self.apply_ep_modules()
+        self.apply_vp_modules()
         self.apply_pre_fsdp_module_hooks()
         self.apply_recompute_modules()
         self.apply_swap_activation_modules()
@@ -124,6 +131,32 @@ class FSDPTurbo(torch.nn.Module):
                 self.config.distributed.fsdp_plan,
                 enable_lp_all_gather=self.config.quantization.quantization_plan.enable_fsdp_low_precision_all_gather,
             )
+
+    def apply_vp_modules(self):
+        """Apply vocabulary parallelism, then V-FSDP on top of the VP shard.
+
+        VP shards ``[vocab, dim]`` embedding weights along the vocab dim and
+        replaces their forward with the all-to-all dispatcher; V-FSDP then
+        optionally applies ``fully_shard`` on top.  Must run BEFORE
+        ``apply_fsdp_modules``: ``validate_vp_config`` has already removed the
+        V-FSDP patterns from the FSDP plan and, for singleton V-FSDP, added
+        them to its ignored_modules so the VP DTensor parameters stay outside
+        ancestor FSDP units.
+        """
+        vp_plan = self.config.distributed.vp_plan
+        if vp_plan is None:
+            return
+        self.model = vocab_parallelize_modules(
+            self.model,
+            self.parallel_state.get_vp_device_mesh(),
+            vp_plan,
+        )
+        self.model = vocab_fully_shard_modules(
+            self.model,
+            self.parallel_state.get_device_mesh("vdp_vfsdp"),
+            vp_plan,
+            self.config.distributed.fsdp_plan,
+        )
 
     def apply_module_patches(self):
         """Apply configured replacements before FSDP wraps the model.

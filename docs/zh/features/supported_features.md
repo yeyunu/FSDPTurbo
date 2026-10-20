@@ -12,7 +12,7 @@
   </thead>
   <tbody>
     <tr>
-      <td rowspan="4">并行特性</td>
+      <td rowspan="5">并行特性</td>
       <td><a href="./fully_shard_parallel.md">全分片数据并行</a></td>
       <td>基于PyTorch FSDP2，参数/梯度/优化器状态全分片，支持混合精度与预取</td>
     </tr>
@@ -27,6 +27,10 @@
     <tr>
       <td><a href="./context_parallel.md">上下文并行</a></td>
       <td>Ulysses上下文并行，支持长序列训练</td>
+    </tr>
+    <tr>
+      <td><a href="./vocab_parallel.md">词表并行</a></td>
+      <td>超大词表嵌入表按词表维切分（VP/V-FSDP），All-to-All查表，常驻设备且可训练</td>
     </tr>
     <tr>
       <td rowspan="7">内存优化特性</td>
