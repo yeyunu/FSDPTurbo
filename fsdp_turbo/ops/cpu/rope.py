@@ -22,3 +22,30 @@ def rope_torch(x, cos, sin, *, interleaved=False, inverse=False):
     else:
         output = torch.cat((real, imag), dim=-1)
     return output.to(x.dtype)
+
+
+@register_op("inplace_rope", "cpu")
+def inplace_rope_cpu(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    interleaved: bool = False,
+    inverse: bool = False,
+    inplace: bool = False,
+) -> torch.Tensor:
+    """Rotate the trailing block of a full [nope | rope] head; reference fallback."""
+    rotary_dim = 2 * cos.shape[-1]
+    rope_x = x[..., -rotary_dim:]
+    if cos.ndim == 2:
+        # rope_torch expects the broadcast shape produced by the `rope` wrapper.
+        coeff_shape = (1, cos.shape[0], *([1] if rope_x.ndim == 4 else []), cos.shape[-1])
+        cos = cos.reshape(coeff_shape)
+        sin = sin.reshape(coeff_shape)
+    rotated = rope_torch(rope_x, cos, sin, interleaved=interleaved, inverse=inverse)
+    if inplace:
+        x[..., -rotary_dim:] = rotated
+        return x
+    out = x.clone()
+    out[..., -rotary_dim:] = rotated
+    return out

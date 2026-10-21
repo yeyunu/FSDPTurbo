@@ -21,6 +21,9 @@ model:
   use_fused_compressor: true
   # Use CANN MhcPreSinkhornPremix/MhcPost training kernels.
   use_fused_mhc: true
+  # Use the triton in-place RoPE kernel (mindspeed_ops.api.triton.inplace_rope)
+  # over the trailing rotary block on NPU.
+  use_triton_inplace_rope: true
   # Use CANN FlashAttn/FlashAttnGrad for full bidirectional vision attention.
   use_fused_vision_flash_attn: true
 

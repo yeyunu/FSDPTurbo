@@ -10,7 +10,7 @@ from torch import nn
 from fsdp_turbo.ops.hf32_linear import hf32_linear
 from fsdp_turbo.ops.mhc import fused_mhc_post, fused_mhc_pre_sinkhorn_premix
 from fsdp_turbo.ops.rms_norm import rms_norm
-from fsdp_turbo.ops.rope import rope
+from fsdp_turbo.ops.rope import inplace_rope
 from fsdp_turbo.ops.sinkhorn import hc_split_sinkhorn
 
 from .activation import limited_swiglu, silu_mul
@@ -111,12 +111,26 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-    """Rotate `x` in place, taking adjacent element pairs as complex numbers. Accepts [b, s, d] and
-    [b, s, h, d]; `inverse` conjugates the rotation, which is how the attention output gets the
-    query's rotation removed again so the cache can stay in one shared rotated form.
+def apply_rotary_emb(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    inverse: bool = False,
+    *,
+    use_triton_inplace_rope: bool = False,
+) -> torch.Tensor:
+    """Rotate the trailing rotary block of `x` in place. Accepts [b, s, d] and [b, s, h, d];
+    `inverse` conjugates the rotation, which is how the attention output gets the query's rotation
+    removed again so the cache can stay in one shared rotated form.
     """
-    return rope(x, freqs_cis.real, freqs_cis.imag, interleaved=True, inverse=inverse, inplace=True)
+    return inplace_rope(
+        x,
+        freqs_cis.real,
+        freqs_cis.imag,
+        interleaved=True,
+        inverse=inverse,
+        inplace=True,
+        device_type="cpu" if not use_triton_inplace_rope else x.device.type,
+    )
 
 
 class ParallelHead(nn.Module):

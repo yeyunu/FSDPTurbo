@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+# pylint: disable=too-many-lines
 import logging
 import os
 from dataclasses import dataclass, field, fields
@@ -29,6 +30,9 @@ class ModelConfig:
     use_fused_compressor: bool = False
     use_fused_mhc: bool = False
     use_fused_clipped_swiglu: bool = False
+    # Use the triton in-place RoPE kernel (mindspeed_ops.api.triton.inplace_rope)
+    # over the trailing rotary block on NPU.
+    use_triton_inplace_rope: bool = False
     use_fused_vision_flash_attn: bool = False
     # DeepSeek-V4.1 head projection precision; cross entropy remains FP32.
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32"
@@ -370,6 +374,8 @@ class FSDPTurboConfig:
             raise ValueError("model.config_path must be a non-empty string when provided.")
         if not isinstance(self.model.use_fused_clipped_swiglu, bool):
             raise ValueError("model.use_fused_clipped_swiglu must be a boolean.")
+        if not isinstance(self.model.use_triton_inplace_rope, bool):
+            raise ValueError("model.use_triton_inplace_rope must be a boolean.")
         if self.model.head_compute_dtype not in ("fp32", "bf16", "hf32"):
             raise ValueError("model.head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
         if not isinstance(self.model.attn_implementation, str) or not self.model.attn_implementation:
@@ -872,8 +878,8 @@ def _coerce_value(value, field_type):
     if field_type is torch.dtype:
         try:
             return get_dtype(value)
-        except (ValueError, TypeError) as e:
-            print_rank(logger.warning, f"Cannot convert '{value}' to torch.dtype: {e}, keeping as str")
+        except (ValueError, TypeError) as error:
+            print_rank(logger.warning, f"Cannot convert '{value}' to torch.dtype: {error}, keeping as str")
             return value
 
     return value
@@ -886,26 +892,26 @@ def _dict_to_dataclass(cls, data):
         return data
     import dataclasses as dc
 
-    field_types = {f.name: f.type for f in dc.fields(cls)}
+    field_types = {field.name: field.type for field in dc.fields(cls)}
     kwargs = {}
     for key, value in data.items():
         if key not in field_types:
             print_rank(logger.warning, f"Ignoring unknown config key '{key}' for {cls.__name__}")
             continue
-        ft = field_types[key]
-        origin = getattr(ft, "__origin__", None)
+        field_type = field_types[key]
+        origin = getattr(field_type, "__origin__", None)
         optional_dataclass = None
         if origin is Union:
-            for arg in ft.__args__:
+            for arg in field_type.__args__:
                 if arg is not type(None) and dc.is_dataclass(arg):  # pylint: disable=unidiomatic-typecheck
                     optional_dataclass = arg
                     break
-        if dc.is_dataclass(ft) and isinstance(value, dict):
-            kwargs[key] = _dict_to_dataclass(ft, value)
+        if dc.is_dataclass(field_type) and isinstance(value, dict):
+            kwargs[key] = _dict_to_dataclass(field_type, value)
         elif optional_dataclass is not None and isinstance(value, dict):
             kwargs[key] = _dict_to_dataclass(optional_dataclass, value)
         else:
-            kwargs[key] = _coerce_value(value, ft)
+            kwargs[key] = _coerce_value(value, field_type)
     return cls(**kwargs)
 
 

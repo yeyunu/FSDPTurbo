@@ -15,7 +15,7 @@ from fsdp_turbo.ops.npu.mx_quant import (
 )
 from fsdp_turbo.ops.npu.permute import permute_npu, unpermute_npu
 from fsdp_turbo.ops.npu.rms_norm import rms_norm_npu
-from fsdp_turbo.ops.npu.rope import rope_npu
+from fsdp_turbo.ops.npu.rope import inplace_rope_npu, rope_npu
 from fsdp_turbo.ops.npu.qsa import qsa_selected_token_mask_npu
 
 try:
@@ -51,6 +51,7 @@ __all__ = [
     'permute_npu',
     'unpermute_npu',
     'rms_norm_npu',
+    'inplace_rope_npu',
     'rope_npu',
     'qsa_selected_token_mask_npu',
     'hc_split_sinkhorn_npu',

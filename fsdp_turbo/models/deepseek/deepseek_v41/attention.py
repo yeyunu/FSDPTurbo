@@ -54,6 +54,7 @@ class Attention(nn.Module):
         self.o_lora_rank = args.o_lora_rank
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
+        self.use_triton_inplace_rope = args.use_triton_inplace_rope
         self.nope_head_dim = args.head_dim - args.rope_head_dim
         self.n_groups = args.o_groups
         self.n_local_groups = self.n_groups
@@ -117,7 +118,7 @@ class Attention(nn.Module):
         bsz, seqlen, _ = x.size()
         win = self.window_size
         kv = self.kv_norm(self.wkv(x))
-        apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs_cis)
+        kv = apply_rotary_emb(kv, freqs_cis, use_triton_inplace_rope=self.use_triton_inplace_rope)
         if start_pos == 0:  # prefill: attend over this chunk, seeding the ring buffer for decode
             if not self.training:
                 if seqlen <= win:
@@ -184,7 +185,7 @@ class Attention(nn.Module):
                     if start_pos == 0
                     else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
                 )
-            apply_rotary_emb(latent[..., -self.rope_head_dim :], freqs)
+            latent = apply_rotary_emb(latent, freqs, use_triton_inplace_rope=self.use_triton_inplace_rope)
             if self.training and start_pos == 0:
                 shared_attn.compress_kv = latent
             else:
@@ -209,11 +210,10 @@ class Attention(nn.Module):
             if packed_lengths is not None
             else self.freqs_cis[start_pos : start_pos + seqlen]
         )
-        rd = self.rope_head_dim
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        q = apply_rotary_emb(q, freqs_cis, use_triton_inplace_rope=self.use_triton_inplace_rope)
 
         kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
         compress_kv = None
@@ -262,7 +262,7 @@ class Attention(nn.Module):
                 q, kv, self.attn_sink, topk_idxs, self.softmax_scale, attention_mask=attention_mask
             )
         o = o.clone()
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        o = apply_rotary_emb(o, freqs_cis, True, use_triton_inplace_rope=self.use_triton_inplace_rope)
 
         # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
         # Linear. convert.py dequantizes it to bf16; an fp8 grouped GEMM would halve the memory.

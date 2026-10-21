@@ -18,6 +18,11 @@ try:
 except ImportError:
     torch_npu = None
 
+try:
+    from mindspeed_ops.api.triton.inplace_rope import inplace_rope as triton_inplace_rope
+except ImportError:
+    triton_inplace_rope = None
+
 
 # Source views are retained to prevent allocator-address reuse giving false
 # hits. The byte limit includes retained source storages (conservatively).
@@ -215,3 +220,46 @@ def rope_npu(x, cos, sin, *, interleaved=False, inverse=False):
     if torch_npu is None or not hasattr(torch_npu, "npu_rotary_mul"):
         raise RuntimeError("Fused RoPE requires torch_npu.npu_rotary_mul")
     return _rotary_mul_adapter(x, cos, sin, interleaved=interleaved, inverse=inverse)
+
+
+@register_op("inplace_rope", "npu")
+def inplace_rope_npu(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    interleaved: bool = False,
+    inverse: bool = False,
+    inplace: bool = False,
+) -> torch.Tensor:
+    """Triton inplace RoPE over the trailing block of a full [nope | rope] head.
+
+    Only the last ``2 * cos.shape[-1]`` columns rotate, written in place by the
+    triton kernel so no ViewCopy/Slice is needed. The triton path mutates x's
+    storage but returns a fresh autograd-tracked tensor, so callers must use the
+    return value (``x = inplace_rope(...)``) for gradients to flow through
+    `inplace_rope_bwd`. When the Triton kernel cannot be used, the eager CANN
+    `rope` op runs over a view of the trailing block.
+    """
+    rotary_dim = 2 * cos.shape[-1]
+    if inplace and interleaved and triton_inplace_rope is not None and x.is_contiguous():
+        if inverse:
+            sin = -sin
+        x4 = x if x.ndim == 4 else x.unsqueeze(-2)
+        cos4 = cos.expand(x4.size(0), x4.size(1), cos.size(-1)).contiguous()
+        sin4 = sin.expand(x4.size(0), x4.size(1), sin.size(-1)).contiguous()
+        rotated = triton_inplace_rope(x4, cos4, sin4)
+        return rotated if x.ndim == 4 else rotated.squeeze(-2)
+    rope_x = x[..., -rotary_dim:]
+    if cos.ndim == 2:
+        # rope_npu expects the broadcast shape produced by the `rope` wrapper.
+        coeff_shape = (1, cos.shape[0], *([1] if rope_x.ndim == 4 else []), cos.shape[-1])
+        cos = cos.reshape(coeff_shape)
+        sin = sin.reshape(coeff_shape)
+    rotated = rope_npu(rope_x, cos, sin, interleaved=interleaved, inverse=inverse)
+    if inplace:
+        x[..., -rotary_dim:] = rotated
+        return x
+    out = x.clone()
+    out[..., -rotary_dim:] = rotated
+    return out

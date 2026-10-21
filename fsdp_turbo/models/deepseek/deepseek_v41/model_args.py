@@ -69,6 +69,7 @@ class ModelArgs:
     # Fuse MHC projection/Sinkhorn/premix and post residual mixing on NPU.
     use_fused_mhc: bool = False
     use_fused_clipped_swiglu: bool = False
+    use_triton_inplace_rope: bool = False
     # Use CANN FlashAttentionScore/FlashAttentionScoreGrad in the vision tower.
     use_fused_vision_flash_attn: bool = False
     lightning_indexer_page_size: int = 128

@@ -51,4 +51,62 @@ def rope(x, cos, sin, *, interleaved=False, inverse=False, inplace=False, use_ea
     return x.copy_(result) if inplace else result
 
 
-__all__ = ["rope"]
+def inplace_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    interleaved: bool = False,
+    inverse: bool = False,
+    inplace: bool = False,
+    device_type: str = "cpu",
+) -> torch.Tensor:
+    """Rotate the trailing rotary block of a full [nope | rope] head.
+
+    cos/sin are ``rotary_dim // 2``-wide coefficients, so the rotated block is the
+    last ``rotary_dim = 2 * cos.shape[-1]`` columns and any leading nope columns
+    are left untouched. Accepts [B,S,D] and [B,S,H,D]. ``device_type="npu"``
+    selects the NPU implementation, which uses the Triton inplace kernel over
+    the whole head when available (no ViewCopy/Slice), then falls back to CANN.
+    Other device types use the eager `rope` operation. The default
+    ``device_type="cpu"`` selects the eager implementation, matching the
+    previous API's default behavior.
+
+    When the triton kernel runs it mutates x's storage in place yet returns a
+    fresh autograd-tracked tensor, so always use the return value
+    (``x = inplace_rope(x, ...)``) or the rotary block's gradient will be dropped.
+    """
+    if x.ndim not in (3, 4) or x.shape[-1] == 0:
+        raise ValueError("RoPE requires 3-D/4-D x with a non-empty last dimension")
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("RoPE x must be FP16, BF16 or FP32")
+    if cos.shape != sin.shape or cos.ndim == 0 or cos.shape[-1] == 0:
+        raise ValueError("RoPE cos/sin must have equal shapes ending in rotary_dim/2")
+    if cos.device != x.device or sin.device != x.device:
+        raise ValueError("RoPE x/cos/sin must be on the same device")
+    rotary_dim = 2 * cos.shape[-1]
+    if rotary_dim > x.shape[-1]:
+        raise ValueError("RoPE rotary block must not exceed the head dimension")
+    if rotary_dim == x.shape[-1] and device_type != "npu":
+        return rope(
+            x,
+            cos,
+            sin,
+            interleaved=interleaved,
+            inverse=inverse,
+            inplace=inplace,
+            use_eager=device_type == "cpu",
+        )
+    return dispatch_op(
+        "inplace_rope",
+        x,
+        cos,
+        sin,
+        interleaved=interleaved,
+        inverse=inverse,
+        inplace=inplace,
+        device_type=device_type,
+    )
+
+
+__all__ = ["rope", "inplace_rope"]

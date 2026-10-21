@@ -195,6 +195,7 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 | Lightning Indexer 融合算子 | 可选；支持 Atlas A3（Ascend 910_93）、Ascend 910B/910C 和 Ascend950DT |
 | MhcPreSinkhornPremix/MhcPost 融合算子 | 可选；设置 `model.use_fused_mhc: true` |
 | Clipped SwiGLU 前反向融合 | 可选；设置 `model.use_fused_clipped_swiglu: true`，模型的 `swiglu_limit` 必须大于 0 |
+| Inplace-RoPE Triton算子 | 可选；设置 `model.use_triton_inplace_rope: true` |
 | 视觉 FlashAttentionScore/Grad 融合算子 | 可选；设置 `model.use_fused_vision_flash_attn: true`；仅支持 BF16 |
 | CSA2 activation recompute | 暂不支持 |
 | Engram BF16 训练、哈希表常驻行切分 | 支持（CPU 两进程已验证） |

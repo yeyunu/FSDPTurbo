@@ -42,6 +42,7 @@ class Indexer(torch.nn.Module):
         self.n_local_heads = args.index_n_heads
         self.index_head_dim = args.index_head_dim
         self.rope_head_dim = args.rope_head_dim
+        self.use_triton_inplace_rope = args.use_triton_inplace_rope
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
         self.softmax_scale = self.index_head_dim**-0.5
@@ -90,7 +91,7 @@ class Indexer(torch.nn.Module):
         """
         assert self.freqs_cis is not None
         bsz, seqlen, _ = x.size()
-        ratio, rd, end_pos = self.compress_ratio, self.rope_head_dim, start_pos + seqlen
+        ratio, end_pos = self.compress_ratio, start_pos + seqlen
 
         packed_lengths = _packed_sequence_lengths(seqlen, cu_seqlens) if start_pos == 0 else None
         if packed_lengths is not None:
@@ -143,7 +144,7 @@ class Indexer(torch.nn.Module):
                 else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
             )
             k = self.k_norm(self.wk(latent))
-            apply_rotary_emb(k[..., -rd:], freqs)
+            k = apply_rotary_emb(k, freqs, use_triton_inplace_rope=self.use_triton_inplace_rope)
             if self.training and start_pos == 0:
                 shared_attn.index_k = k
             else:
@@ -151,7 +152,11 @@ class Indexer(torch.nn.Module):
                 shared_attn.index_k = self.k_cache
 
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))
-        apply_rotary_emb(q[..., -rd:], self.freqs_cis[start_pos:end_pos])
+        q = apply_rotary_emb(
+            q,
+            self.freqs_cis[start_pos:end_pos],
+            use_triton_inplace_rope=self.use_triton_inplace_rope,
+        )
         index_k = shared_attn.index_k[:bsz, : end_pos // ratio]
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
 

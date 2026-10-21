@@ -36,11 +36,10 @@ class DSparkAttention(Attention):
         assert self.compress_ratio == 0
         bsz, seqlen, _ = main_x.size()
         win = self.window_size
-        rd = self.rope_head_dim
 
         main_freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
         main_kv = self.kv_norm(self.wkv(main_x))
-        apply_rotary_emb(main_kv[..., -rd:], main_freqs_cis)
+        main_kv = apply_rotary_emb(main_kv, main_freqs_cis, use_triton_inplace_rope=self.use_triton_inplace_rope)
         if start_pos == 0:
             if seqlen <= win:
                 self.window_kv_cache[:bsz, :seqlen] = main_kv
@@ -56,16 +55,16 @@ class DSparkAttention(Attention):
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        q = apply_rotary_emb(q, freqs_cis, use_triton_inplace_rope=self.use_triton_inplace_rope)
         kv = self.kv_norm(self.wkv(x))
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
+        kv = apply_rotary_emb(kv, freqs_cis, use_triton_inplace_rope=self.use_triton_inplace_rope)
         topk_idxs = get_dspark_topk_idxs(win, bsz, block_size, start_pos)
         self.window_kv_cache[:bsz, start_pos % win] = main_kv.squeeze(1)
         kv = torch.cat([self.window_kv_cache[:bsz], kv], dim=1)
         o = indexed_sparse_attention(
             q, kv, self.attn_sink, topk_idxs, self.softmax_scale, attention_mask=attention_mask
         )
-        apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+        o = apply_rotary_emb(o, freqs_cis, True, use_triton_inplace_rope=self.use_triton_inplace_rope)
 
         o = o.view(bsz, block_size, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
