@@ -52,21 +52,21 @@ class KimiK3Processor(ProcessorMixin):
 
     # ── Media preprocessing ────────────────────────────────────────────
 
-    def update_raw_text(self, text: str, image_prompts: list[str]) -> str:
-        # Replace image placeholders
-        if isinstance(text, list):
-            text = text[0]
-        image_count = text.count(self.image_placeholder)
-        if image_count > 0:
-            assert image_count == len(image_prompts), (
-                f"image placeholder count {image_count} != image_prompts count {len(image_prompts)}"
-            )
-            text_parts = text.split(self.image_placeholder)
-            assert len(text_parts) == len(image_prompts) + 1
-            text = "".join([text_parts[i] + image_prompts[i] for i in range(len(image_prompts))])
-            text += text_parts[-1]
+    def update_raw_text(self, text: list[str], image_prompts: list[str]) -> list[str]:
+        """Replace placeholders in a batch of texts in sample order.
 
-        return text
+        Image prompts must follow placeholder order across all samples.
+        Raises ValueError when their total counts differ.
+        """
+        image_count = sum(sample.count(self.image_placeholder) for sample in text)
+        if image_count != len(image_prompts):
+            raise ValueError(f"image placeholder count {image_count} != image_prompts count {len(image_prompts)}")
+        prompts = iter(image_prompts)
+        updated_texts = []
+        for sample in text:
+            parts = sample.split(self.image_placeholder)
+            updated_texts.append(parts[0] + "".join(next(prompts) + part for part in parts[1:]))
+        return updated_texts
 
     def preprocess_medias(self, medias: list[dict]) -> tuple[list[dict], list[str]]:
         """Process media items and generate corresponding prompts.
@@ -96,7 +96,7 @@ class KimiK3Processor(ProcessorMixin):
         self,
         messages: list[dict] = None,
         medias: list[dict] = None,
-        text: str = None,
+        text: list[str] | None = None,
         return_tensors: str = "pt",
         **kwargs,
     ) -> BatchFeature:
@@ -107,9 +107,11 @@ class KimiK3Processor(ProcessorMixin):
             messages: List of message dicts with 'role' and 'content' fields.
                      If provided, medias and text will be extracted automatically.
             medias: Pre-extracted list of media dicts.
-            text: Pre-formatted text string.
+            text: Batch of pre-formatted strings. Medias must
+                  follow placeholder order across the batch.
             return_tensors: Format of returned tensors. Default: 'pt'.
-            **kwargs: Additional arguments passed to apply_chat_template.
+            **kwargs: Additional arguments passed to the tokenizer for explicit
+                      text inputs, or apply_chat_template for messages.
 
         Returns:
             BatchFeature with fields: input_ids, attention_mask,
@@ -122,7 +124,7 @@ class KimiK3Processor(ProcessorMixin):
             updated_medias, image_prompts = self.preprocess_medias(medias)
             preprocessed = self.media_processor.preprocess(updated_medias, return_tensors=return_tensors)
             text = self.update_raw_text(text, image_prompts)
-            text_inputs = self.tokenizer(text, return_tensors=return_tensors)
+            text_inputs = self.tokenizer(text, return_tensors=return_tensors, **kwargs)
             return BatchFeature(data={**text_inputs, **preprocessed.data})
 
         if medias is None:
@@ -142,7 +144,7 @@ class KimiK3Processor(ProcessorMixin):
             return BatchFeature(data={**text_inputs, **preprocessed.data})
 
         text = self.update_raw_text(text, image_prompts)
-        text_inputs = self.tokenizer(text, return_tensors=return_tensors)
+        text_inputs = self.tokenizer(text, return_tensors=return_tensors, **kwargs)
         return BatchFeature(data={**text_inputs, **preprocessed.data})
 
     @staticmethod

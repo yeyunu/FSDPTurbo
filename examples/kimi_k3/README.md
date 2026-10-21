@@ -4,6 +4,27 @@
 [`config.yaml`](./config.yaml) 已开启 Ulysses Context Parallel（CP），CP
 并行度为 2。
 
+## 模型文件准备
+
+从下载的 Kimi-K3 模型目录中拷贝`media_utils.py` 和
+`configuration_kimi_k3.py` 到 FSDPTurbo 的`fsdp_turbo/models/kimi/` 目录。
+以本地仓库为例，目标目录为`D:\FSDPTurbo\fsdp_turbo\models\kimi`这两个文件需要与
+`modeling_kimi_k3.py`、`kimi_k3_processor.py` 同级，以满足相对导入。
+
+在训练服务器上执行以下命令，并将路径替换为实际位置：
+
+```bash
+HF_PATH="/download/Kimi-K3"
+TURBO_PATH="/home/workspace/FSDPTurbo"
+
+cp "${HF_PATH}/media_utils.py" "${TURBO_PATH}/fsdp_turbo/models/kimi/"
+cp "${HF_PATH}/configuration_kimi_k3.py" "${TURBO_PATH}/fsdp_turbo/models/kimi/"
+```
+
+请保留仓库内已适配的 `modeling_kimi_k3.py`、`modeling_kimi_linear.py`
+等实现文件。模型权重、tokenizer、processor 配置等资源仍由
+`config.yaml` 中的 `model_name_or_path` 指定。
+
 ## 模型代码加载
 
 `train.py` 和系统测试先调用 `fsdp_turbo.models.kimi.register_kimi_k3()`，
@@ -120,7 +141,9 @@ padding，并通过 `attention_mask` 排除 padding token。
 
 在 A5 服务器上执行 Kimi K3 预训练前，需要先下载并安装 `mindspeed_ops` 库（https://gitcode.com/Ascend/MindSpeed-Ops）。
 
-Attention Residual 通过算子注册入口自动选择后端。在 NPU 上使用 AscendC 实现需要安装
+### 安装 ops-transformer 以适配 AscendC 版本 attn_res
+
+Attention Residual（attn_res）通过算子注册入口自动选择后端。在 NPU 上使用 AscendC 实现需要安装
 [`ops-transformer`](https://gitcode.com/cann/ops-transformer) 的
 `block_attention_residuals` 前向和反向算子。参考版本和安装方式如下：
 
@@ -129,6 +152,8 @@ git clone https://gitcode.com/cann/ops-transformer.git
 cd ops-transformer
 git checkout a041b05638
 source /usr/local/Ascend/cann/set_env.sh
+# 根据设备选择：A2=ascend910b，A3=ascend910_93，950 系列=ascend950
+soc_version=ascend910_93
 bash build.sh --pkg --soc=${soc_version} \
   --ops=block_attention_residuals,block_attention_residuals_grad -j16
 bash build/cann-ops-transformer-custom_linux-aarch64.run
@@ -139,6 +164,15 @@ export LD_LIBRARY_PATH=${ASCEND_OPP_PATH}/vendors/custom_transformer/op_api/lib/
 
 `${soc_version}` 根据设备选择，例如 Atlas A2 使用 `ascend910b`，Atlas A3 使用
 `ascend910_93`，950 系列使用 `ascend950`。缺少扩展时自动回退到 eager 实现。
+
+安装完成后，在训练使用的 Python 环境中验证扩展可以导入：
+
+```bash
+python -c "from cann_ops_transformer import block_attention_residuals"
+```
+
+上述命令正常退出表示前向 Python 接口可导入；反向算子的正确性仍需通过实际训练验证。
+启动训练的每个终端都需要加载对应 CANN 环境，并设置上述 `LD_LIBRARY_PATH`。
 
 ## 启动训练
 
