@@ -55,6 +55,23 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         self.model = backbone
         self.model_args = model_args
 
+    def from_pretrained(
+        self,
+        pretrained_model_name_or_path: str,
+        *,
+        strict: bool = True,
+        engram_rows_per_chunk: int = 65_536,
+    ):
+        """Load dequantized HF weights after FSDPTurbo has sharded this model."""
+        from .state_dict_adapter import load_deepseek_v41_from_pretrained
+
+        return load_deepseek_v41_from_pretrained(
+            self,
+            pretrained_model_name_or_path,
+            strict=strict,
+            engram_rows_per_chunk=engram_rows_per_chunk,
+        )
+
     def forward(
         self,
         input_ids: torch.LongTensor,

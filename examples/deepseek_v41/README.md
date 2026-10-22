@@ -71,7 +71,8 @@ FP32，参数存储和优化器配置不变。该模式要求 NPU 及支持上�
 模型结构参数优先从 `model.config_path` 指定的 JSON 文件读取；未设置时读取
 `model.model_name_or_path/config.json`。选中的文件不存在时直接报错，不回退到仓库内置配置。
 `config_path` 是文件路径，`model_name_or_path` 是目录路径；相对路径按进程工作目录解析。
-该入口不读取官方发布的 FP8/FP4 权重，模型参数仍以 BF16 随机初始化。
+默认不读取官方发布的 FP8/FP4 权重，模型参数以 BF16 随机初始化；启用
+`model.load_pretrained_weights` 时则从已反量化的 BF16 HuggingFace safetensors 初始化。
 
 ```yaml
 model:
@@ -277,6 +278,44 @@ prepare 函数。优化器应在 `FSDPTurbo` 构造后创建。模型构造入�
 切分统一由 FSDPTurbo 管理。延后初始化按全局种子、层号和行起点派生随机种子，
 在固定拓扑、相同初始种子下可复现；
 不保证与先初始化完整表再切分的随机值逐元素一致。
+
+加载已反量化为 BF16 的 HuggingFace safetensors 权重时，同样必须先应用并行：
+
+```yaml
+model:
+  model_name_or_path: /path/to/DeepSeek-V4.1-Flash-BF16
+  config_path: examples/deepseek_v41/model_config/config_full_bf16.json
+  load_pretrained_weights: true
+  pretrained_strict: true
+  pretrained_engram_rows_per_chunk: 65536
+```
+
+`config_path` 是相对进程工作目录或绝对路径。加载完整官方权重必须使用
+`config_full_bf16.json`；它保留发布模型的完整语言/视觉拓扑，同时
+关闭当前训练不支持的 MTP/DSpark，并将参数类型设为 BF16。原始 `config.json`
+保留发布模型的 FP8/FP4 推理设置，不能直接用于当前 BF16 训练入口。
+`model_config/config_8p*.json` 和 `model_config/config_16p_A5.json` 会改变
+compressor/indexer source 拓扑，
+只用于随机初始化的裁剪模型。
+
+```python
+model = FSDPTurbo(config, model)
+model.model.from_pretrained(
+    config.model.model_name_or_path,
+    strict=config.model.pretrained_strict,
+    engram_rows_per_chunk=config.model.pretrained_engram_rows_per_chunk,
+)
+```
+
+加载器通过 DCP 直接读取当前 rank 所需的 FSDP/TP/EP shard，并逐层合并 HF 的
+`w1/w3/w2` 专家权重到本仓的 `gate_up_proj/down_proj`。Engram 表按 EP 行范围和
+固定行块流式读入 Host 权重，不会在单个 rank 上构造完整表。权重目录需包含
+`model.safetensors.index.json`（或单个/多个无索引 safetensors 文件）；当前入口
+只接受已反量化权重，不在加载阶段处理 FP8 scale。残留的 `.scale` 以及训练模型
+明确禁用的 `mtp.*` 权重会被忽略；`strict: true` 要求其余权重结构与当前仓内模型
+JSON 完全一致。训练入口仅在 `model.load_pretrained_weights: true` 时加载 HF
+初始权重；该开关不影响 DCP 断点恢复。当前 HF 初始加载要求
+`distributed.expert_fully_shard_parallel_size: 1`；EP 和普通 FSDP 可正常切分。
 
 训练适配器在 Block 内执行 Engram，确保投影参数已被 FSDP materialize。
 图像和 padding 会截断 n-gram，并屏蔽对应位置的 Engram 注入。没有 tokenizer、

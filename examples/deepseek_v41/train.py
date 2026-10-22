@@ -82,8 +82,16 @@ class DeepseekV41Trainer(BaseTrainer):
 
         print_rank(logger.info, "> Applying FSDPTurbo parallelism...")
         parallel_model = FSDPTurbo(self.config, training_model)
-        print_rank(logger.info, "> Initializing local DeepSeek-V4.1 parameter shards...")
-        initialize_deepseek_v41_model(parallel_model.model)
+        if self.config.model.load_pretrained_weights:
+            print_rank(logger.info, "> Loading sharded DeepSeek-V4.1 HuggingFace weights...")
+            parallel_model.model.from_pretrained(
+                self.config.model.model_name_or_path,
+                strict=self.config.model.pretrained_strict,
+                engram_rows_per_chunk=(self.config.model.pretrained_engram_rows_per_chunk),
+            )
+        else:
+            print_rank(logger.info, "> Initializing local DeepSeek-V4.1 parameter shards...")
+            initialize_deepseek_v41_model(parallel_model.model)
         return parallel_model
 
     def build_optimizer(self):

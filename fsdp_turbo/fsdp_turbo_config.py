@@ -22,6 +22,9 @@ class ModelConfig:
     config_path: Optional[str] = None
     tokenizer_name_or_path: str = ""
     torch_dtype: torch.dtype = torch.bfloat16
+    load_pretrained_weights: bool = False
+    pretrained_strict: bool = True
+    pretrained_engram_rows_per_chunk: int = 65_536
     # Optional demo/debug knob for building a shallower language model.
     num_hidden_layers: Optional[int] = None
     engram_storage_backend: Optional[Literal["host_offload", "elastic_buffer"]] = None
@@ -380,6 +383,10 @@ class FSDPTurboConfig:
             raise ValueError("model.head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
         if not isinstance(self.model.attn_implementation, str) or not self.model.attn_implementation:
             raise ValueError("model.attn_implementation must be a non-empty string.")
+        if self.model.load_pretrained_weights and not self.model.model_name_or_path:
+            raise ValueError("model.model_name_or_path is required when load_pretrained_weights is enabled.")
+        if self.model.pretrained_engram_rows_per_chunk <= 0:
+            raise ValueError("model.pretrained_engram_rows_per_chunk must be positive.")
 
     def validate_data_config(self):
         """Validate and normalize dataloader configuration."""

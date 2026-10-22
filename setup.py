@@ -16,10 +16,11 @@ setup(
     packages=find_packages(include=["fsdp_turbo", "fsdp_turbo.*"]),
     python_requires=">=3.10",
     install_requires=[
-        "torch>=2.4.0",
+        "torch>=2.7.0",
         "torchvision",
         "pyyaml>=6.0",
         "transformers>=5.2.0",
+        "safetensors>=0.4.0",
         "datasets>=2.14.0",
         "pillow>=9.0.0",
         "tiktoken",
