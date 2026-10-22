@@ -1,0 +1,146 @@
+# ============================================================
+# DeepSeek-V4-Flash Text Training Configuration
+# Stock transformers (>=5.8.1) deepseek_v4 model, 4-layer / 16-expert
+# reduced profile; local alpaca parquet + real V4 tokenizer, from-scratch init.
+# CP disabled (ulysses=1, kv_allgather=1); FSDP=8, EP=4.
+# Machine paths are ${ENV} placeholders expanded by train.py:
+#   DSV4_MODEL_PATH, DSV4_OUTPUT_DIR, DSV4_DATA_PATH
+# ============================================================
+
+# --- Model Configuration ---
+model:
+  model_name_or_path: "${DSV4_MODEL_PATH}"
+  tokenizer_name_or_path: "${DSV4_MODEL_PATH}"
+  torch_dtype: "bf16"
+
+# --- Optimizer Configuration ---
+# AdamWSwap = AdamW whose optimizer states are swapped to host memory to lower
+# peak accelerator memory; supported by BaseTrainer.build_optimizer (it passes
+# mem_fraction_static / state_keys / param_prefetch through when set). The
+# optional fields below are left unset on purpose: AdamWSwap defaults apply
+# (mem_fraction_static=0.8, param_prefetch=false, state_keys=None).
+optimizer:
+  optimizer_type: "AdamW"
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1e-8
+  lr: 1.0e-5
+  warmup_ratio: 0.03
+  lr_scheduler_type: "CosineAnnealingLR"
+  min_lr: 1.0e-6
+  clip_grad: 1.0
+
+# --- Run Configuration ---
+run:
+  seed: 42
+  deterministic: true
+  max_steps: -1
+  num_train_epochs: 10
+  gradient_accumulation_steps: 1
+  logging_steps: 1
+  profile:
+    enabled: false
+    wait_steps: 0
+    warmup_steps: 0
+    active_steps: 1
+    repeat: 1
+    skip_first: 0
+    output_dir: "./profile"
+    record_shapes: false
+    profile_memory: false
+    with_stack: false
+
+# --- Checkpoint Configuration ---
+checkpoint:
+  output_dir: "${DSV4_OUTPUT_DIR}"
+  save_steps: 500
+  strict: true
+  save_optim: true
+  load_optim: true
+  resume_from_checkpoint: null
+
+# --- Data Configuration ---
+data:
+  # local alpaca HF parquet (52002 rows, text column)
+  dataset_path: "${DSV4_DATA_PATH}"
+  dataset_config: null
+  text_column: "text"
+  split: "train"
+  batch_size: 2
+  max_seq_length: 4096
+  num_workers: 4
+  pin_memory: true
+  shuffle: true
+
+# --- Distributed Configuration ---
+distributed:
+  data_parallel_size: 1
+  fully_shard_parallel_size: 8
+  tensor_parallel_size: 1
+  kv_allgather_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 4
+  expert_fully_shard_parallel_size: 1
+  expert_data_parallel_size: 1
+
+  # --- FSDP Plan (module names follow the transformer layout) ---
+  fsdp_plan:
+    ignored_modules: []
+    apply_modules:
+      model.layers.{*}:
+        {}
+      model.embed_tokens:
+        {}
+      model.norm:
+        {}
+    param_dtype: "bf16"
+    reduce_dtype: "fp32"
+    output_dtype: null
+    cast_forward_inputs: false
+    num_to_forward_prefetch: 2
+    num_to_backward_prefetch: 2
+    hook_modules:
+      - model.layers.{*}
+    fsdp_implementation: "native"
+
+  # --- Tensor Parallel Plan (inactive at tensor_parallel_size=1) ---
+  tp_plan:
+    colwise_parallel:
+      - model.layers.{*}.mlp.shared_experts.gate_proj
+      - model.layers.{*}.mlp.shared_experts.up_proj
+    rowwise_parallel:
+      - model.layers.{*}.mlp.shared_experts.down_proj
+    sequence_parallel: []
+
+  # --- Expert Parallel Plan ---
+  ep_plan:
+    apply_modules:
+      - model.layers.{*}.mlp.experts
+    dispatcher: "custom_native_eager_forward"
+    fixed_router: true
+    apply_efsdp_modules:
+      - model.layers.{*}.mlp.experts
+
+  # --- Context Parallel Plan ---
+  cp_plan:
+    ulysses_function_patches: []
+    kv_allgather_function_patches: []
+    loss_function_patches:
+      - target_functions:
+          - transformers.loss.loss_utils.ForCausalLMLoss
+        type: causal_lm_loss
+
+# --- Memory Configuration ---
+memory:
+  recompute: true
+  recompute_plan:
+    - model.layers.{*}
+  swap_activation: false
+  swap_activation_plan:
+    apply_modules:
+      - model.layers.{*}
+
+# --- Quantization Configuration ---
+quantization:
+  quantization_plan: null

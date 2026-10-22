@@ -1,175 +1,223 @@
+# Copyright 2026 The HuggingFace Inc. team. All rights reserved.
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This file is adapted from the DeepSeek-V4 reference model implementation
+# (DeepSeek-AI official release) for FSDPTurbo training: dense-attention and
+# FSDPTurbo adaptations (expert-parallel dispatch, reduced config, hash-MoE
+# buffers).
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at LICENSE (Apache-2.0) in the repo root.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""DeepSeek-V4-Flash training on the stock transformers (>=5.8.1) deepseek_v4
+model: random init by default, or load real released weights when
+``--ckpt``/``--weights`` is provided.
+
+A single entry point (no separate train/initialize scripts): the model is
+randomly initialized unless a checkpoint (or raw safetensors directory) is
+given on the command line. Designed for GPU/NPU precision comparison with the
+same source tree on both platforms.
+
+Usage:
+  python train.py --config config_train.yaml --max-steps 5                 # random init
+  python train.py --config config_train.yaml --max-steps 5 --ckpt ckpt.pt  # real weights
+  python train.py --config config_train.yaml --max-steps 5 --weights /path/DeepSeek-V4-Flash-BF16
+"""
+
 import argparse
 import logging
 import os
+from dataclasses import replace
 
 import torch
-import yaml
 
-from fsdp_turbo.fsdp_turbo import FSDPTurbo
 from fsdp_turbo.fsdp_turbo_config import load_config_from_yaml
+from fsdp_turbo.models.deepseek.deepseek_v4 import (
+    build_deepseek_v4_model,
+    build_deepseek_v4_model_args,
+    initialize_deepseek_v4_model,
+    prepare_deepseek_v4_model_for_fsdp,
+)
 from fsdp_turbo.training.trainer import BaseTrainer
 from fsdp_turbo.utils.log import print_rank
+
+from load_weights import load_weights_into
 
 logger = logging.getLogger(__name__)
 
 
-def convert_model_dtype(model, dtype):
-    for param in model.parameters():
-        param.data = param.data.to(dtype)
-    for buffer in model.buffers():
-        buffer.data = buffer.data.to(dtype)
+def _expand_config_env(config) -> "object":
+    """Expand ``${VAR}`` placeholders in the path fields of a parsed
+    ``FSDPTurboConfig`` (the yaml loader performs no interpolation).
+    """
+
+    def expand(value):
+        if isinstance(value, str):
+            return os.path.expandvars(value)
+        if isinstance(value, list):
+            return [expand(v) for v in value]
+        if isinstance(value, dict):
+            return {k: expand(v) for k, v in value.items()}
+        return value
+
+    model = replace(
+        config.model,
+        model_name_or_path=expand(config.model.model_name_or_path),
+        tokenizer_name_or_path=expand(config.model.tokenizer_name_or_path),
+    )
+    checkpoint = replace(config.checkpoint, output_dir=expand(config.checkpoint.output_dir))
+    data = replace(config.data, dataset_path=expand(config.data.dataset_path))
+    return replace(config, model=model, checkpoint=checkpoint, data=data)
 
 
 class DeepseekV4Trainer(BaseTrainer):
-    def __init__(self, config, features=None):
-        super().__init__(config)
-        self.config = config
-        self.features = features or {}
+    """BaseTrainer variant that loads real weights if a checkpoint is given."""
+
+    def __init__(self, *args, weights_dir: str = "", ckpt_path: str = "", **kwargs):
+        self._weights_dir = weights_dir
+        self._ckpt_path = ckpt_path
+        super().__init__(*args, **kwargs)
+
+    def _model_args(self):
+        if not hasattr(self, "_cached_model_args"):
+            self._cached_model_args = build_deepseek_v4_model_args()
+        return self._cached_model_args
+
+    def build_processor(self):
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast.from_pretrained(
+            self.config.model.tokenizer_name_or_path,
+        )
 
     def build_model(self):
-        from transformers.models.deepseek_v4 import DeepseekV4ForCausalLM, DeepseekV4Config
-        import modeling_deepseek_v4  # noqa: F401
+        from fsdp_turbo.fsdp_turbo import FSDPTurbo
 
-        print_rank(logger.info, "> Building DeepseekV4 Model...")
-        model_config = DeepseekV4Config()
+        print_rank(logger.info, "> Building DeepSeek-V4-Flash reference model (transformers >= 5.8.1)...")
+        training_model = build_deepseek_v4_model(
+            model_args=self._model_args(),
+            tokenizer=self.tokenizer,
+        )
 
-        # reduce layer and expert for demo
-        model_config.num_hidden_layers = 4
-        model_config.n_routed_experts = 16
-        model_config.index_topk = 16
-
-        with torch.device('meta'):
-            model = DeepseekV4ForCausalLM(model_config)
-        convert_model_dtype(model, self.config.model.torch_dtype)
-
-        init_weights = model._init_weights
-
-        print_rank(logger.info, "> Applying FSDPTurbo parallelism...")
-        model = FSDPTurbo(self.config, model)
-        model.to_empty(device='npu')
-
-        with torch.no_grad():
-            model.apply(init_weights)
-
-        # SwapActivation: must be applied after model has actual memory allocated
-        if self.features.get("swap_activation"):
-            from fsdp_turbo.memory.swap_activation.swap_activation import (
-                swap_activation_modules,
+        if self._ckpt_path and os.path.exists(self._ckpt_path):
+            # Load a prepared .pt checkpoint (heavyweight layout mirroring the
+            # transformers state dict). ``training_model.model`` is the HF
+            # backbone whose state-dict keys are the plain "model.*" paths used
+            # by loaders and the parallelism plans.
+            print_rank(logger.info, f"> Loading checkpoint {self._ckpt_path} ...")
+            ckpt = torch.load(self._ckpt_path, map_location="cpu")
+            missing, unexpected = training_model.model.load_state_dict(ckpt, strict=False)
+            print_rank(
+                logger.info,
+                f"> Checkpoint loaded: {len(ckpt)} keys, {len(missing)} missing, {len(unexpected)} unexpected",
             )
+            self._clip_tid2eid(training_model.model)
+        elif self._weights_dir and os.path.isdir(self._weights_dir):
+            # Load raw released safetensors (subset mapped into the model).
+            stats = load_weights_into(training_model.model, self._weights_dir, device="cpu")
+            print_rank(
+                logger.info,
+                f"> Loaded {stats['loaded']} keys from {self._weights_dir}; "
+                f"{len(stats['skipped_shape_mismatch'])} shape mismatches",
+            )
+            self._clip_tid2eid(training_model.model)
+        else:
+            # No weights given -> random initialization (official init rules via
+            # the stock DeepseekV4PreTrainedModel._init_weights).
+            print_rank(logger.info, "> No checkpoint/weights provided, using random initialization...")
+            initialize_deepseek_v4_model(training_model)
 
-            plan = self.features.get("swap_activation_plan") or ["model.layers.{*}"]
-            print_rank(logger.info, "> Applying SwapActivation...")
-            model = swap_activation_modules(model, plan)
+        training_model = prepare_deepseek_v4_model_for_fsdp(
+            training_model,
+            device=torch.accelerator.current_accelerator(),
+            parameter_dtype=self.config.model.torch_dtype,
+        )
 
-        # indexer grad bypass
-        for name, module in model.named_modules():
-            if "indexer" in name:
-                for n, p in module.named_parameters():
-                    p.grad = torch.zeros_like(p.data)
+        # Parallelism plans are written against the transformers layout
+        # ("model.layers.{*}.mlp.experts", ...), so FSDPTurbo wraps the HF
+        # backbone (``training_model.model``) rather than the adapter facade:
+        # the adapter's extra nesting level would shift every module path.
+        # Note: SwapActivation is applied inside FSDPTurbo.__init__
+        # (fsdp_turbo/fsdp_turbo.py:apply_swap_activation_modules) when
+        # memory.swap_activation is enabled in the config, so no extra calls
+        # are needed here.
+        print_rank(logger.info, "> Applying FSDPTurbo parallelism...")
+        model = FSDPTurbo(self.config, training_model.model)
+        print_rank(logger.info, "> SwapActivation handled by FSDPTurbo (memory.swap_activation).")
         return model
 
+    def _clip_tid2eid(self, training_model) -> None:
+        """Render the hash-table routing safe for the reduced expert count: the
+        released tid2eid maps tokens to experts 0..255, but the reduced model
+        only has <n_routed_experts> experts. Upcast to int64 (required by
+        gather) and clamp indices into [0, n_routed_experts) so the forward
+        pass cannot index out of bounds. Identical logic in eval_weights.py.
+        """
+        n_experts = self._model_args().n_routed_experts
+        clipped_total = 0
+        tid_total = 0
+        for buf_name, buf in training_model.named_buffers():
+            if "tid2eid" not in buf_name:
+                continue
+            as_int64 = buf.data.to(torch.int64)
+            clipped = int((as_int64 >= n_experts).sum())
+            clipped_total += clipped
+            tid_total += int(as_int64.numel())
+            buf.data = as_int64.clamp(0, n_experts - 1)
+        print_rank(
+            logger.info,
+            f"> tid2eid clip: {clipped_total}/{tid_total} indices clamped to {n_experts} experts",
+        )
+
     def build_optimizer(self):
-        if self.model is None:
-            print_rank(logger.warning, "Model is None, skipping optimizer build.")
-            return None
+        """Standard AdamW via ``BaseTrainer.build_optimizer``.
 
-        from fsdp_turbo.quantization.cache import hook_optimizer_step
-
-        print_rank(logger.info, "> Building Optimizer...")
-        optim_cfg = self.config.optimizer
-
-        if self.features.get("swap_optimizer"):
-            from fsdp_turbo.memory.swap_optimizer.swap_optimizer import AdamWSwap
-
-            optimizer = AdamWSwap(
-                self.model.parameters(),
-                lr=optim_cfg.lr,
-                weight_decay=optim_cfg.weight_decay,
-                betas=(optim_cfg.adam_beta1, optim_cfg.adam_beta2),
-                eps=optim_cfg.adam_epsilon,
-            )
-        else:
-            from fsdp_turbo.training.factories import OptimizerFactory
-
-            optimizer = OptimizerFactory.create(
-                optim_cfg.optimizer_type,
-                self.model.parameters(),
-                lr=optim_cfg.lr,
-                weight_decay=optim_cfg.weight_decay,
-                betas=(optim_cfg.adam_beta1, optim_cfg.adam_beta2),
-                eps=optim_cfg.adam_epsilon,
-            )
-
-        hook_optimizer_step(self.model, optimizer)
-        return optimizer
-
-    def train_step(self, batch):
-        batch['use_cache'] = False
-        if self.features.get("chunk_loss"):
-            chunk_size = self.features.get("chunk_loss_size", 1024)
-            loss = self._compute_chunk_loss(batch, chunk_size)
-        else:
-            return super().train_step(batch)
-
-        loss = loss / self.config.run.gradient_accumulation_steps
-        loss.backward()
-        return loss, None
-
-    def _compute_chunk_loss(self, batch, chunk_size):
-        from fsdp_turbo.memory.chunk_loss.chunk_loss import calculate_lm_loss, chunk_loss
-
-        outputs = self.model(
-            input_ids=batch['input_ids'],
-            attention_mask=batch.get('attention_mask', None),
-            use_cache=False,
-            output_hidden_states=True,
-        )
-        hidden_states = outputs.hidden_states[-1]
-        hidden = hidden_states[:, :-1, :].contiguous()
-
-        head = self.model.model.lm_head
-        shift_labels = batch['labels'][:, 1:].contiguous()
-
-        num_items = (shift_labels != -100).sum().clamp(min=1)
-
-        loss_kwargs_chunks = [
-            {"shift_labels": chunk, "alpha": num_items, "ignore_index": -100, "reduction": "sum"}
-            for chunk in torch.split(shift_labels, chunk_size, dim=1)
-        ]
-
-        return chunk_loss(
-            hidden,
-            head.weight,
-            getattr(head, 'bias', None),
-            calculate_lm_loss,
-            loss_kwargs_chunks,
-            chunk_size,
-        )
+        The base implementation (fsdp_turbo/training/trainer.py) already
+        carries the full optimizer construction: ``OptimizerFactory``
+        (optimizer_type-driven), AdamWSwap-specific swap arguments when
+        ``optimizer_type == "AdamWSwap"``, the quantization
+        ``hook_optimizer_step`` wiring and the "model is None" guard — so
+        delegating here preserves those abilities instead of reimplementing
+        them.
+        """
+        print_rank(logger.info, "> Building DeepSeek-V4 optimizer (via BaseTrainer)...")
+        return super().build_optimizer()
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="DeepSeekV4 Training")
-    parser.add_argument("--config", type=str, default="config.yaml", help="Path to YAML config file")
-    parser.add_argument("--output-dir", type=str, default=None, help="Override checkpoint output directory")
-    parser.add_argument("--max-steps", type=int, default=None, help="Override run.max_steps")
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="DeepSeek-V4-Flash FSDP Training")
+    parser.add_argument("--config", type=str, default="config_train.yaml")
+    parser.add_argument("--output-dir", type=str, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--weights", type=str, default="", help="Path to raw safetensors dir")
+    parser.add_argument("--ckpt", type=str, default="", help="Path to prepared .pt checkpoint")
     return parser.parse_args()
 
 
 def main():
-    args = parse_args()
+    parsed = parse_arguments()
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), parsed.config)
+    fsdp_config = _expand_config_env(load_config_from_yaml(config_path))
 
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.config)
-    with open(config_path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f) or {}
+    # Command-line overrides construct a new validated config instead of
+    # mutating an already-created FSDPTurboConfig at runtime.
+    if parsed.output_dir:
+        checkpoint_config = replace(fsdp_config.checkpoint, output_dir=parsed.output_dir)
+        fsdp_config = replace(fsdp_config, checkpoint=checkpoint_config)
+    if parsed.max_steps is not None:
+        run_config = replace(fsdp_config.run, max_steps=parsed.max_steps)
+        fsdp_config = replace(fsdp_config, run=run_config)
 
-    config = load_config_from_yaml(config_path)
-    if args.output_dir:
-        config.checkpoint.output_dir = args.output_dir
-    if args.max_steps is not None:
-        config.run.max_steps = args.max_steps
-
-    features = raw.get("features") or {}
-    trainer = DeepseekV4Trainer(config=config, features=features)
+    trainer = DeepseekV4Trainer(
+        config=fsdp_config,
+        weights_dir=parsed.weights,
+        ckpt_path=parsed.ckpt,
+    )
     trainer.setup()
     trainer.train()
 
