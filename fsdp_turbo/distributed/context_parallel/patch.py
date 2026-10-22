@@ -1,26 +1,57 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Install context-parallel wrappers through the generic patch framework."""
 
+from __future__ import annotations
+
 import logging
+import types
+from typing import TYPE_CHECKING
 
 from fsdp_turbo.distributed.context_parallel.loss import get_cp_causal_lm_loss_fn
 from fsdp_turbo.utils.log import print_rank
-from fsdp_turbo.utils.patch import patch_namespace_members, resolve_callable
+from fsdp_turbo.utils.patch import (
+    patch_namespace_members,
+    resolve_callable,
+    resolve_class_member,
+    resolve_namespace_member,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping, Sequence
+    from typing import TypedDict
+
+    from torch import nn
+    from torch.distributed import ProcessGroup
+
+    class FunctionPatchSpec(TypedDict):
+        """Normalized wrapper kind and dotted target paths from the CP plan."""
+
+        type: str
+        target_functions: list[str]
+
 
 logger = logging.getLogger(__name__)
 
 CP_PATCHES_ATTR = "_fsdp_turbo_cp_patches"
+CP_GROUP_ATTR = "_fsdp_turbo_cp_group"
 CAUSAL_LM_LOSS = "causal_lm_loss"
 GATED_DELTA_NET = "gated_delta_net"
 KDA_TYPE = "kda"
 
 
-def apply_function_patch_specs(specs, group, patch_types, label, model=None):
+def apply_function_patch_specs(
+    specs: Sequence[FunctionPatchSpec],
+    group: ProcessGroup | None,
+    patch_types: Mapping[str, Callable[[Callable[..., object], ProcessGroup | None], Callable[..., object]]],
+    label: str,
+    model: nn.Module | None = None,
+) -> None:
     """Build and install direct replacements for configured CP patch specs.
 
     ``type: gated_delta_net`` and ``type: kda`` specs are class-method patches deferred to
-    architecture-aware helpers (they require ``model``); all other types are
-    installed as module-level function wrappers via ``patch_types``.
+    architecture-aware helpers (they require ``model``). Other types use the
+    wrapper factories in ``patch_types``, for either module-level functions or
+    instance methods on matching model modules. Class definitions stay unchanged.
     """
     for spec in specs:
         patch_type = spec["type"]
@@ -36,6 +67,9 @@ def apply_function_patch_specs(specs, group, patch_types, label, model=None):
         patch_key = f"{label}:{patch_type}"
 
         for target in spec["target_functions"]:
+            if resolve_namespace_member(target) is None:
+                _apply_instance_wrapper(model, target, wrapper, group, patch_key)
+                continue
             original = resolve_callable(target)
             if patch_key in getattr(original, CP_PATCHES_ATTR, ()):
                 continue
@@ -49,6 +83,30 @@ def apply_function_patch_specs(specs, group, patch_types, label, model=None):
                 print_rank(logger.info, f"[Context Parallel/{_label}] Patched {_type} with {wrapper_name}.")
 
             patch_namespace_members(target, replacement, after_patch=on_patch)
+
+
+def _apply_instance_wrapper(model, target, wrapper, group, patch_key):
+    """Wrap regular instance methods without changing other models of the same class."""
+    if model is None:
+        raise RuntimeError(f"CP method patch {target!r} requires a model.")
+    target_class, member_name = resolve_class_member(target)
+    modules = [module for module in model.modules() if isinstance(module, target_class)]
+    if not modules:
+        raise RuntimeError(f"CP patch target did not match any module: {target!r}.")
+    for module in modules:
+        original = getattr(module, member_name)
+        if not isinstance(original, types.MethodType) or original.__self__ is not module:
+            raise TypeError(f"CP method patch {target!r} requires a regular instance method.")
+        applied = set(getattr(original, CP_PATCHES_ATTR, ()))
+        if patch_key in applied and getattr(original, CP_GROUP_ATTR, None) is not group:
+            raise ValueError(f"CP method patch {target!r} is already installed with a different group.")
+        if patch_key in applied:
+            continue
+        replacement = wrapper(original.__func__, group)
+        setattr(replacement, CP_PATCHES_ATTR, tuple(applied | {patch_key}))
+        setattr(replacement, CP_GROUP_ATTR, group)
+        setattr(module, member_name, types.MethodType(replacement, module))
+    print_rank(logger.info, f"[Context Parallel/{patch_key}] Patched instance method: {target}")
 
 
 def apply_cp_loss_patches(specs, group):
@@ -81,12 +139,12 @@ def apply_gdn_patches(model, spec, label):
         print_rank(logger.info, f"[Context Parallel/{label}] Patched gdn: {target}")
 
 
-def apply_kda_patches(model, spec, group, label):
+def apply_kda_patches(model: nn.Module, spec: FunctionPatchSpec, group: ProcessGroup, label: str) -> None:
     """Install the group-bound forward selected by the patch field."""
     if model is None:
         raise RuntimeError(f"[Context Parallel/{label}] KDA patches require a model.")
 
-    from fsdp_turbo.utils.patch import patch_model_members, resolve_class_member
+    from fsdp_turbo.utils.patch import patch_model_members
 
     if label == "Ulysses":
         from fsdp_turbo.modules.kda import get_ulysses_kda_forward

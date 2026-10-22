@@ -7,16 +7,21 @@ import json
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from fsdp_turbo.distributed.context_parallel.patch import CP_GROUP_ATTR
+
 from .engram.host_offload_engram import HostOffloadEngram
 
 from . import model as reference_model
 from .lm_head import ChunkedLMHead
+
+if TYPE_CHECKING:
+    from .image_processor import ImageInput
 
 
 def _load_model_args(*, config_path: str | Path | None = None, model_name_or_path: str | Path | None = None) -> dict:
@@ -83,20 +88,37 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
             engram_rows_per_chunk=engram_rows_per_chunk,
         )
 
+    @property
+    def _kv_cp_group(self):
+        """Use the group installed on this model's attention methods by the CP wrapper."""
+        groups = [getattr(layer.attn.forward, CP_GROUP_ATTR, None) for layer in getattr(self.model, "layers", ())]
+        group = groups[0] if groups else None
+        if any(item is not group for item in groups):
+            raise ValueError("DeepSeek-V4.1 CP requires every attention layer to use the same group.")
+        if group is not None and torch.distributed.get_world_size(group) > 1:
+            return group
+        return None
+
     def forward(
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
-        images=None,
+        images: list[list[ImageInput]] | None = None,
         token_types: torch.LongTensor | None = None,
         use_cache: bool = False,
         output_hidden_states: bool = False,
-        sfa_layout: Literal["BSND", "TND"] = "BSND",
+        sfa_layout: str | list[str] | tuple[str, ...] = "BSND",
         actual_seq_len: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        **model_inputs,
+        **model_inputs: object,
     ) -> DeepseekV41CausalLMOutput:
+        """Compute training logits and optional causal loss.
+
+        CP consumes equal contiguous text shards and complete, unshifted labels
+        on every rank. Unsupported cache, layout and input combinations raise
+        ValueError before the corresponding model computation.
+        """
         if use_cache:
             raise ValueError("DeepSeek-V4.1 FSDPTurbo training does not support KV cache inputs.")
         if model_inputs:
@@ -107,6 +129,7 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         if images is not None and not self.model_args.vision_enabled:
             raise ValueError("Image inputs require an enabled DeepSeek vision tower.")
 
+        cp_group = self._kv_cp_group
         if isinstance(sfa_layout, (list, tuple)):
             if len(sfa_layout) != 1:
                 raise ValueError("A batch must use one common sfa_layout.")
@@ -114,6 +137,8 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         sfa_layout = sfa_layout.upper()
         if sfa_layout not in ("BSND", "TND"):
             raise ValueError(f"sfa_layout must be BSND or TND, got {sfa_layout!r}.")
+        if cp_group is not None and sfa_layout != "BSND":
+            raise ValueError("DeepSeek-V4.1 CP currently supports BSND input only.")
         cu_seqlens = None
         if sfa_layout == "TND":
             if not self.model_args.use_sparse_flash_attn:
@@ -150,8 +175,20 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
                     raise ValueError("Packed TND position_ids must restart at zero for every document.")
         elif actual_seq_len is not None:
             raise ValueError("actual_seq_len is only valid when sfa_layout='TND'.")
-        elif position_ids is not None:
-            raise ValueError("position_ids is currently only valid for TND input.")
+        elif position_ids is not None and cp_group is None:
+            raise ValueError("position_ids is currently only valid for TND or CP input.")
+
+        engram_hashes = None
+        if cp_group is not None:
+            from .context_parallel import prepare_cp_inputs
+
+            hash_input_ids, hash_slice = prepare_cp_inputs(
+                self, input_ids, position_ids, attention_mask, labels, images, token_types
+            )
+            if self.model.engram_hash is not None:
+                # Hash complete token history before slicing so CP shard edges
+                # do not become artificial n-gram sequence boundaries.
+                engram_hashes = self.model.engram_hash(hash_input_ids, 0)[:, hash_slice]
 
         hidden_states, _, collected_hidden_states = self.model.forward_backbone(
             input_ids,
@@ -161,9 +198,10 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
             output_hidden_states=output_hidden_states,
             sfa_layout=sfa_layout,
             cu_seqlens=cu_seqlens,
+            engram_hashes=engram_hashes,
         )
         shift_labels = None
-        if labels is not None:
+        if labels is not None and cp_group is None:
             if cu_seqlens is not None and cu_seqlens.numel() > 2:
                 labels = labels.clone()
                 boundary_starts = cu_seqlens[1:-1].to(device=labels.device, dtype=torch.long)
@@ -177,7 +215,11 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         else:
             logits = self.model.head(hidden_states, full_logits=True)
             loss = None
-            if shift_labels is not None:
+            if labels is not None and cp_group is not None:
+                from fsdp_turbo.distributed.context_parallel.loss import cp_compute_lm_loss
+
+                loss = cp_compute_lm_loss(logits, labels, cp_group)
+            elif shift_labels is not None:
                 loss = F.cross_entropy(
                     logits[:, :-1].float().reshape(-1, logits.size(-1)),
                     shift_labels.reshape(-1),

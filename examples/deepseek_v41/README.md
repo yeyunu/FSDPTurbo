@@ -190,7 +190,8 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 | Padding attention mask | 支持 |
 | Packed TND/BSND SparseFlashMla 训练 | 支持；需配套 CANN 算子包 |
 | 官方 FP8/FP4 checkpoint 加载 | 暂不支持 |
-| V4.1 attention tensor/context parallel | 暂不支持 |
+| V4.1 attention tensor parallel | 暂不支持 |
+| V4.1 eager KV-AllGather context parallel（小算子 CP） | 支持；仅无 padding 的等长 BSND 文本，TP/Ulysses/KCP=1，关闭全部融合开关、Triton RoPE、recompute、chunk_batch 和 chunk_loss |
 | CSA2 跨层压缩状态与稀疏索引结构 | 支持构造与结构验证 |
 | CANN Compressor/CompressorGrad 融合压缩算子 | 可选；设置 `model.use_fused_compressor: true` |
 | Lightning Indexer 融合算子 | 可选；支持 Atlas A3（Ascend 910_93）、Ascend 910B/910C 和 Ascend950DT |
@@ -228,6 +229,14 @@ MHC 融合开关同时替换每个 Attention/FFN 前的 projection、Sinkhorn、
 当前模型没有 compressor positional bias，因此向算子传入零 `ape`。该路径要求
 `cann_ops_transformer` 与 CANN/torch-npu 版本配套；默认保持关闭，关闭时继续运行
 原 FP32 投影、softmax pooling 实现。
+
+小算子 CP 沿用通用配置：设置 `distributed.kv_allgather_parallel_size`，在
+`cp_plan.kv_allgather_function_patches` 中使用 `type: compressor_sparse_attention`，
+`target_functions` 指定 `fsdp_turbo.models.deepseek.deepseek_v41.attention.Attention.forward`。
+Adapter 已处理 CP loss，`loss_function_patches` 保持为空；完整序列长度须整除 CP 数，
+本地序列长度须整除各层压缩比。CP 使用完整、未移位的 labels，在全局移位后匹配
+本地 logits，保留分片边界的预测目标；`memory.chunk_loss` 必须关闭，该组合会在配置
+初始化时被拒绝。非 CP 训练仍可使用下文的 chunk loss。
 
 Clipped SwiGLU 融合开关开启后，`swiglu_limit > 0` 的共享专家和原生路由专家
 调用 CANN `ClippedSwiglu`，反向调用配套的 `ClippedSwigluGrad`，融合裁剪与激活计算。
@@ -396,7 +405,7 @@ CPU/NPU 搬运，不依赖 `cann_ops_transformer`，当前仅面向 eager 正确
 算子包不支持直接注册 Host storage 时，eager 会在每次 forward 重新提交；
 `torch.compile` 会显式拒绝该路径，避免产生表未更新的静默错误。Host 表不参与 TP，
 可以与当前仅切分 shared expert 的 TP plan 共存；当前仍不支持对 Engram 模块本身应用 TP、
-PP、CP 或跨 EP degree checkpoint 转换。
+PP 或跨 EP degree checkpoint 转换；小算子 KV-AllGather CP 已支持，其他 CP 组合仍不支持。
 
 token 压缩、特殊 token 处理和 hash multiplier 已与发布参考实现保持同一 ABI。压缩词表
 不是 99,092 时会直接失败，不再通过告警后静默改写配置。

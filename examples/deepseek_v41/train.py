@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import argparse
 import logging
 import os
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -24,10 +27,43 @@ from fsdp_turbo.training.factories import OptimizerFactory, SchedulerFactory
 from fsdp_turbo.training.trainer import BaseTrainer
 from fsdp_turbo.utils.log import print_rank
 
+if TYPE_CHECKING:
+    from typing import TypedDict
+
+    from fsdp_turbo.models.deepseek.deepseek_v41.image_processor import ImageInput
+
+    class _TrainingBatch(TypedDict, total=False):
+        input_ids: torch.Tensor
+        attention_mask: torch.Tensor
+        labels: torch.Tensor
+        position_ids: torch.Tensor
+        actual_seq_len: torch.Tensor
+        images: list[list[ImageInput]]
+        token_types: torch.Tensor
+        sfa_layout: str | list[str] | tuple[str, ...]
+
+
 logger = logging.getLogger(__name__)
 
 
 class DeepseekV41Trainer(BaseTrainer):
+    def prepare_batch(self, batch: _TrainingBatch) -> _TrainingBatch:
+        """Reject unsupported full batches before the base trainer pads and shards them."""
+        cp_size = self.config.distributed.kv_allgather_parallel_size
+        if cp_size > 1:
+            from fsdp_turbo.models.deepseek.deepseek_v41.context_parallel import validate_sequence_length
+
+            layout = batch.get("sfa_layout", "BSND")
+            if layout not in ("BSND", ["BSND"], ("BSND",)) or batch.get("actual_seq_len") is not None:
+                raise ValueError("DeepSeek-V4.1 CP currently supports unpacked BSND text only.")
+            validate_sequence_length(batch["input_ids"].shape[1], cp_size, self._model_args())
+            if batch.get("images") is not None or batch.get("token_types") is not None:
+                raise ValueError("DeepSeek-V4.1 CP currently supports text batches only.")
+            mask = batch.get("attention_mask")
+            if mask is not None and not bool(mask.bool().all()):
+                raise ValueError("DeepSeek-V4.1 CP currently requires unpadded equal-length text.")
+        return super().prepare_batch(batch)
+
     def _model_args(self):
         if not hasattr(self, "_cached_model_args"):
             self._cached_model_args = replace(

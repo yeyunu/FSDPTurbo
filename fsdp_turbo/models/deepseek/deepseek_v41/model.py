@@ -161,8 +161,13 @@ class Transformer(nn.Module):
         output_hidden_states: bool = False,
         sfa_layout: str = "BSND",
         cu_seqlens: torch.Tensor | None = None,
+        engram_hashes: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, ...] | None]:
-        """Run the shared backbone path used by training and generation."""
+        """Run the shared backbone path used by training and generation.
+
+        CP supplies local rows of globally computed ``engram_hashes`` to retain
+        n-gram history across shard boundaries; other callers leave it unset.
+        """
         if start_pos == 0:
             shared_attn.reset()
 
@@ -171,21 +176,23 @@ class Transformer(nn.Module):
         if attention_mask is not None:
             attention_mask = attention_mask.bool()
             engram_mask = attention_mask if engram_mask is None else engram_mask & attention_mask
-        if self.engram_hash is None:
-            engram_hashes = None
-        elif cu_seqlens is not None and cu_seqlens.numel() > 2:
-            boundaries = cu_seqlens.tolist()
-            engram_hashes = torch.cat(
-                [
-                    self.engram_hash(
-                        input_ids[:, begin:end], 0, None if engram_mask is None else engram_mask[:, begin:end]
-                    )
-                    for begin, end in zip(boundaries[:-1], boundaries[1:])
-                ],
-                dim=1,
-            )
-        else:
-            engram_hashes = self.engram_hash(input_ids, start_pos, engram_mask)
+        # CP supplies hashes from the complete sequence before selecting local rows.
+        if engram_hashes is None:
+            if self.engram_hash is None:
+                engram_hashes = None
+            elif cu_seqlens is not None and cu_seqlens.numel() > 2:
+                boundaries = cu_seqlens.tolist()
+                engram_hashes = torch.cat(
+                    [
+                        self.engram_hash(
+                            input_ids[:, begin:end], 0, None if engram_mask is None else engram_mask[:, begin:end]
+                        )
+                        for begin, end in zip(boundaries[:-1], boundaries[1:])
+                    ],
+                    dim=1,
+                )
+            else:
+                engram_hashes = self.engram_hash(input_ids, start_pos, engram_mask)
 
         h = self.embed(input_ids)
         if images is not None:

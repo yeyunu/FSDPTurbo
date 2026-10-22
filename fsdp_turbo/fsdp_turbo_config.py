@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+# Keep the configuration schema and its __post_init__ validation together.
 # pylint: disable=too-many-lines
 import logging
 import os
@@ -526,10 +527,12 @@ class FSDPTurboConfig:
             [] if self.distributed.tp_plan.sequence_parallel is None else self.distributed.tp_plan.sequence_parallel
         )
 
-    def validate_cp_config(self):
+    def validate_cp_config(self) -> None:
+        """Normalize CP patch specs and reject unsupported parallel configurations."""
         kcp_parallel_size = self.distributed.kcp_parallel_size
         ulysses_parallel_size = self.distributed.ulysses_parallel_size
         for field_name, size in (
+            ("kv_allgather_parallel_size", self.distributed.kv_allgather_parallel_size),
             ("kcp_parallel_size", kcp_parallel_size),
             ("ulysses_parallel_size", ulysses_parallel_size),
         ):
@@ -575,8 +578,39 @@ class FSDPTurboConfig:
                     raise ValueError(
                         "KDA context-parallel patches must use ulysses_function_patches or kcp_function_patches."
                     )
+                if patch_type == "compressor_sparse_attention" and field_name != "kv_allgather_function_patches":
+                    raise ValueError("Compressor sparse attention CP must use kv_allgather_function_patches.")
                 normalized.append(normalized_patch)
             setattr(self.distributed.cp_plan, field_name, normalized)
+
+        compressor_sparse_patches = [
+            spec
+            for spec in self.distributed.cp_plan.kv_allgather_function_patches
+            if spec["type"] == "compressor_sparse_attention"
+        ]
+        if compressor_sparse_patches:
+            if len(self.distributed.cp_plan.kv_allgather_function_patches) != 1:
+                raise ValueError("DeepSeek-V4.1 CP requires exactly one compressor sparse attention patch.")
+            if ulysses_parallel_size != 1 or kcp_parallel_size != 1 or self.distributed.tensor_parallel_size != 1:
+                raise ValueError("DeepSeek-V4.1 KV-AllGather requires Ulysses=KCP=TP=1.")
+            if self.memory.recompute or self.memory.chunk_batch or self.distributed.cp_plan.loss_function_patches:
+                raise ValueError("DeepSeek-V4.1 CP does not support recompute/chunk_batch or external loss patches.")
+            if self.data.is_multimodal:
+                raise ValueError("DeepSeek-V4.1 CP currently supports text batches only.")
+            if self.data.sfa_layout == "TND":
+                raise ValueError("DeepSeek-V4.1 CP currently supports BSND input only.")
+            if any(
+                (
+                    self.model.use_sparse_flash_attn,
+                    self.model.use_fused_lightning_indexer,
+                    self.model.use_fused_compressor,
+                    self.model.use_fused_mhc,
+                    self.model.use_fused_clipped_swiglu,
+                    self.model.use_triton_inplace_rope,
+                    self.model.use_fused_vision_flash_attn,
+                )
+            ):
+                raise ValueError("DeepSeek-V4.1 CP requires all fused flags and Triton RoPE disabled.")
 
         if kcp_parallel_size > 1 and ulysses_parallel_size > 1:
             raise ValueError(
@@ -709,7 +743,7 @@ class FSDPTurboConfig:
                 if pattern not in fsdp_plan.ignored_modules:
                     fsdp_plan.ignored_modules.append(pattern)
 
-    def validate_engram_config(self):
+    def validate_engram_config(self) -> None:
         """Validate parallel topology required by Host-offload Engram."""
         backend = self.model.engram_storage_backend
         supported_backends = (
@@ -723,7 +757,12 @@ class FSDPTurboConfig:
         if self.distributed.expert_parallel_size <= 1:
             raise ValueError("Host-offload Engram requires expert_parallel_size > 1.")
         if self.distributed.kv_allgather_parallel_size != 1 or self.distributed.ulysses_parallel_size != 1:
-            raise ValueError("Host-offload Engram context-parallel token halo is not implemented yet.")
+            compressor_sparse_cp = any(
+                spec["type"] == "compressor_sparse_attention"
+                for spec in self.distributed.cp_plan.kv_allgather_function_patches
+            )
+            if not compressor_sparse_cp:
+                raise ValueError("Host-offload Engram CP requires the compressor_sparse_attention KV-AllGather patch.")
 
     def validate_module_patches(self):
         """Validate the namespace-neutral module patch configuration.

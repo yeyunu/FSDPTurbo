@@ -8,6 +8,7 @@ from torch import nn
 from fsdp_turbo.ops.sparse_attention import indexed_sparse_attention
 
 from .compressor import Compressor
+from .context_parallel import attention_forward
 from .indexer import Indexer
 from .layers import ColumnParallelLinear, Linear, RMSNorm, RowParallelLinear, apply_rotary_emb, precompute_freqs_cis
 from .model_args import ModelArgs
@@ -201,7 +202,11 @@ class Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         sfa_layout: str = "BSND",
         cu_seqlens: torch.Tensor | None = None,
-    ):
+        cp_group: torch.distributed.ProcessGroup | None = None,
+    ) -> torch.Tensor:
+        """Attend to local queries, using globally gathered KV when CP is enabled."""
+        if cp_group is not None:
+            return attention_forward(self, x, start_pos, cp_group)
         bsz, seqlen, _ = x.size()
         packed_cu_seqlens = cu_seqlens if sfa_layout == "TND" else None
         packed_lengths = _packed_sequence_lengths(seqlen, packed_cu_seqlens) if start_pos == 0 else None
