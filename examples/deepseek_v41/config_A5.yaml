@@ -133,6 +133,12 @@ distributed:
     cast_forward_inputs: false
     num_to_forward_prefetch: 1
     num_to_backward_prefetch: 1
+    prefetch_modules:
+      - model.embed
+      - model.vision
+      - model.aligner
+      - model.layers.{*}
+      - model.head
     hook_modules:
       - model.layers.{*}
       - model.vision

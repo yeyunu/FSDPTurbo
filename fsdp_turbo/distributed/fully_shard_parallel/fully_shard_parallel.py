@@ -41,27 +41,34 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, 
     return model
 
 
-def set_modules_to_prefetch(model: torch.nn.Module, fsdp_modules: list[torch.nn.Module], fsdp_plan: FSDPPlanConfig):
-    """Configure forward and backward prefetching."""
-    wrapped_modules_in_order: list[torch.nn.Module] = []
-    for sub_module in model.modules():  # pre-order
-        if any(sub_module is target_module for target_module in fsdp_modules):
-            wrapped_modules_in_order.append(sub_module)
+def set_modules_to_prefetch(
+    model: torch.nn.Module, fsdp_modules: dict[torch.nn.Module, Any], fsdp_plan: FSDPPlanConfig
+):
+    """Configure prefetching in explicit execution order or registration order."""
+    wrapped_modules_in_order = list(fsdp_modules)
+    if fsdp_plan.prefetch_modules is not None:
+        named_modules = dict(model.named_modules())
+        wrapped_modules_in_order = list(
+            dict.fromkeys(
+                module
+                for pattern in fsdp_plan.prefetch_modules
+                for name, module in named_modules.items()
+                if module in fsdp_modules and module_name_match(pattern, name)
+            )
+        )
 
     if fsdp_plan.num_to_forward_prefetch > 0:
         for i, layer in enumerate(wrapped_modules_in_order):
-            j_end = min(len(wrapped_modules_in_order), i + 1 + fsdp_plan.num_to_forward_prefetch)
-            layers_to_prefetch = wrapped_modules_in_order[i + 1 : j_end]
-            if layers_to_prefetch:
-                layer.set_modules_to_forward_prefetch(layers_to_prefetch)
+            layer.set_modules_to_forward_prefetch(
+                wrapped_modules_in_order[i + 1 : i + 1 + fsdp_plan.num_to_forward_prefetch]
+            )
 
     if fsdp_plan.num_to_backward_prefetch > 0:
         rev_wrapped_modules_in_order = list(reversed(wrapped_modules_in_order))
         for i, layer in enumerate(rev_wrapped_modules_in_order):
-            j_end = min(len(rev_wrapped_modules_in_order), i + 1 + fsdp_plan.num_to_backward_prefetch)
-            layers_to_prefetch = rev_wrapped_modules_in_order[i + 1 : j_end]
-            if layers_to_prefetch:
-                layer.set_modules_to_backward_prefetch(layers_to_prefetch)
+            layer.set_modules_to_backward_prefetch(
+                rev_wrapped_modules_in_order[i + 1 : i + 1 + fsdp_plan.num_to_backward_prefetch]
+            )
 
 
 def get_mixprecision_policy(fsdp_plan: FSDPPlanConfig):

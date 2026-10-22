@@ -62,6 +62,7 @@ disable = [
   "too-many-positional-arguments",
   "too-many-branches",
   "too-many-statements",
+  "too-many-lines",
   "too-many-locals",
   "too-many-return-statements",
   "too-many-instance-attributes",

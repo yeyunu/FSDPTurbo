@@ -182,6 +182,10 @@ class FSDPPlanConfig:
     # 'native': Use PyTorch native FSDP implementation (default)
     fsdp_implementation: Literal["custom", "native"] = "native"
 
+    # apply_modules patterns in forward execution order; backward uses the reverse.
+    # None preserves module registration order.
+    prefetch_modules: Optional[List[str]] = None
+
 
 @dataclass
 class TPPlanConfig:
@@ -436,8 +440,9 @@ class FSDPTurboConfig:
             if not isinstance(self.data.conversation_column, str) or not self.data.conversation_column:
                 raise ValueError("data.conversation_column must be a non-empty string for multimodal data.")
 
-    def validate_fsdp_config(self):
-        """fully shard plan
+    def validate_fsdp_config(self) -> None:
+        """Initialize the FSDP plan and validate its prefetch pattern order.
+
         config = FSDPTurboConfig(
             distributed=DistributedConfig(
                 fsdp_plan=FSDPPlanConfig(
@@ -452,6 +457,17 @@ class FSDPTurboConfig:
         self.distributed.fsdp_plan = (
             FSDPPlanConfig() if self.distributed.fsdp_plan is None else self.distributed.fsdp_plan
         )
+        fsdp_plan = self.distributed.fsdp_plan
+        prefetch_modules = fsdp_plan.prefetch_modules
+        if prefetch_modules is not None:
+            if not isinstance(prefetch_modules, list) or any(
+                not isinstance(pattern, str) for pattern in prefetch_modules
+            ):
+                raise ValueError("distributed.fsdp_plan.prefetch_modules must be a list of apply_modules patterns.")
+            if sorted(prefetch_modules) != sorted(fsdp_plan.apply_modules or {}):
+                raise ValueError(
+                    "distributed.fsdp_plan.prefetch_modules must contain every apply_modules pattern exactly once."
+                )
         if self.distributed.fully_shard_parallel_size > 1:
             if self.distributed.expert_parallel_size > 1:
                 self.distributed.fsdp_plan.ignored_modules.extend(self.distributed.ep_plan.apply_modules)

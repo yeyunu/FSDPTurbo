@@ -130,8 +130,15 @@ distributed:
     # DeepSeek controls numerical dtypes inside the model. In particular,
     # blanket casting would truncate FP32 HC pre-mix coefficients to BF16.
     cast_forward_inputs: false
-    num_to_forward_prefetch: 2
-    num_to_backward_prefetch: 2
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+    prefetch_modules:
+      - model.embed
+      - model.vision.patch_embed
+      - model.vision.blocks.{*}
+      - model.aligner
+      - model.layers.{*}
+      - model.head
     hook_modules:
       - model.layers.{*}
       - model.vision.blocks.{*}
