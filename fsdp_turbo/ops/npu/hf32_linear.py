@@ -36,11 +36,14 @@ def _hf32_matmul():
 
 class _HF32Linear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight):
-        ctx.save_for_backward(x, weight)
+    def forward(x, weight):
         # HF32 is a math mode for FP32 tensors, not an autocast dtype.
         with torch.autocast(device_type=x.device.type, enabled=False), _hf32_matmul():
             return F.linear(x, weight)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        ctx.save_for_backward(*inputs)
 
     @staticmethod
     def backward(ctx, grad_output):

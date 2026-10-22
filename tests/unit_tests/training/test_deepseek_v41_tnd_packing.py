@@ -14,6 +14,7 @@ from fsdp_turbo.models.deepseek.deepseek_v41.model import (
     Compressor,
     Indexer,
     ModelArgs,
+    ParallelHead,
     shared_attn,
 )
 from fsdp_turbo.training.dataloader import _MultimodalCollator
@@ -62,15 +63,12 @@ def _image_modules():
 
 class DeepseekV41TndPackingTests(unittest.TestCase):
     def test_adapter_passes_tnd_boundaries_to_shared_backbone(self):
-        class Head(torch.nn.Module):
-            def forward(self, hidden, full_logits=False):
-                self.full_logits = full_logits
-                return hidden
-
         class Backbone(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.head = Head()
+                self.head = ParallelHead(8, 8)
+                with torch.no_grad():
+                    self.head.weight.copy_(torch.eye(8))
 
             def forward_backbone(self, input_ids, **kwargs):
                 self.call_kwargs = kwargs
@@ -98,7 +96,7 @@ class DeepseekV41TndPackingTests(unittest.TestCase):
 
         self.assertEqual(backbone.call_kwargs["sfa_layout"], "TND")
         self.assertEqual(backbone.call_kwargs["cu_seqlens"].tolist(), [0, 2, 4])
-        self.assertTrue(backbone.head.full_logits)
+        self.assertEqual(output.logits.shape, (1, 4, 8))
         expected_targets = torch.tensor([[2, -100, 4]])
         expected_loss = torch.nn.functional.cross_entropy(
             output.logits[:, :-1].reshape(-1, 8),

@@ -16,6 +16,7 @@ from torch import nn
 from .engram.host_offload_engram import HostOffloadEngram
 
 from . import model as reference_model
+from .lm_head import ChunkedLMHead
 
 
 def _load_model_args(*, config_path: str | Path | None = None, model_name_or_path: str | Path | None = None) -> dict:
@@ -34,7 +35,7 @@ class DeepseekV41CausalLMOutput:
     """Minimal Transformers-like output consumed by :class:`BaseTrainer`."""
 
     loss: torch.Tensor | None
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     hidden_states: tuple[torch.Tensor, ...] | None = None
 
 
@@ -50,10 +51,20 @@ def _validate_training_args(model_args) -> None:
 class DeepseekV41ForCausalLMAdapter(nn.Module):
     """Trainable causal-LM facade over DeepSeek's reference ``Transformer``."""
 
-    def __init__(self, backbone: nn.Module, model_args: reference_model.ModelArgs):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        model_args: reference_model.ModelArgs,
+        *,
+        chunk_loss: bool = False,
+        chunk_loss_size: int = 512,
+    ):
         super().__init__()
         self.model = backbone
         self.model_args = model_args
+        self.chunk_loss = chunk_loss
+        if chunk_loss:
+            self.model.head = ChunkedLMHead(backbone.head, chunk_loss_size=chunk_loss_size)
 
     def from_pretrained(
         self,
@@ -151,26 +162,30 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
             sfa_layout=sfa_layout,
             cu_seqlens=cu_seqlens,
         )
-        logits = self.model.head(hidden_states, full_logits=True)
-
-        loss = None
+        shift_labels = None
         if labels is not None:
             if cu_seqlens is not None and cu_seqlens.numel() > 2:
                 labels = labels.clone()
                 boundary_starts = cu_seqlens[1:-1].to(device=labels.device, dtype=torch.long)
                 labels.view(-1)[boundary_starts] = -100
-            shift_logits = logits[:, :-1].contiguous().float()
-            shift_labels = labels[:, 1:].contiguous().to(shift_logits.device)
+            shift_labels = labels[:, 1:].contiguous().to(hidden_states.device)
             if attention_mask is not None:
                 shift_labels = shift_labels.masked_fill(~attention_mask[:, 1:].bool(), -100)
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-                reduction="sum",
-            )
-            valid_target_count = (shift_labels != -100).sum().clamp_min(1)
-            loss = loss / valid_target_count
+
+        if self.chunk_loss:
+            logits, loss = self.model.head(hidden_states, shift_labels=shift_labels)
+        else:
+            logits = self.model.head(hidden_states, full_logits=True)
+            loss = None
+            if shift_labels is not None:
+                loss = F.cross_entropy(
+                    logits[:, :-1].float().reshape(-1, logits.size(-1)),
+                    shift_labels.reshape(-1),
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                valid_target_count = (shift_labels != -100).sum().clamp_min(1)
+                loss = loss / valid_target_count
 
         return DeepseekV41CausalLMOutput(
             loss=loss,
@@ -195,6 +210,8 @@ def _build_deepseek_v41_model(
     *,
     tokenizer=None,
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
+    chunk_loss: bool = False,
+    chunk_loss_size: int = 512,
 ) -> DeepseekV41ForCausalLMAdapter:
     if head_compute_dtype not in ("fp32", "bf16", "hf32"):
         raise ValueError("head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
@@ -202,7 +219,12 @@ def _build_deepseek_v41_model(
         backbone = reference_model.Transformer(model_args, tokenizer=tokenizer)
     backbone.head.compute_dtype = torch.bfloat16 if head_compute_dtype == "bf16" else torch.float32
     backbone.head.use_hf32 = head_compute_dtype == "hf32"
-    return DeepseekV41ForCausalLMAdapter(backbone, model_args)
+    return DeepseekV41ForCausalLMAdapter(
+        backbone,
+        model_args,
+        chunk_loss=chunk_loss,
+        chunk_loss_size=chunk_loss_size,
+    )
 
 
 def build_deepseek_v41_model(
@@ -220,6 +242,8 @@ def build_deepseek_v41_model(
     use_triton_inplace_rope: bool = False,
     use_fused_vision_flash_attn: bool = False,
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
+    chunk_loss: bool = False,
+    chunk_loss_size: int = 512,
 ) -> DeepseekV41ForCausalLMAdapter:
     """Build an uninitialized BF16 model from model_args or a selected config JSON.
 
@@ -245,6 +269,8 @@ def build_deepseek_v41_model(
         model_args,
         tokenizer=tokenizer,
         head_compute_dtype=head_compute_dtype,
+        chunk_loss=chunk_loss,
+        chunk_loss_size=chunk_loss_size,
     )
 
 

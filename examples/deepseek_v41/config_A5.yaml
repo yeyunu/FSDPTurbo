@@ -166,6 +166,9 @@ distributed:
 
 # --- Memory Configuration ---
 memory:
+  # Split the output projection and loss along the sequence axis.
+  chunk_loss: false
+  chunk_loss_size: 512
   # V4.1 attention shares runtime state between layers. Recompute requires a
   # model-specific state capture and is intentionally disabled in this adapter.
   recompute: false

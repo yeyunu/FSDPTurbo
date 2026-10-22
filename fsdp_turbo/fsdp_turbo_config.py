@@ -11,6 +11,7 @@ import yaml
 
 from fsdp_turbo.utils.dtype import get_dtype
 from fsdp_turbo.utils.log import print_rank
+from fsdp_turbo.utils.str_match import module_name_match
 
 logger = logging.getLogger(__name__)
 
@@ -331,6 +332,8 @@ class MemoryConfig:
     recompute_plan: List[str] = None
     chunk_batch: bool = False
     chunk_batch_plan: Optional[ChunkBatchPlanConfig] = None
+    chunk_loss: bool = False
+    chunk_loss_size: int = 512
     swap_activation: bool = False
     swap_activation_plan: Optional[SwapActivationPlanConfig] = None
 
@@ -357,6 +360,7 @@ class FSDPTurboConfig:
         self.validate_model_config()
         self.validate_data_config()
         self.validate_tp_config()
+        self.validate_chunk_loss_config()
         self.validate_cp_config()
         self.validate_module_patches()
         self.validate_ep_config()
@@ -368,6 +372,33 @@ class FSDPTurboConfig:
         self.validate_fsdp_config()
         self.validate_vp_config()
         self.validate_memory_snapshot_config()
+
+    def validate_chunk_loss_config(self):
+        if not isinstance(self.memory.chunk_loss, bool):
+            raise ValueError("memory.chunk_loss must be a boolean.")
+        chunk_size = self.memory.chunk_loss_size
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError("memory.chunk_loss_size must be a positive integer.")
+        if not self.memory.chunk_loss:
+            return
+        if any(
+            size > 1
+            for size in (
+                self.distributed.ulysses_parallel_size,
+                self.distributed.kv_allgather_parallel_size,
+                self.distributed.kcp_parallel_size,
+            )
+        ):
+            raise ValueError("memory.chunk_loss does not support context parallelism.")
+        recompute_patterns = (self.memory.recompute_plan or []) if self.memory.recompute else []
+        swap_plan = self.memory.swap_activation_plan
+        swap_patterns = (swap_plan.apply_modules or []) if self.memory.swap_activation and swap_plan else []
+        if any(
+            module_name_match(pattern, name)
+            for pattern in [*recompute_patterns, *swap_patterns]
+            for name in ("", "model.head")
+        ):
+            raise ValueError("memory.chunk_loss cannot wrap the head or root in recompute/swap_activation hooks.")
 
     def validate_model_config(self):
         """Validate model loading configuration."""

@@ -73,6 +73,8 @@ class DeepseekV41Trainer(BaseTrainer):
             use_triton_inplace_rope=self.config.model.use_triton_inplace_rope,
             use_fused_vision_flash_attn=(self.config.model.use_fused_vision_flash_attn),
             head_compute_dtype=self.config.model.head_compute_dtype,
+            chunk_loss=self.config.memory.chunk_loss,
+            chunk_loss_size=self.config.memory.chunk_loss_size,
         )
         training_model = prepare_deepseek_v41_model_for_fsdp(
             training_model,

@@ -48,8 +48,8 @@ cd examples/deepseek_v41
 bash run.sh
 ```
 
-训练 head 的计算精度由 YAML 中的 `model.head_compute_dtype` 控制，默认 `fp32`。
-如需启用 BF16 head + FP32 CE，可在 `config.yaml` 或 `config_tnd.yaml` 中设置：
+训练 head 的计算精度由 YAML 中的 `model.head_compute_dtype` 控制。A3、A5 和
+TND 示例均设为 `bf16`，使用 BF16 head + FP32 CE；未配置该字段时框架默认 `fp32`：
 
 ```yaml
 model:
@@ -240,6 +240,43 @@ autograd 一阶梯度，不包含 TorchAir 图模式或高阶梯度。
 默认 8 卡拓扑为 `FSDP=4, TP=2, EP=4, expert DP=2`。注意力包含 attention
 sink 与 indexed sparse-attention 的特殊头布局，因此当前保持复制，不能直接套用通用
 Colwise/Rowwise 规则；`cp_plan` 也保持为空。
+
+## Chunk Loss
+
+在所用 YAML 的 `memory` 下开启分块损失，默认关闭：
+
+```yaml
+memory:
+  chunk_loss: true
+  chunk_loss_size: 512
+```
+
+`chunk_loss_size` 是每块的序列 token 数，必须为正整数。该功能沿用旧版
+DeepSeek-V4-Flash 的通用 `chunk_loss()`，逐块计算输出投影、交叉熵及其梯度，
+按整批有效标签数归一化。它支持 `head_compute_dtype` 的 FP32、BF16 和 HF32
+路径，交叉熵保持 FP32；HF32 仍需要配套的 Ascend 环境。
+
+分块计算保留 padding、`-100` 标签及 packed TND 的文档边界屏蔽，也可用于
+图文训练。整批标签均被屏蔽时返回零 loss 和零梯度。它不能与 CP 同时开启，
+配置会在启动时拒绝该组合。
+
+Recompute 与 activation swap 的 plan 可继续匹配 decoder 层，但不能覆盖
+`model.head` 或根模块（包括匹配它们的通配符）。分块求导使用的 `torch.func`
+不支持这些 wrapper 的 saved-tensor hooks；配置会提前拒绝该组合。
+
+有 `labels` 时，分块模式返回 `loss`，`logits=None`，不生成全量 logits，也
+不需要收集全部中间 hidden states。没有 `labels` 时仍沿用普通 logits 路径。
+仅在 `chunk_loss: true` 时，模型 adapter 初始化才装配 `ChunkedLMHead`；
+关闭时保留原始 head 对象和普通 logits/loss 路径。训练入口只传配置，不再
+替换 head 或注入 loss 回调。分块 head 的 forward 返回 `(logits, loss)`，保留
+`model.head.weight` 参数名及 FSDP forward 边界，可继续使用现有 FSDP plan
+和 checkpoint。
+
+沿用主仓通用实现，跨块权重梯度按传入 head 权重的 dtype 累加。
+BF16 head 投影配合 BF16 梯度累加时，该缓冲区占用为
+FP32 的一半；logits 仍转换为 FP32 计算交叉熵，loss 也保持 FP32。
+多分块低精度累加会引入舍入误差，需要在实际训练中对比 loss 曲线和梯度范数。
+FP32/HF32 投影的权重及其梯度累加仍使用 FP32，不具备上述缓冲区减半收益。
 
 ## Engram 切分
 

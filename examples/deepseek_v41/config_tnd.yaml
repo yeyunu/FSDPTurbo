@@ -10,7 +10,7 @@ model:
   tokenizer_name_or_path: "./DSV41/models/DeepSeek-V4.1-Flash"
   torch_dtype: "bf16"
   # Head projection precision: fp32, bf16, or hf32 (NPU); cross entropy remains FP32.
-  head_compute_dtype: "fp32"
+  head_compute_dtype: "bf16"
   engram_storage_backend: "host_offload"
   # Use CANN SparseFlashMla/SparseFlashMlaGrad instead of eager indexed attention.
   use_sparse_flash_attn: true
@@ -168,6 +168,9 @@ distributed:
 
 # --- Memory Configuration ---
 memory:
+  # Preserve document-boundary masks while computing the loss in chunks.
+  chunk_loss: false
+  chunk_loss_size: 512
   # V4.1 attention shares runtime state between layers. Recompute requires a
   # model-specific state capture and is intentionally disabled in this adapter.
   recompute: false
