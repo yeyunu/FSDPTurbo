@@ -62,13 +62,9 @@
       <td>权重与优化器状态保存/恢复</td>
     </tr>
     <tr>
-      <td rowspan="2">量化特性</td>
-      <td><a href="./quantization.md">MXFP8量化训练</a></td>
-      <td>支持E4M3/E5M2/HIF8格式与分块量化</td>
-    </tr>
-    <tr>
-      <td><a href="./quantization.md">低精度AllGather</a></td>
-      <td>FSDP2通信低精度化</td>
+      <td>量化特性</td>
+      <td><a href="./quantization.md">量化训练</a></td>
+      <td>MXFP8量化（E4M3/E5M2/HIF8格式与分块量化），FSDP2低精度AllGather通信</td>
     </tr>
     <tr>
       <td rowspan="2">其他</td>

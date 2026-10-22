@@ -59,7 +59,7 @@ FSDPTurbo支持FSDP、TP、EP、EFSDP、CP多维并行自由组合，兼顾训�
 >
 > 本节表格中“/”表示不可配套（未验证或不支持），“Y”表示可配套。
 
-**表 3** FSDPTurbo与TorchNPU版本兼容
+**表2** FSDPTurbo与TorchNPU版本兼容
 
 <table style="table-layout: fixed; width: 750px; text-align:center">
   <colgroup>
@@ -83,7 +83,7 @@ FSDPTurbo支持FSDP、TP、EP、EFSDP、CP多维并行自由组合，兼顾训�
   </tbody>
 </table>
 
-**表 4** FSDPTurbo与CANN版本兼容
+**表3** FSDPTurbo与CANN版本兼容
 
 <table style="table-layout: fixed; width: 750px; text-align:center">
   <colgroup>
