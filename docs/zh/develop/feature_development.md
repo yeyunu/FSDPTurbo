@@ -179,7 +179,7 @@ memory:
 ```yaml
 module_patches:
   - target: transformers.models.qwen3.modeling_qwen3.Qwen3Model.forward
-    replacement: fsdp_turbo.models.qwen.qwen3_5.qwen3_5_model_forward
+    replacement: fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5.qwen3_5_model_forward
 ```
 
 说明如下：

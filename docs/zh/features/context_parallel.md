@@ -40,7 +40,7 @@ Ulysses CP通常需要替换模型主干的forward（以改变注意力调用与
 ```yaml
 module_patches:
   - target: transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5Model.forward
-    replacement: fsdp_turbo.models.qwen.qwen3_5.qwen3_5_model_forward
+    replacement: fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5.qwen3_5_model_forward
 ```
 
 FSDPTurbo已为部分主流模型提供替换实现（见`fsdp_turbo/models/`）。

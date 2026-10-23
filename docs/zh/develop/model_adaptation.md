@@ -103,7 +103,7 @@ distributed:
 ```yaml
 module_patches:
   - target: transformers.models.xxx.modeling_xxx.XxxModel.forward
-    replacement: fsdp_turbo.models.qwen.qwen3_5.qwen3_5_model_forward
+    replacement: fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5.qwen3_5_model_forward
 ```
 
 ### 专家并行（MoE模型，可选）
@@ -122,7 +122,7 @@ distributed:
 ```
 
 > [!NOTE]
-> 
+>
 > EP路径要求experts模块持有3D张量参数（`gate_up_proj`、`down_proj`），而非ModuleList形式的独立专家子模块。若模型专家计算语义非标准，可使用`dispatcher='custom_ep_forward_eager'` / `'custom_ep_forward_fused'`，并在专家模块上自行实现：
 >
 > ```python

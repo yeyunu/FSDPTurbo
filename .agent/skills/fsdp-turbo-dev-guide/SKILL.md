@@ -254,7 +254,7 @@ tmp1 = compute()               # 无意义命名
 
 正确：在 `examples/qwen3_5/train.py`（使用方）中：
 ```python
-from fsdp_turbo.models.qwen.qwen3_5 import qwen3_5_model_forward  # 允许：examples 是使用方
+from fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5 import qwen3_5_model_forward  # 允许：examples 是使用方
 ```
 
 正确：在 `models/kimi/modeling_kimi_k3.py` 内：
@@ -265,7 +265,7 @@ from .configuration_kimi_k3 import KimiK3Config   # 允许：模型目录内部�
 错误：在 `training/`、`distributed/`、`memory/` 等包内非 `models/` 文件中：
 ```python
 from fsdp_turbo.models.kimi import register_kimi_k3   # 禁止：包内反向依赖 models
-from fsdp_turbo.models.qwen.qwen3_5 import xxx        # 禁止
+from fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5 import xxx        # 禁止
 ```
 
 错误：在模型目录之间交叉引用：
@@ -328,7 +328,7 @@ class FSDPTurboQwen3_5ForCausalLM(Qwen3_5ForCausalLM):
 - 存量待整改（不要求本次立即重构，但改动到相关文件时应一并整改）：
   - `models/kimi/kimi_moe_patch.py`：`apply_kimi_k3_moe_patch()` 换类引用，以及 `PatchKimiSparseMoeBlock` / `PatchKimiMoeExperts` 非继承式替代类；
   - `models/kimi/modeling_kimi_k3.py`：对 `apply_kimi_k3_moe_patch()` 的调用；
-  - `models/qwen/qwen3_5.py`、`models/qwen/qwen3_5_moe.py`：自由函数 forward（`qwen3_5_model_forward` / `qwen3_5_moe_model_forward`）依赖配置 `replacement` 的运行期替换。
+  - `models/qwen/qwen3_5_moe/qwen3_5.py`、`models/qwen/qwen3_5_moe/qwen3_5_moe_cp.py`：自由函数 forward（`qwen3_5_model_forward` / `qwen3_5_moe_model_forward`）依赖配置 `replacement` 的运行期替换。
 
 ---
 

@@ -23,7 +23,7 @@ from fsdp_turbo.fsdp_turbo_config import (
     DistributedConfig,
     MemoryConfig,
 )
-from fsdp_turbo.models.qwen.qwen3_5_moe import qwen3_5_moe_model_forward
+from fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5_moe_cp import qwen3_5_moe_model_forward
 from fsdp_turbo.training.clip_grads import compute_grad_norm
 from fsdp_turbo.utils.device import set_accelerator_compatible
 from fsdp_turbo.utils.log import set_log_level

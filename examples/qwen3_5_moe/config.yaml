@@ -141,7 +141,7 @@ distributed:
 # --- Module Patch Plan ---
 module_patches:
   - target: transformers.models.qwen3_5_moe.modeling_qwen3_5_moe.Qwen3_5MoeModel.forward
-    replacement: fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5_moe_model_forward     # enable for ulysses cp for now
+    replacement: fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5_moe_cp.qwen3_5_moe_model_forward     # enable for ulysses cp for now
 
 # --- Memory Configuration ---
 memory:

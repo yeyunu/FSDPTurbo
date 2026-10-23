@@ -132,6 +132,7 @@ def fixed_cross_entropy(
         alpha (Optional[torch.Tensor]): Optional scaling factor.
             - If scalar (0-D tensor), it globally scales the total loss.
             - If 1-D tensor of shape (N,), it provides per-example scaling factors.
+            - If 2-D tensor of shape (B, S), it provides per-token scaling factors.
             - Must be positive and non-zero.
         ignore_index (int): Specifies a target value that is ignored and does not contribute to the loss.
         reduction (str): Specifies the reduction to apply to the output:
@@ -157,6 +158,10 @@ def fixed_cross_entropy(
         if alpha.ndim == 0:
             # Alpha is a scalar: sum all element-wise losses, then divide
             loss = loss.sum() / alpha
+        elif alpha.ndim >= 2 and alpha.shape[1] > 1:
+            # Normalize each token separately, including packed samples in one row.
+            loss = loss.view(alpha.shape[0], -1)
+            loss = (loss / alpha).sum()
         else:
             # Alpha is 1-D with shape (N,): assume N examples
             # Reshape loss to (N, -1) to group elements per example
@@ -248,15 +253,35 @@ def chunk_loss(hidden_states, head_weight, head_bias, loss_forward, loss_kwargs_
     """
     Compute loss in chunks using the custom autograd function `ChunkLoss`.
 
+    For sum reduction with a scalar alpha, filter ignored tokens before the
+    output projection and re-chunk valid tokens across the batch. Boolean
+    indexing scatters input gradients back, leaving ignored rows at zero.
+    Other reductions and fully valid or fully ignored batches use the dense path.
+
     Args:
         hidden_states: Input tensor (e.g., from a transformer) to compute loss on.
         head_weight: Weight matrix of the output classification head.
         head_bias: Bias vector of the head.
         loss_forward: Callable that computes the loss for a given chunk.
         loss_kwargs_chunks: List of keyword arguments for `loss_forward`, one per chunk.
-        chunk_size: Number of features per chunk (along dim=1).
+        chunk_size: Number of sequence positions per chunk (along dim=1).
 
     Returns:
         The total accumulated loss as a scalar tensor.
     """
+    loss_kwargs = loss_kwargs_chunks[0]
+    alpha = loss_kwargs.get("alpha")
+    if loss_kwargs.get("reduction") == "sum" and torch.is_tensor(alpha) and alpha.ndim == 0:
+        ignore_index = loss_kwargs.get("ignore_index", -100)
+        shift_labels = torch.cat([chunk["shift_labels"] for chunk in loss_kwargs_chunks], dim=1)
+        valid_tokens = shift_labels.reshape(-1) != ignore_index
+        valid_token_count = int(valid_tokens.sum())
+
+        if 0 < valid_token_count < valid_tokens.numel():
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))[valid_tokens].unsqueeze(0)
+            shift_labels = shift_labels.reshape(-1)[valid_tokens].unsqueeze(0)
+            loss_kwargs_chunks = [
+                {**loss_kwargs, "shift_labels": labels} for labels in torch.split(shift_labels, chunk_size, dim=1)
+            ]
+
     return ChunkLoss.apply(hidden_states, head_weight, head_bias, loss_forward, loss_kwargs_chunks, chunk_size)
