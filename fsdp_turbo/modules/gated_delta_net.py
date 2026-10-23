@@ -1,3 +1,4 @@
+# Copyright c) 2025 NVIDIA CORPORATION AFFILIATES. All rights reserved.
 # Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
 # Copyright 2026, Huawei Technologies Co., Ltd. All rights reserved.
 from typing import Optional
@@ -121,23 +122,25 @@ def ulysses_gdn_all_to_all_output(core_attn_out, ulysses_group):
 
 
 def _resolve_gdn_func(self, func_name, module_func_name=None):
-    """Resolve a GDN function from instance method (5.15.0) or module-level import (5.3.0).
+    """Resolve a GDN function from instance method or module-level import.
 
-    In transformers 5.3.0, GDN functions are instance methods (e.g. ``self.chunk_gated_delta_rule``).
-    In transformers 5.15.0, they are module-level functions with a ``torch_`` prefix
-    (e.g. ``torch_chunk_gated_delta_rule``). When ``module_func_name`` is not specified,
-    it defaults to ``func_name`` (for functions whose name is unchanged across versions).
+    Searches every class in ``type(self).__mro__`` so that subclasses (which
+    keep the stock transformers class in their MRO) still resolve the
+    module-level reference defined in the transformers modeling module.
     """
     func = getattr(self, func_name, None)
     if func is not None:
         return func
+
     if module_func_name is None:
         module_func_name = func_name
-    if "Moe" in type(self).__name__:
-        import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as modeling_module
-    else:
-        import transformers.models.qwen3_5.modeling_qwen3_5 as modeling_module
-    return getattr(modeling_module, module_func_name, None)
+
+    for klass in type(self).__mro__:
+        modeling_module = __import__(klass.__module__, fromlist=[""])
+        func = getattr(modeling_module, module_func_name, None)
+        if func is not None:
+            return func
+    return None
 
 
 class GatedDeltaNet(nn.Module):
@@ -278,6 +281,11 @@ class GatedDeltaNet(nn.Module):
             recurrent_gated_delta_rule = _resolve_gdn_func(
                 self, "recurrent_gated_delta_rule", "torch_recurrent_gated_delta_rule"
             )
+            if recurrent_gated_delta_rule is None:
+                raise RuntimeError(
+                    f"Could not resolve recurrent_gated_delta_rule for {type(self).__name__}; "
+                    "no module in its MRO defines 'torch_recurrent_gated_delta_rule'."
+                )
             core_attn_out, last_recurrent_state = recurrent_gated_delta_rule(
                 query,
                 key,
@@ -290,6 +298,11 @@ class GatedDeltaNet(nn.Module):
             )
         else:
             chunk_gated_delta_rule = _resolve_gdn_func(self, "chunk_gated_delta_rule", "torch_chunk_gated_delta_rule")
+            if chunk_gated_delta_rule is None:
+                raise RuntimeError(
+                    f"Could not resolve chunk_gated_delta_rule for {type(self).__name__}; "
+                    "no module in its MRO defines 'torch_chunk_gated_delta_rule'."
+                )
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 query,
                 key,

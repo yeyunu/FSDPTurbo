@@ -34,6 +34,15 @@ if IS_TRITON_AVAILABLE:
         IS_TRITON_ASCEND_KERNELS_AVAILABLE = False
 
 
+IS_MINDSPEED_OPS_AVAILABLE = False
+try:
+    import mindspeed_ops  # noqa: F401
+
+    IS_MINDSPEED_OPS_AVAILABLE = True
+except Exception:
+    IS_MINDSPEED_OPS_AVAILABLE = False
+
+
 def accelerator_getattr(module, fallback_module):
     def __getattr__(name):
         if hasattr(fallback_module, name):

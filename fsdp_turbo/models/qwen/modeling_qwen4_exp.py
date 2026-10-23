@@ -376,8 +376,8 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
             return super().forward(hidden_states, cache_params=cache_params, attention_mask=attention_mask, **kwargs)
         from fsdp_turbo.ops.causal_conv1d import causal_conv1d as _ft_causal_conv1d
         from fsdp_turbo.ops.causal_conv1d import causal_conv1d_update as _ft_causal_conv1d_update
-        from fsdp_turbo.ops.fla import chunk_gated_delta_rule as _ft_chunk_gdr
-        from fsdp_turbo.ops.fla import fused_recurrent_gated_delta_rule as _ft_recurrent_gdr
+        from fsdp_turbo.ops.gdn import chunk_gdn as _ft_chunk_gdr
+        from fsdp_turbo.ops.gdn import fused_recurrent_gdn as _ft_recurrent_gdr
 
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
         batch_size, seq_len, _ = hidden_states.shape

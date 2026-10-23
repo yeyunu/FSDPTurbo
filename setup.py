@@ -26,12 +26,12 @@ setup(
         "tiktoken",
         "triton>=3.5.0",
         "triton_ascend>=3.2.2",
+        "fla-core",
+        "flash-linear-attention",
     ],
     extras_require={
         "npu": [
             "torch_npu",
-            "fla-core",
-            "flash-linear-attention",
         ],
     },
     classifiers=[

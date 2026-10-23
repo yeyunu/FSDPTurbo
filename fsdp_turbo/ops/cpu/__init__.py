@@ -21,6 +21,8 @@ from fsdp_turbo.ops.cpu.rope import rope_torch
 from fsdp_turbo.ops.cpu.sinkhorn import hc_split_sinkhorn_cpu
 from fsdp_turbo.ops.cpu.sparse_attention import indexed_sparse_attention_torch
 from fsdp_turbo.ops.cpu.situ_glu import situ_glu_cpu
+from fsdp_turbo.ops.cpu.flash_attn import flash_attention_cpu
+from fsdp_turbo.ops.cpu.rotary_mul import rotary_mul_cpu
 
 __all__ = [
     'cce_loss_cpu',
@@ -47,4 +49,6 @@ __all__ = [
     'indexed_sparse_attention_torch',
     'mx_to_block_mx_quant_cpu',
     'situ_glu_cpu',
+    'flash_attention_cpu',
+    'rotary_mul_cpu',
 ]

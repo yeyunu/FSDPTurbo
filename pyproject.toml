@@ -34,10 +34,12 @@ dependencies = [
     "tiktoken",
     "triton>=3.5.0",
     "triton_ascend>=3.2.2",
+    "fla-core",
+    "flash-linear-attention",
 ]
 
 [project.optional-dependencies]
-npu = ["torch_npu", "fla-core", "flash-linear-attention"]
+npu = ["torch_npu"]
 gpu = ["transformer-engine"]
 
 [project.urls]

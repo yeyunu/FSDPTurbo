@@ -3,6 +3,7 @@ from fsdp_turbo.ops.npu.cce_loss import cce_loss_npu
 from fsdp_turbo.ops.npu.attn_res import attn_res_npu
 from fsdp_turbo.ops.npu.clipped_swiglu import clipped_swiglu_npu
 from fsdp_turbo.ops.npu.causal_conv1d import causal_conv1d_npu, causal_conv1d_update_npu
+from fsdp_turbo.ops.npu.gdn import chunk_gdn_npu, fused_recurrent_gdn_npu
 from fsdp_turbo.ops.npu.chunk_kda import chunk_kda_npu
 from fsdp_turbo.ops.npu.grouped_matmul import grouped_matmul_npu
 from fsdp_turbo.ops.npu.grouped_matmul_mc2 import all2all_grouped_matmul_npu, grouped_matmul_all2all_npu
@@ -34,6 +35,8 @@ from fsdp_turbo.ops.npu.lightning_indexer import fused_lightning_indexer
 from fsdp_turbo.ops.npu.mhc import fused_mhc_post, fused_mhc_pre_sinkhorn_premix
 from fsdp_turbo.ops.npu.vision_flash_attention import fused_vision_flash_attention
 from fsdp_turbo.ops.npu.hf32_linear import hf32_linear_npu
+from fsdp_turbo.ops.npu.flash_attn import flash_attention_npu
+from fsdp_turbo.ops.npu.rotary_mul import rotary_mul_npu
 
 __all__ = [
     'cce_loss_npu',
@@ -41,6 +44,8 @@ __all__ = [
     'clipped_swiglu_npu',
     'causal_conv1d_npu',
     'causal_conv1d_update_npu',
+    'chunk_gdn_npu',
+    'fused_recurrent_gdn_npu',
     'chunk_kda_npu',
     'grouped_matmul_npu',
     'all2all_grouped_matmul_npu',
@@ -68,4 +73,6 @@ __all__ = [
     'fused_mhc_pre_sinkhorn_premix',
     'fused_vision_flash_attention',
     'hf32_linear_npu',
+    'flash_attention_npu',
+    'rotary_mul_npu',
 ]
