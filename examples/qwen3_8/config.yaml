@@ -177,7 +177,8 @@ distributed:
     apply_modules:
       - model.language_model.layers.{*}.mlp.experts
       - mtp.layers.{*}.mlp.experts
-    dispatcher: "fused"
+    dispatcher: "all2all"
+    use_fused_ops: true
     apply_efsdp_modules:
       - model.language_model.layers.{*}.mlp
       - mtp.layers.{*}.mlp

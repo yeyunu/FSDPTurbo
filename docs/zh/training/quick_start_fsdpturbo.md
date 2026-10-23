@@ -296,7 +296,7 @@ distributed:
   ep_plan:
     apply_modules:                    # 应用 EP 的模块（通配符）
       - model.language_model.layers.{*}.mlp.experts
-    dispatcher: "fused"               # 调度器：eager / fused / mc2 / domino
+    dispatcher: "all2all"             # 通信调度方式
     apply_efsdp_modules:              # 应用 EFSDP 的模块
       - model.language_model.layers.{*}.mlp.experts
 ```

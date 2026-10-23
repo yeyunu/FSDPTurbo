@@ -189,7 +189,8 @@ def get_complete_custom_config():
             expert_fully_shard_parallel_size=EXPERT_FULLY_SHARD_PARALLEL_SIZE,
             ep_plan=EPPlanConfig(
                 apply_modules=['model.language_model.layers.{*}.mlp.experts'],
-                dispatcher='fused',
+                dispatcher='all2all',
+                use_fused_ops=True,
                 apply_efsdp_modules=['model.language_model.layers.{*}.mlp.experts'],
             ),
         ),

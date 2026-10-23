@@ -1,13 +1,13 @@
 import logging
 
 import torch
-from torch.distributed.fsdp import MixedPrecisionPolicy
 from torch.distributed.tensor import Shard
 
 from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import (
     get_fsdp_hook_modules,
     find_hook_module,
     get_offload_policy,
+    get_mixprecision_policy,
 )
 from fsdp_turbo.fsdp_turbo_config import EPPlanConfig, FSDPPlanConfig
 from fsdp_turbo.distributed.fine_grained_fully_shard import get_fsdp_strategy
@@ -37,7 +37,7 @@ def expert_fully_shard_modules(
 
     config = {
         'mesh': efsdp_mesh,
-        'mp_policy': MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
+        'mp_policy': get_mixprecision_policy(fsdp_plan),
         'offload_policy': offload_policy,
         'shard_placement_fn': shard_placement_fn,
     }
@@ -66,7 +66,8 @@ def get_efsdp_modules(modules: torch.nn.Module, plan: EPPlanConfig):
         for name, module in modules.named_modules():
             if module_name_match(plan_name, name):
                 print_rank(logger.debug, f'[Expert Fully Shard]: Apply efsdp to module <{name}>')
-                efsdp_modules.append(module)
+                if module not in efsdp_modules:
+                    efsdp_modules.append(module)
     if len(efsdp_modules) == 0:
         raise RuntimeError(f'[Expert Fully Shard] No module named {plan} or not be ModuleList')
     return efsdp_modules

@@ -134,7 +134,8 @@ distributed:
   ep_plan:
     apply_modules:
       - model.language_model.layers.{*}.mlp.experts
-    dispatcher: "fused"
+    dispatcher: "all2all"
+    use_fused_ops: true
     apply_efsdp_modules:
       - model.language_model.layers.{*}.mlp.experts
 

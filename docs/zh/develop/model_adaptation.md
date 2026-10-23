@@ -116,7 +116,7 @@ distributed:
   ep_plan:
     apply_modules:
       - model.layers.{*}.mlp.experts
-    dispatcher: "fused"        # eager / fused / mc2 / domino
+    dispatcher: "all2all"      # all2all / allgather / chunkmoe / mc2 / domino
     apply_efsdp_modules:
       - model.layers.{*}.mlp.experts
 ```

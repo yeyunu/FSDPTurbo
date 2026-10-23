@@ -205,13 +205,51 @@ class CPPlanConfig:
 
 @dataclass
 class EPPlanConfig:
-    apply_modules: List[str] = None
-    dispatcher: Union[Literal["eager", "fused", "mc2", "domino"], Callable, str] = None
+    """Configuration for Expert Parallelism (EP) plan for MoE models."""
+
+    apply_modules: List[str] = field(default_factory=list)
+    dispatcher: Union[Literal["all2all", "allgather", "mc2", "domino", "chunkmoe"], Callable, str] = "all2all"
     fixed_router: bool = False
-    apply_efsdp_modules: List[str] = None
+    apply_efsdp_modules: List[str] = field(default_factory=list)
     # Gradient divide factor for expert HSDP. When unset (None) it is
     # computed in the config validation as ep * edp * efsdp.
     gradient_divide_factor: Optional[float] = None
+    use_fused_ops: bool = True
+    use_swiglu: bool = True
+    # Fixed chunk count takes precedence over token-based chunk size. Zero
+    # disables that mode; with both zero, execute one chunk.
+    moe_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": "Chunk size for chunked MoE dispatch; 0 means no chunking (the whole token sequence is one chunk)."
+        },
+    )
+    moe_num_chunks: int = field(
+        default=0,
+        metadata={
+            "help": "Fixed number of chunks for chunked MoE dispatch; chunk length is derived as ceil(num_tokens / moe_num_chunks) and tail chunks are padded empty so every EP rank has the same chunk count. 0 means disabled; mutually exclusive with moe_chunk_size."
+        },
+    )
+    chunk_moe_recompute: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable Gradient Checkpointing (Activation Recomputation)."},
+    )
+
+    enable_ep_balance: bool = False
+    max_dup_experts_num: int = 2
+
+    def __post_init__(self):
+        if self.moe_chunk_size > 0 and self.moe_num_chunks > 0:
+            logger.warning(
+                "moe_chunk_size (%s) and moe_num_chunks (%s) are both set; "
+                "moe_num_chunks takes precedence and moe_chunk_size is ignored.",
+                self.moe_chunk_size,
+                self.moe_num_chunks,
+            )
+        if self.max_dup_experts_num < 0:
+            raise ValueError("max_dup_experts_num must be non-negative.")
+        if self.enable_ep_balance and self.dispatcher not in ("all2all", "allgather"):
+            raise ValueError("EP balance only supports all2all, allgather dispatchers.")
 
 
 @dataclass
@@ -646,21 +684,21 @@ class FSDPTurboConfig:
                 "distributed.cp_plan.kv_allgather_function_patches must be set when KV-AllGather CP is enabled."
             )
 
-    def validate_ep_config(self):
+    def validate_ep_config(self) -> None:
         """expert parallelize plan
 
         config = FSDPTurboConfig(
             distributed=DistributedConfig(
                 ep_plan=EPPlanConfig(
                     apply_modules: ['*mlp.experts*'],
-                    dispatcher: 'eager', 'fused', 'mc2', 'domino',
+                    dispatcher: 'all2all', 'mc2', 'domino', 'allgather', 'chunkmoe',
                                 'custom_ep_forward_eager', 'custom_ep_forward_fused'
                 )
             )
         )
         """
         self.distributed.ep_plan = (
-            EPPlanConfig(apply_modules=[], dispatcher="eager")
+            EPPlanConfig(apply_modules=[], dispatcher="all2all")
             if self.distributed.ep_plan is None
             else self.distributed.ep_plan
         )
@@ -682,7 +720,7 @@ class FSDPTurboConfig:
             self.distributed.ep_plan.gradient_divide_factor = (
                 self.distributed.expert_parallel_size * self.distributed.expert_fully_shard_parallel_size * edp
             )
-        if self.distributed.ep_plan.apply_efsdp_modules is None:
+        if not self.distributed.ep_plan.apply_efsdp_modules:
             self.distributed.ep_plan.apply_efsdp_modules = []
             for ep_module in self.distributed.ep_plan.apply_modules:
                 if ep_module.endswith(".experts"):

@@ -17,7 +17,7 @@ FSDPTurbo架构关系如[图1](#架构图)所示，整体采用分层架构：�
 - **分布式并行（`Distributed`）**
     - **FSDP**：基于PyTorch FSDP2 API实现，支持混合精度训练、前向/反向预取、选择性模块分片，并提供`custom`自定义实现路径。
     - **EFSDP**：对EP切分后的专家参数进一步全分片，通过`apply_efsdp_modules`配置。
-    - **EP**：面向MoE模型，支持多种dispatcher（`eager`、`fused`、`mc2`、`domino`）以及自定义EP forward。
+    - **EP**：面向MoE模型，支持多种dispatcher（`all2all`、`allgather`、`chunkmoe`、`mc2`、`domino`，融合算子由 `use_fused_ops` 控制）以及自定义EP forward。
     - **TP**：支持列并行、行并行与序列并行，集成DTensor。
     - **CP**：Ulysses风格，支持长序列训练。
     - **parallel_state**：全局并行状态管理，统一管理多维并行设备网格（DeviceMesh）。

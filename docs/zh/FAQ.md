@@ -88,7 +88,7 @@ NNODES=2 GPUS_PER_NODE=16 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 NODE_RANK=1 bas
 
 - **专家模块结构要求**：EP要求experts模块持有3D张量参数（`gate_up_proj`/`down_proj`，形状`[num_experts, out_dim, in_dim]`），ModuleList形式的独立专家子模块需先转换为3D张量聚合结构。
 - **整除约束**：`expert_parallel_size`需能整除每层专家总数。
-- **dispatcher选型**：优先使用`fused` / `mc2`；专家计算语义非标准时需实现自定义EP forward。
+- **dispatcher选型**：可使用 `all2all`（`use_fused_ops: true`）或 `mc2`；专家计算语义非标准时需实现自定义EP forward。
 
 详见[专家并行](./features/expert_parallel.md)。
 

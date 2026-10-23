@@ -1,6 +1,25 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+import os
 import torch
+
+# `torch.bincount` is used for counting expert assignments in EP. This is slower than `torch.histc` but more stable.
+# `torch.histc` is not a deterministic operation and `torch.bincount` is deterministic.
+# Set environment variable export MM_EP_BINCOUNT_DISPATCH=1 to activate.
+EP_BINCOUNT_DISPATCH = os.environ.get('EP_BINCOUNT_DISPATCH', '0') == '1'
+
+
+def get_num_global_tokens_per_local_expert(
+    selected_experts: torch.Tensor,
+    num_global_experts: int,
+) -> torch.Tensor:
+    if EP_BINCOUNT_DISPATCH:
+        num_local_tokens_per_expert = torch.bincount(selected_experts.reshape(-1), minlength=num_global_experts)
+    else:
+        num_local_tokens_per_expert = torch.histc(
+            selected_experts.reshape(-1), bins=num_global_experts, min=0, max=num_global_experts
+        )
+    return num_local_tokens_per_expert
 
 
 def normalize_expert_args(top_k_index, top_k_weights):

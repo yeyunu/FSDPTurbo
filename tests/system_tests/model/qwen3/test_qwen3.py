@@ -121,7 +121,7 @@ def get_complete_custom_config():
 
     Features:
     - FSDP2 with fully sharded data parallel
-    - Expert Parallel with eager dispatcher
+    - Expert Parallel with all2all dispatcher and fused ops
     - Tensor Parallel
     - Recompute for memory optimization
     - Mixed Precision (BF16 param/output, FP32 reduce)
@@ -168,7 +168,8 @@ def get_complete_custom_config():
             expert_fully_shard_parallel_size=EXPERT_FULLY_SHARD_PARALLEL_SIZE,
             ep_plan=EPPlanConfig(
                 apply_modules=['model.layers.{*}.mlp.experts'],
-                dispatcher='fused',
+                dispatcher='all2all',
+                use_fused_ops=False,
                 fixed_router=True,
             ),
         ),

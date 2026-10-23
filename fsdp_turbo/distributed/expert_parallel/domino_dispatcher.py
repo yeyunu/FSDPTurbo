@@ -3,7 +3,7 @@
 import torch
 
 from torch.distributed.tensor import DTensor
-from fsdp_turbo.distributed.dist_ops import gather_along_first_dim_expert_parallel
+from fsdp_turbo.distributed.expert_parallel.comm import gather_along_first_dim_expert_parallel
 from fsdp_turbo.ops.moe import permute, unpermute, grouped_matmul
 from fsdp_turbo.distributed.expert_parallel.utils import (
     fixed_router_for_debug,
@@ -35,8 +35,9 @@ def get_domino_experts_forward_fn(ep_group, fused=True, fixed_router=False):
 
     comm_streams = {}
 
-    def domino_experts_forward(self, hidden_states: torch.Tensor, top_k_index: torch.Tensor,
-                               top_k_weights: torch.Tensor):
+    def domino_experts_forward(
+        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
+    ):
         """
         Forward pass for expert parallel processing with DOMINO optimization.
 
@@ -55,13 +56,10 @@ def get_domino_experts_forward_fn(ep_group, fused=True, fixed_router=False):
             top_k_index, top_k_weights = fixed_router_for_debug(top_k_index, top_k_weights, self.num_global_experts)
 
         hidden_states_list, top_k_index_list, top_k_weights_list = slice_hidden_states_for_domino(
-            hidden_states, top_k_index, top_k_weights)
-        gate_up_proj = (self.gate_up_proj.to_local()
-                        if isinstance(self.gate_up_proj, DTensor)
-                        else self.gate_up_proj)
-        down_proj = (self.down_proj.to_local()
-                     if isinstance(self.down_proj, DTensor)
-                     else self.down_proj)
+            hidden_states, top_k_index, top_k_weights
+        )
+        gate_up_proj = self.gate_up_proj.to_local() if isinstance(self.gate_up_proj, DTensor) else self.gate_up_proj
+        down_proj = self.down_proj.to_local() if isinstance(self.down_proj, DTensor) else self.down_proj
         weights = (gate_up_proj, down_proj)
         act_fn = self.act_fn
         num_global_experts = self.num_global_experts
@@ -73,28 +71,39 @@ def get_domino_experts_forward_fn(ep_group, fused=True, fixed_router=False):
             comm_stream = torch.accelerator.Stream()
             comm_streams[device_index] = comm_stream
 
-        hidden_states_list = dispatch_mlp_combine(ep_group, fused, hidden_states_list, top_k_index_list,
-                                                  top_k_weights_list, weights, act_fn, act_limit,
-                                                  num_global_experts, expert_ids_per_ep_rank, comm_stream)
+        hidden_states_list = dispatch_mlp_combine(
+            ep_group,
+            fused,
+            hidden_states_list,
+            top_k_index_list,
+            top_k_weights_list,
+            weights,
+            act_fn,
+            act_limit,
+            num_global_experts,
+            expert_ids_per_ep_rank,
+            comm_stream,
+        )
         hidden_states = torch.cat(hidden_states_list, dim=0)
         return hidden_states.view(*hidden_states_shape)
 
     return domino_experts_forward
 
 
-def dispatch_mlp_combine(ep_group, fused,
-                         hidden_states_list: list[torch.Tensor],
-                         top_k_index_list: list[torch.Tensor],
-                         top_k_weights_list: list[torch.Tensor],
-                         weights,
-                         act_fn,
-                         act_limit,
-                         num_global_experts,
-                         expert_ids_per_ep_rank,
-                         comm_stream=None):
-    if not (
-        len(hidden_states_list) == len(top_k_index_list) == len(top_k_weights_list) == _DOMINO_NUM_SLICES
-    ):
+def dispatch_mlp_combine(
+    ep_group,
+    fused,
+    hidden_states_list: list[torch.Tensor],
+    top_k_index_list: list[torch.Tensor],
+    top_k_weights_list: list[torch.Tensor],
+    weights,
+    act_fn,
+    act_limit,
+    num_global_experts,
+    expert_ids_per_ep_rank,
+    comm_stream=None,
+):
+    if not (len(hidden_states_list) == len(top_k_index_list) == len(top_k_weights_list) == _DOMINO_NUM_SLICES):
         raise AssertionError(f"DOMINO dispatcher expects exactly {_DOMINO_NUM_SLICES} slices.")
 
     preprocess_ctx = dispatch_preprocess(ep_group, top_k_index_list, num_global_experts, expert_ids_per_ep_rank)
@@ -125,8 +134,7 @@ def dispatch_mlp_combine(ep_group, fused,
         p1_out, up_idx1 = permute(hs, top_k_index_list[i], use_eager=not fused)
         unpermute_indices_list[i][0] = up_idx1
         if p1_out.grad_fn is not None:
-            p1_out.grad_fn.register_prehook(
-                wait_event_backward_pre_hook(dispatch_bwd_events, i))
+            p1_out.grad_fn.register_prehook(wait_event_backward_pre_hook(dispatch_bwd_events, i))
         p1_buf[i] = p1_out
 
         dispatch_producer_events[i] = torch.accelerator.current_stream().record_event()
@@ -134,10 +142,16 @@ def dispatch_mlp_combine(ep_group, fused,
     def launch_dispatch_slice(i):
         inp_split, out_splits = split_sizes_list[i]
         dispatch_buf[i] = domino_all_to_all(
-            ep_group, p1_buf[i], out_splits, inp_split,
-            comm_stream=comm_stream, producer_event=dispatch_producer_events[i],
+            ep_group,
+            p1_buf[i],
+            out_splits,
+            inp_split,
+            comm_stream=comm_stream,
+            producer_event=dispatch_producer_events[i],
             forward_event_list=dispatch_fwd_events,
-            backward_event_list=dispatch_bwd_events, index=i)
+            backward_event_list=dispatch_bwd_events,
+            index=i,
+        )
 
     def wait_dispatch_and_permute_local(i):
         torch.accelerator.current_stream().wait_event(dispatch_fwd_events[i])
@@ -158,22 +172,26 @@ def dispatch_mlp_combine(ep_group, fused,
         if p2_out is None:
             return
 
-        mlp_out = experts_computation(
-            p2_out, num_tokens, gate_up_weights, down_weights, act_fn, act_limit, fused)
+        mlp_out = experts_computation(p2_out, num_tokens, gate_up_weights, down_weights, act_fn, act_limit, fused)
 
         up2_out = unpermute(mlp_out, up_idx2, use_eager=not fused)
         if up2_out.grad_fn is not None:
-            up2_out.grad_fn.register_prehook(
-                wait_event_backward_pre_hook(combine_bwd_events, i))
+            up2_out.grad_fn.register_prehook(wait_event_backward_pre_hook(combine_bwd_events, i))
         up2_buf[i] = up2_out
 
     def launch_combine_slice(i, inp_split, out_splits):
         combine_producer_event = torch.accelerator.current_stream().record_event()
         combine_buf[i] = domino_all_to_all(
-            ep_group, up2_buf[i], inp_split, out_splits,
-            comm_stream=comm_stream, producer_event=combine_producer_event,
+            ep_group,
+            up2_buf[i],
+            inp_split,
+            out_splits,
+            comm_stream=comm_stream,
+            producer_event=combine_producer_event,
             forward_event_list=combine_fwd_events,
-            backward_event_list=combine_bwd_events, index=i)
+            backward_event_list=combine_bwd_events,
+            index=i,
+        )
 
     prepare_dispatch_input(0)
     launch_dispatch_slice(0)
@@ -211,14 +229,12 @@ def dispatch_preprocess(ep_group, top_k_index_list, num_global_experts, expert_i
     local_experts_start_id = num_local_experts * ep_rank
     local_experts_end_id = local_experts_start_id + num_local_experts
     # [S, E] --> [EP * S, E], where S is the fixed number of DOMINO slices.
-    local_tokens_per_experts = torch.stack([
-        torch.bincount(top_k_index.view(-1), minlength=num_global_experts)
-        for top_k_index in top_k_index_list
-    ], dim=0)
+    local_tokens_per_experts = torch.stack(
+        [torch.bincount(top_k_index.view(-1), minlength=num_global_experts) for top_k_index in top_k_index_list], dim=0
+    )
     num_global_tokens_per_expert, _ = gather_along_first_dim_expert_parallel(local_tokens_per_experts, ep_group)
     # [EP * S, E] --> [EP, S, E]
-    num_global_tokens_per_expert = num_global_tokens_per_expert.reshape(
-        ep_size, _DOMINO_NUM_SLICES, num_global_experts)
+    num_global_tokens_per_expert = num_global_tokens_per_expert.reshape(ep_size, _DOMINO_NUM_SLICES, num_global_experts)
 
     return {
         "ep_size": ep_size,
@@ -248,15 +264,17 @@ def prepare_dispatch_slice(preprocess_ctx, list_index):
     num_local_tokens_per_expert = local_tokens_per_experts[list_index]
     # [EP, 2, E] --> [EP, local_E]
     num_global_tokens_per_local_expert = num_global_tokens_per_expert[
-        :, list_index, local_experts_start_id: local_experts_end_id]
+        :, list_index, local_experts_start_id:local_experts_end_id
+    ]
 
     # [EP, local_E] --> [local_E]
     num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(axis=0)
     # [EP, local_E] --> [E*select]
     global_indices = torch.repeat_interleave(expert_ids_per_ep_rank, num_global_tokens_per_local_expert.ravel())
     # [E] --> [EP, local_E] --> [EP]
-    input_split = num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(axis=1).to(
-        torch.device("cpu")).numpy()
+    input_split = (
+        num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(axis=1).to(torch.device("cpu")).numpy()
+    )
     # [EP, local_E] --> [EP]
     output_splits = num_global_tokens_per_local_expert.sum(axis=-1).to(torch.device("cpu")).numpy()
 
@@ -265,8 +283,17 @@ def prepare_dispatch_slice(preprocess_ctx, list_index):
     return prepared_slice
 
 
-def domino_all_to_all(group, inputs, output_split_sizes=None, input_split_sizes=None, comm_stream=None,
-                      producer_event=None, forward_event_list=None, backward_event_list=None, index=0):
+def domino_all_to_all(
+    group,
+    inputs,
+    output_split_sizes=None,
+    input_split_sizes=None,
+    comm_stream=None,
+    producer_event=None,
+    forward_event_list=None,
+    backward_event_list=None,
+    index=0,
+):
     """
     Wrapper for autograd function implementing DOMINO optimized AllToAll communication.
 
@@ -280,8 +307,17 @@ def domino_all_to_all(group, inputs, output_split_sizes=None, input_split_sizes=
         backward_event: Event to synchronize backward pass
 
     """
-    return Domino_AllToAll.apply(group, inputs, output_split_sizes, input_split_sizes, comm_stream, producer_event,
-                                 forward_event_list, backward_event_list, index)
+    return Domino_AllToAll.apply(
+        group,
+        inputs,
+        output_split_sizes,
+        input_split_sizes,
+        comm_stream,
+        producer_event,
+        forward_event_list,
+        backward_event_list,
+        index,
+    )
 
 
 def empty_expert_output(dispatch_buf: torch.Tensor, hidden_dim: int, backward_event_list: list, index: int):
@@ -298,12 +334,18 @@ class Domino_AllToAll(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, group, inputs, output_split_sizes, input_split_sizes,
-                comm_stream: torch.cuda.Stream = None,
-                producer_event: torch.cuda.Event = None,
-                forward_event_list: torch.cuda.Event = None,
-                backward_event_list: torch.cuda.Event = None,
-                index: int = 0):
+    def forward(
+        ctx,
+        group,
+        inputs,
+        output_split_sizes,
+        input_split_sizes,
+        comm_stream: torch.cuda.Stream = None,
+        producer_event: torch.cuda.Event = None,
+        forward_event_list: torch.cuda.Event = None,
+        backward_event_list: torch.cuda.Event = None,
+        index: int = 0,
+    ):
         """
         Forward pass implementing AllToAll communication.
 
@@ -356,10 +398,14 @@ def _all_to_all_single(group, inputs, output_split_sizes=None, input_split_sizes
     if output_split_sizes is None:
         output = torch.empty_like(inputs)
     else:
-        output = inputs.new_empty(size=[sum(output_split_sizes)] + list(inputs.size()[1:]),
-                                  dtype=inputs.dtype, device=torch.accelerator.current_device_index())
-    torch.distributed.all_to_all_single(output, inputs, output_split_sizes=output_split_sizes,
-                                        input_split_sizes=input_split_sizes, group=group)
+        output = inputs.new_empty(
+            size=[sum(output_split_sizes)] + list(inputs.size()[1:]),
+            dtype=inputs.dtype,
+            device=torch.accelerator.current_device_index(),
+        )
+    torch.distributed.all_to_all_single(
+        output, inputs, output_split_sizes=output_split_sizes, input_split_sizes=input_split_sizes, group=group
+    )
     return output
 
 
@@ -385,9 +431,7 @@ def wait_event_backward_pre_hook(backward_event_list: list, index: int):
 
 
 def slice_hidden_states_for_domino(
-        hidden_states: torch.Tensor,
-        top_k_index: torch.Tensor,
-        top_k_weights: torch.Tensor
+    hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
     """
     Slice hidden states and related tensors into two chunks for DOMINO processing.

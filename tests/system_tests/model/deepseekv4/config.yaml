@@ -99,7 +99,8 @@ distributed:
   ep_plan:
     apply_modules:
       - model.layers.{*}.mlp.experts
-    dispatcher: "eager"
+    dispatcher: "all2all"
+    use_fused_ops: false
     apply_efsdp_modules:
       - model.layers.{*}.mlp.experts
 

@@ -160,7 +160,8 @@ distributed:
   ep_plan:
     apply_modules:
       - model.layers.{*}.ffn.experts
-    dispatcher: "fused"
+    dispatcher: "all2all"
+    use_fused_ops: true
     fixed_router: true
     apply_efsdp_modules:
       - model.layers.{*}.ffn.experts

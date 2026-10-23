@@ -13,7 +13,8 @@ _SPEC.loader.exec_module(cpu_permute)
 
 
 def _reference_unpermute(permuted_tokens, sorted_indices, probs=None):
-    route_positions = torch.argsort(sorted_indices.long())
+    # permute_cpu returns the inverse permutation: original route -> sorted row.
+    route_positions = sorted_indices.long()
     if probs is None:
         return permuted_tokens.index_select(0, route_positions)
     if probs.size(0) == 0:
@@ -104,3 +105,25 @@ def test_unpermute_random_routes_matches_output_and_gradients(dtype, topk, index
     expected.backward(upstream)
     torch.testing.assert_close(activations.grad, reference_activations.grad, rtol=0, atol=0)
     torch.testing.assert_close(probs.grad, reference_probs.grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("topk", [1, 2, 4])
+def test_permute_unpermute_round_trip_matches_weighted_tokens_and_gradients(topk):
+    """Use real routing indices to verify the inverse mapping contract end to end."""
+    generator = torch.Generator().manual_seed(789)
+    tokens = torch.randn(5, 7, generator=generator, requires_grad=True)
+    expert_indices = torch.randint(0, 4, (5, topk), generator=generator)
+    probs = torch.rand(5, topk, generator=generator, requires_grad=True)
+    reference_tokens = tokens.detach().clone().requires_grad_()
+    reference_probs = probs.detach().clone().requires_grad_()
+
+    permuted_tokens, inverse_mapping = cpu_permute.permute_cpu(tokens, expert_indices)
+    output = cpu_permute.unpermute_cpu(permuted_tokens, inverse_mapping, probs)
+    expected = (reference_tokens.unsqueeze(1) * reference_probs.unsqueeze(-1)).sum(dim=1)
+
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    upstream = torch.randn(output.shape, generator=generator)
+    output.backward(upstream)
+    expected.backward(upstream)
+    torch.testing.assert_close(tokens.grad, reference_tokens.grad)
+    torch.testing.assert_close(probs.grad, reference_probs.grad)

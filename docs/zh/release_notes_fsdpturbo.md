@@ -113,7 +113,7 @@ FSDPTurbo支持FSDP、TP、EP、EFSDP、CP多维并行自由组合，兼顾训�
 
 | 特性 | 描述 | 目的 |
 | --- | --- | --- |
-| 多维并行策略 | FSDP2全分片数据并行、张量并行、专家并行（eager/fused/mc2/domino dispatcher与EFSDP）、上下文并行（Ulysses与KV AllGather），支持自由组合 | 兼顾训练吞吐与集群扩展性 |
+| 多维并行策略 | FSDP2全分片数据并行、张量并行、专家并行（all2all/allgather/chunkmoe/mc2/domino dispatcher与EFSDP，融合算子由use_fused_ops控制）、上下文并行（Ulysses与KV AllGather），支持自由组合 | 兼顾训练吞吐与集群扩展性 |
 | 内存优化 | 激活重计算、微批次切分、分块损失计算、激活值交换、优化器状态交换（AdamWSwap）、CPU Offload | 降低显存占用，支持低显存大模型训练 |
 | 量化训练 | MXFP8（E4M3/E5M2/HIF8）与分块量化、W8A16量化感知训练、低精度AllGather | 降低显存占用并提升训练速度 |
 | 断点续训 | 基于PyTorch分布式Checkpoint（DCP）的权重与优化器状态保存/恢复 | 支持故障恢复与长周期训练 |

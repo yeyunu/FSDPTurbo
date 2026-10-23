@@ -22,7 +22,7 @@
     </tr>
     <tr>
       <td><a href="./expert_parallel.md">专家并行</a></td>
-      <td>MoE专家并行，支持eager/fused/mc2/domino dispatcher与EFSDP</td>
+      <td>MoE专家并行，支持all2all/allgather/chunkmoe/mc2/domino dispatcher与EFSDP，融合算子由use_fused_ops控制</td>
     </tr>
     <tr>
       <td><a href="./context_parallel.md">上下文并行</a></td>

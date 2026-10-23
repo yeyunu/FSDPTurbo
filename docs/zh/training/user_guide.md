@@ -61,3 +61,7 @@ FSDPTurbo与HuggingFace Transformers原生训练的主要差异：
 - **多模态模型训练**：Qwen3.5等多模态模型，通过`is_multimodal`与对话列配置加载图文数据。
 
 详见 [模型支持列表](../models/supported_models.md) 与 [模型适配指南](../develop/model_adaptation.md)。
+
+EP 通信方式通过 `distributed.ep_plan.dispatcher` 选择（默认 `all2all`）；融合算子通过
+`use_fused_ops` 控制（默认 `true`）。
+无效 dispatcher 在配置初始化时直接报错，详细用法见 [专家并行](../features/expert_parallel.md)。

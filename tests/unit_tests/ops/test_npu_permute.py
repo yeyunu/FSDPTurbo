@@ -13,7 +13,7 @@ _SPEC.loader.exec_module(npu_permute)
 
 class _FakeTorchNPU:
     @staticmethod
-    def npu_moe_token_unpermute(permuted_tokens, sorted_indices, probs):
+    def npu_moe_token_unpermute(permuted_tokens, sorted_indices, probs, *, restore_shape=None):
         assert permuted_tokens.dtype == probs.dtype
         return permuted_tokens
 
