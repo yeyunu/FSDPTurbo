@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+from fsdp_turbo.ops.npu.cce_loss import cce_loss_npu
 from fsdp_turbo.ops.npu.attn_res import attn_res_npu
 from fsdp_turbo.ops.npu.clipped_swiglu import clipped_swiglu_npu
 from fsdp_turbo.ops.npu.causal_conv1d import causal_conv1d_npu, causal_conv1d_update_npu
@@ -34,6 +36,7 @@ from fsdp_turbo.ops.npu.vision_flash_attention import fused_vision_flash_attenti
 from fsdp_turbo.ops.npu.hf32_linear import hf32_linear_npu
 
 __all__ = [
+    'cce_loss_npu',
     'attn_res_npu',
     'clipped_swiglu_npu',
     'causal_conv1d_npu',

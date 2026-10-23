@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+from fsdp_turbo.ops.cpu.cce_loss import cce_loss_cpu
 from fsdp_turbo.ops.cpu.attn_res import attn_res_cpu
 from fsdp_turbo.ops.cpu.clipped_swiglu import clipped_swiglu_cpu
 from fsdp_turbo.ops.cpu.causal_conv1d import causal_conv1d_cpu, causal_conv1d_update_cpu
@@ -21,6 +23,7 @@ from fsdp_turbo.ops.cpu.sparse_attention import indexed_sparse_attention_torch
 from fsdp_turbo.ops.cpu.situ_glu import situ_glu_cpu
 
 __all__ = [
+    'cce_loss_cpu',
     'attn_res_cpu',
     'clipped_swiglu_cpu',
     'causal_conv1d_cpu',

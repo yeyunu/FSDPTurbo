@@ -46,7 +46,9 @@ class Qwen3_5MoeForConditionalGeneration(HFQwen3_5MoeForConditionalGeneration):
         loss = None
         logits = None
         if getattr(self, "enable_chunk_loss", False):
-            loss = self.lm_head(hidden_states[:, slice_indices, :], self.loss_function, labels)
+            # Training injects either legacy chunk loss or CCE through loss_function.
+            # Both consume the full sequence; logits_to_keep only selects returned logits.
+            loss = self.lm_head(hidden_states, self.loss_function, labels)
         else:
             logits = self.lm_head(hidden_states[:, slice_indices, :])
             if labels is not None:
