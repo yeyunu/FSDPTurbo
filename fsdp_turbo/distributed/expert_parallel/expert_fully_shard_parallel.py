@@ -18,6 +18,31 @@ from fsdp_turbo.utils.torch_patch import apply_hccl_premul_sum_patch
 logger = logging.getLogger(__name__)
 
 
+def set_modules_to_prefetch_efsdp(
+    model: torch.nn.Module, efsdp_modules: list[torch.nn.Module], fsdp_plan: FSDPPlanConfig
+):
+    """Configure forward and backward prefetching."""
+    wrapped_modules_in_order: list[torch.nn.Module] = []
+    for sub_module in model.modules():  # pre-order
+        if any(sub_module is target_module for target_module in efsdp_modules):
+            wrapped_modules_in_order.append(sub_module)
+
+    if fsdp_plan.num_to_forward_prefetch > 0:
+        for i, layer in enumerate(wrapped_modules_in_order):
+            j_end = min(len(wrapped_modules_in_order), i + 1 + fsdp_plan.num_to_forward_prefetch)
+            layers_to_prefetch = wrapped_modules_in_order[i + 1 : j_end]
+            if layers_to_prefetch:
+                layer.set_modules_to_forward_prefetch(layers_to_prefetch)
+
+    if fsdp_plan.num_to_backward_prefetch > 0:
+        rev_wrapped_modules_in_order = list(reversed(wrapped_modules_in_order))
+        for i, layer in enumerate(rev_wrapped_modules_in_order):
+            j_end = min(len(rev_wrapped_modules_in_order), i + 1 + fsdp_plan.num_to_backward_prefetch)
+            layers_to_prefetch = rev_wrapped_modules_in_order[i + 1 : j_end]
+            if layers_to_prefetch:
+                layer.set_modules_to_backward_prefetch(layers_to_prefetch)
+
+
 def expert_fully_shard_modules(
     model: torch.nn.Module,
     efsdp_mesh,
@@ -56,6 +81,8 @@ def expert_fully_shard_modules(
         else:
             fully_shard_fn(experts, hook_module=hook_module, **config)
             set_gradient_divide_factor(experts, gradient_divide_factor)
+
+    set_modules_to_prefetch_efsdp(model, efsdp_modules, fsdp_plan)
 
     return model
 
