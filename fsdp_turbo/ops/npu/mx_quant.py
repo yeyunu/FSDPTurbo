@@ -28,6 +28,13 @@ def get_float4_dtype():
     return torch_npu.float4_e2m1fn_x2
 
 
+def get_e8m0_dtype():
+    """Return the NPU e8m0 scale dtype, or None when torch_npu is unavailable."""
+    if torch_npu is None:
+        return None
+    return torch_npu.float8_e8m0fnu
+
+
 @register_op('dynamic_mx_quant', 'npu')
 def dynamic_mx_quant_npu(x, axis=-1, dst_type=None, scale_alg=0, block_size=32, round_mode=None):
     """FP8 e4m3 + per-block shared-exponent quantization (MX format).
@@ -43,6 +50,10 @@ def dynamic_mx_quant_npu(x, axis=-1, dst_type=None, scale_alg=0, block_size=32, 
     }
     if round_mode is not None:
         kwargs["round_mode"] = round_mode
+
+    if dst_type == torch.float4_e2m1fn_x2:
+        kwargs['dst_type'] = torch_npu.float4_e2m1fn_x2
+
     return torch_npu.npu_dynamic_mx_quant(x, **kwargs)
 
 

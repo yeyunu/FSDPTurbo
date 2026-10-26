@@ -5,16 +5,19 @@ from fsdp_turbo.ops.npu.clipped_swiglu import clipped_swiglu_npu
 from fsdp_turbo.ops.npu.causal_conv1d import causal_conv1d_npu, causal_conv1d_update_npu
 from fsdp_turbo.ops.npu.gdn import chunk_gdn_npu, fused_recurrent_gdn_npu
 from fsdp_turbo.ops.npu.chunk_kda import chunk_kda_npu
-from fsdp_turbo.ops.npu.grouped_matmul import grouped_matmul_npu
+from fsdp_turbo.ops.npu.grouped_matmul import grouped_matmul_npu, w4a16_grouped_matmul_npu
 from fsdp_turbo.ops.npu.grouped_matmul_mc2 import all2all_grouped_matmul_npu, grouped_matmul_all2all_npu
 from fsdp_turbo.ops.npu.mx_grouped_matmul import mx_grouped_matmul_npu
-from fsdp_turbo.ops.npu.mx_quant_matmul import mx_quant_matmul_npu
+from fsdp_turbo.ops.npu.mx_quant_matmul import mx_quant_matmul_npu, w4a16_quant_matmul_npu
 from fsdp_turbo.ops.npu.mx_quant import (
     dynamic_mx_quant_npu,
     dynamic_mx_quant_with_dual_axis_npu,
     grouped_dynamic_mx_quant_npu,
     swiglu_npu,
     mx_to_block_mx_quant_npu,
+    get_float4_dtype,
+    get_hifloat8_dtype,
+    get_e8m0_dtype,
 )
 from fsdp_turbo.ops.npu.permute import permute_npu, unpermute_npu
 from fsdp_turbo.ops.npu.rms_norm import rms_norm_npu
@@ -48,10 +51,12 @@ __all__ = [
     'fused_recurrent_gdn_npu',
     'chunk_kda_npu',
     'grouped_matmul_npu',
+    'w4a16_grouped_matmul_npu',
     'all2all_grouped_matmul_npu',
     'grouped_matmul_all2all_npu',
     'mx_grouped_matmul_npu',
     'mx_quant_matmul_npu',
+    'w4a16_quant_matmul_npu',
     'dynamic_mx_quant_npu',
     'dynamic_mx_quant_with_dual_axis_npu',
     'grouped_dynamic_mx_quant_npu',
@@ -64,6 +69,9 @@ __all__ = [
     'qsa_selected_token_mask_npu',
     'hc_split_sinkhorn_npu',
     'mx_to_block_mx_quant_npu',
+    'get_float4_dtype',
+    'get_hifloat8_dtype',
+    'get_e8m0_dtype',
     'situ_glu_npu',
     'indexed_sparse_attention_npu',
     'npu_sparse_flash_mla',

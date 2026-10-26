@@ -83,3 +83,31 @@ class GroupedMatmul(torch.autograd.Function):
 @register_op('grouped_matmul', 'npu')
 def grouped_matmul_npu(inputs, m_split, weights):
     return GroupedMatmul.apply(inputs, weights, None, m_split, 1)
+
+
+@register_op('w4a16_grouped_matmul', 'npu')
+def w4a16_grouped_matmul_npu(
+    x,
+    weights,
+    bias=None,
+    group_list=None,
+    group_type=0,
+    output_dtype=None,
+    group_list_type=0,
+    split_item=2,
+):
+    """Low-precision (W4A16) grouped matmul on Ascend.
+
+    Wraps ``torch_npu.npu_grouped_matmul`` with the W4A16 QAT recipe's
+    argument set (``output_dtype``, ``group_type``, ``split_item``).
+    """
+    return torch_npu.npu_grouped_matmul(
+        [x],
+        weights,
+        bias=bias,
+        group_list=group_list,
+        group_type=group_type,
+        output_dtype=output_dtype,
+        group_list_type=group_list_type,
+        split_item=split_item,
+    )

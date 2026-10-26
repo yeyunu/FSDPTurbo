@@ -59,3 +59,29 @@ def mx_quant_matmul_cpu(
     if output_dtype is not None:
         output = output.to(output_dtype)
     return output
+
+
+@register_op('w4a16_quant_matmul', 'cpu')
+def w4a16_quant_matmul_cpu(
+    x1,
+    x2,
+    scale,
+    pertoken_scale=None,
+    bias=None,
+    scale_dtype=None,
+    pertoken_scale_dtype=None,
+    output_dtype=None,
+    x1_dtype=None,
+    x2_dtype=None,
+    group_sizes=None,
+):
+    """Low-precision (W4A16) quantized matmul CPU fallback.
+
+    W4A16 relies on the NPU low-precision quantized matmul kernel and the
+    NPU float4 dtype, so there is no meaningful CPU implementation. This
+    fallback keeps the module importable on non-NPU devices and raises a
+    clear error if the W4A16 path is actually exercised on CPU.
+    """
+    raise NotImplementedError(
+        "W4A16 low-precision quantized matmul is only supported on NPU. No CPU fallback is available."
+    )

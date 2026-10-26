@@ -7,6 +7,8 @@ from torch.distributed._functional_collectives import all_to_all_single_autograd
 from fsdp_turbo.distributed.expert_parallel.comm import gather_along_first_dim_expert_parallel
 from fsdp_turbo.ops.moe import grouped_matmul, permute, unpermute, swiglu, clipped_swiglu, clamp_swiglu
 from fsdp_turbo.quantization.utils import quant_grouped_gemm
+from fsdp_turbo.quantization.qat.w4a16.w4a16_config import W4A16Config
+from fsdp_turbo.quantization.qat.w4a16.w4a16_gmm import mx_quant_group_gemm
 from fsdp_turbo.distributed.expert_parallel.utils import get_num_global_tokens_per_local_expert
 from fsdp_turbo.distributed.expert_parallel.ep_balance import EPBalanceWeights
 
@@ -91,6 +93,8 @@ def experts_computation(
     quant_config=None,
     weight_owner=None,
 ):
+    is_w4a16 = isinstance(quant_config, W4A16Config)
+
     if hidden_states.shape[0] == 0:
         if ep_balance is not None:
             down_weights = ep_balance.prepare_down(down_weights)
@@ -100,6 +104,23 @@ def experts_computation(
         return torch.nn.functional.linear(gate * up, down_weights[0])
 
     def gemm_fn(x, w, weight_attr):
+        if is_w4a16:
+            num_local_experts = gate_up_weights.shape[0]
+            hidden_size = gate_up_weights.shape[-1]
+            if weight_attr == "gate_up_proj":
+                to_shape = [num_local_experts, -1, hidden_size]
+            else:
+                to_shape = [num_local_experts, hidden_size, -1]
+            return mx_quant_group_gemm(
+                x=x,
+                weight=w,
+                bias=None,
+                tokens_per_expert=split_list,
+                config=quant_config,
+                grad_enabled=torch.is_grad_enabled(),
+                to_shape=to_shape,
+                ori_weight=w,
+            )
         if quant_config is not None:
             return quant_grouped_gemm(
                 x,
@@ -113,14 +134,17 @@ def experts_computation(
         return grouped_matmul(x, split_list, w, use_eager=not fused)
 
     intermediate_hidden_states = gemm_fn(hidden_states, gate_up_weights, "gate_up_proj")
-    intermediate_activations = apply_activation(
-        intermediate_hidden_states,
-        dim=-1,
-        fused=fused,
-        swiglu_limit=act_limit,
-        swiglu_alpha=act_alpha,
-        activation=act_fn,
-    )
+    if is_w4a16:
+        intermediate_activations = swiglu(intermediate_hidden_states, dim=-1)
+    else:
+        intermediate_activations = apply_activation(
+            intermediate_hidden_states,
+            dim=-1,
+            fused=fused,
+            swiglu_limit=act_limit,
+            swiglu_alpha=act_alpha,
+            activation=act_fn,
+        )
 
     if ep_balance is not None:
         down_weights = ep_balance.prepare_down(down_weights)

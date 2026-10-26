@@ -150,6 +150,12 @@ def w8a16_module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) ->
     )
 
 
+def w4a16_module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
+    return isinstance(mod, nn.Linear) and _apply_modules_match(
+        fqn, config, 'w4a16_apply_modules', 'w4a16_ignored_modules'
+    )
+
+
 def moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
     return "experts" in fqn.lower() and _apply_modules_match(
         fqn, config, 'mxfp8_apply_modules', 'mxfp8_ignored_modules'
@@ -159,6 +165,12 @@ def moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
 def w8a16_moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
     return "experts" in fqn.lower() and _apply_modules_match(
         fqn, config, 'w8a16_apply_modules', 'w8a16_ignored_modules'
+    )
+
+
+def w4a16_moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
+    return "experts" in fqn.lower() and _apply_modules_match(
+        fqn, config, 'w4a16_apply_modules', 'w4a16_ignored_modules'
     )
 
 

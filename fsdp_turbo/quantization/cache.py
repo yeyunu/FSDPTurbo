@@ -2,13 +2,95 @@
 import types
 import warnings
 from typing import Callable, Any
+from collections import defaultdict
 
 import torch
+
+from fsdp_turbo.ops.quantize import w4a16_quant_matmul
+
 
 _weight_cache: dict[int, Any] = {}
 _num_quantized: int = 0
 _num_cache_hits: int = 0
 _opt_hooked: bool = False
+_identity_linear_cache = {}
+_identity_gmm_cache = {}
+_cached_weight_pool = defaultdict(lambda: {})
+
+
+def cached_weight_fakequant(
+    x: torch.Tensor,
+    quantizer: Callable[..., Any],
+    bias: torch.Tensor = None,
+    block_size: int = 32,
+    key: torch.Tensor = None,
+    **kwargs,
+):
+    global _num_quantized, _num_cache_hits
+
+    key = x if key is None else key
+
+    if key in _cached_weight_pool:
+        _num_cache_hits += 1
+        return _cached_weight_pool[key]
+
+    if len(x.shape) == 3:
+        e, m, n = x.shape
+        if m not in _identity_gmm_cache:
+            identity_matrix = torch.eye(m, dtype=torch.bfloat16, device=x.device)
+            identity_quant, identity_sf_quant = quantizer(identity_matrix, axis=-1, **kwargs)
+            _identity_gmm_cache[m] = (identity_quant, identity_sf_quant)
+
+        identity_quant, identity_sf_quant = _identity_gmm_cache[m]
+
+        weight_2d = x.permute(1, 0, 2).reshape(m, e * n)
+        weight_quant, weight_sf_quant = quantizer(weight_2d, axis=-2, **kwargs)
+
+        output = w4a16_quant_matmul(
+            identity_quant,
+            weight_quant,
+            weight_sf_quant,
+            pertoken_scale=identity_sf_quant,
+            bias=bias,
+            scale_dtype=torch.float8_e8m0fnu,
+            pertoken_scale_dtype=torch.float8_e8m0fnu,
+            output_dtype=torch.bfloat16,
+            x1_dtype=torch.float4_e2m1fn_x2,
+            x2_dtype=torch.float4_e2m1fn_x2,
+            group_sizes=[1, 1, 32],
+        )
+
+        weight = output.reshape(m, e, n).permute(1, 0, 2)
+    else:
+        n = x.shape[-1]
+        if n not in _identity_linear_cache:
+            identity_matrix = torch.eye(n, dtype=torch.bfloat16, device=x.device)
+            identity_quant, identity_sf_quant = quantizer(identity_matrix, axis=-2, **kwargs)
+            _identity_linear_cache[n] = (identity_quant, identity_sf_quant)
+
+        identity_quant, identity_sf_quant = _identity_linear_cache[n]
+        weight_quant, weight_sf_quant = quantizer(x, axis=-1, **kwargs)
+
+        output = w4a16_quant_matmul(
+            weight_quant,
+            identity_quant,
+            identity_sf_quant,
+            pertoken_scale=weight_sf_quant,
+            bias=bias,
+            scale_dtype=torch.float8_e8m0fnu,
+            pertoken_scale_dtype=torch.float8_e8m0fnu,
+            output_dtype=torch.bfloat16,
+            x1_dtype=torch.float4_e2m1fn_x2,
+            x2_dtype=torch.float4_e2m1fn_x2,
+            group_sizes=[1, 1, 32],
+        )
+
+        weight = output
+
+    _cached_weight_pool[key] = weight
+    _num_quantized += 1
+
+    return weight
 
 
 def cached_weight_quant(
@@ -56,6 +138,9 @@ def clear_weight_cache() -> None:
                 if isinstance(t, torch.Tensor):
                     t.untyped_storage().resize_(0)
     _weight_cache.clear()
+    _cached_weight_pool.clear()
+    _identity_linear_cache.clear()
+    _identity_gmm_cache.clear()
     _num_quantized = 0
     _num_cache_hits = 0
 

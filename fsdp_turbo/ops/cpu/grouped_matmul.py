@@ -68,3 +68,26 @@ def grouped_matmul_cpu(inputs, m_split, weights):
         Tensor of shape [batch_size, output_dim]
     """
     return _GroupedMatmulCPU.apply(inputs, m_split, weights)
+
+
+@register_op('w4a16_grouped_matmul', 'cpu')
+def w4a16_grouped_matmul_cpu(
+    x,
+    weights,
+    bias=None,
+    group_list=None,
+    group_type=0,
+    output_dtype=None,
+    group_list_type=0,
+    split_item=2,
+):
+    """Low-precision (W4A16) grouped matmul CPU fallback.
+
+    W4A16 relies on the NPU low-precision grouped matmul kernel and the
+    NPU float4 dtype, so there is no meaningful CPU implementation. This
+    fallback keeps the module importable on non-NPU devices and raises a
+    clear error if the W4A16 path is actually exercised on CPU.
+    """
+    raise NotImplementedError(
+        "W4A16 low-precision grouped matmul is only supported on NPU. No CPU fallback is available."
+    )
