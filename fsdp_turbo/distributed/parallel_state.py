@@ -7,6 +7,7 @@ from functools import reduce
 from typing import Optional
 
 import torch
+from torch.distributed import ProcessGroup
 from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
 
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
@@ -306,6 +307,26 @@ class ParallelState(metaclass=Singleton):
         else:
             self.device_mesh_map[new_mesh_name] = device_mesh[tuple(mesh_dim_names)]
         self.add_method(new_mesh_name)
+
+    def update_device_mesh_map(self, device_mesh_map: dict[str, DeviceMesh | ProcessGroup]):
+        """Update registered device meshes with user-provided ones at runtime.
+
+        Args:
+            device_mesh_map: Mapping from mesh name to a DeviceMesh or a
+                ProcessGroup. A ProcessGroup is wrapped into a 1D DeviceMesh
+                whose dimension is named after the mesh name, reusing the
+                existing group without creating new communicators. Only the
+                given names are updated; all other registered meshes stay
+                unchanged.
+        """
+        for mesh_name, mesh in device_mesh_map.items():
+            if isinstance(mesh, ProcessGroup):
+                mesh = DeviceMesh.from_group(mesh, device_type=get_accelerator_name(), mesh_dim_names=(mesh_name,))
+            elif not isinstance(mesh, DeviceMesh):
+                raise TypeError(f"Mesh '{mesh_name}' must be a DeviceMesh or ProcessGroup, got {type(mesh).__name__}.")
+            self.device_mesh_map[mesh_name] = mesh
+            self.add_method(mesh_name)
+        print_rank(logger.info, f'Updated device meshes: {", ".join(device_mesh_map)}')
 
 
 def get_parallel_state() -> ParallelState:

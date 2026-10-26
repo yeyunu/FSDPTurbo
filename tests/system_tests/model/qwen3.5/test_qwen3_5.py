@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 
@@ -9,6 +10,7 @@ except ImportError:
     torch_npu = None
 from torch.optim import AdamW
 from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
 
 from fsdp_turbo.fsdp_turbo import FSDPTurbo
 from fsdp_turbo.quantization.cache import clear_weight_cache
@@ -25,7 +27,7 @@ from fsdp_turbo.fsdp_turbo_config import (
 from fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5 import qwen3_5_model_forward
 from fsdp_turbo.training.clip_grads import compute_grad_norm
 from fsdp_turbo.utils.device import set_accelerator_compatible
-from fsdp_turbo.utils.log import set_log_level
+from fsdp_turbo.utils.log import print_rank, set_log_level
 from fsdp_turbo.utils.model import init_submodule_weights, set_num_hidden_layers
 from fsdp_turbo.utils.random import set_seed
 
@@ -193,6 +195,24 @@ def get_complete_custom_config():
 # ============================================================
 # Training loop
 # ============================================================
+def _init_language_model_with_legacy_sampling(language_model: torch.nn.Module) -> None:
+    """Use the parameter dtype for GDN sampling, retaining the installed version's bounds."""
+
+    def init_weights(module):
+        if not isinstance(module, Qwen3_5GatedDeltaNet):
+            language_model._init_weights(module)
+            return
+        default_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(module.A_log.dtype)
+            language_model._init_weights(module)
+        finally:
+            torch.set_default_dtype(default_dtype)
+
+    language_model.apply(init_weights)
+    print_rank(logging.getLogger(__name__).info, "Initialized language_model with GDN sampling in A_log.dtype.")
+
+
 def train_step(model, batch, optimizer):
     """Execute a single training step: forward, backward, optimizer step, zero_grad."""
     batch['use_cache'] = False
@@ -231,7 +251,7 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
 
     model, processor = get_model_tokenizer(config)
     model.to_empty(device='npu')
-    init_submodule_weights(model.model.language_model, name="language_model")
+    _init_language_model_with_legacy_sampling(model.model.language_model)
     init_submodule_weights(model.model.visual, name="visual")
     model.tie_weights()
     model = FSDPTurbo(config, model)

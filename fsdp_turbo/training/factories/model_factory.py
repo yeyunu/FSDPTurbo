@@ -32,7 +32,7 @@ class ModelFactory:
             custom_fn: Callable that returns a model, receives **kwargs.
         """
         _registry[name] = custom_fn
-        logger.info(f"Registered custom model creator: {name}")
+        logger.info("Registered custom model creator: %s", name)
 
     @staticmethod
     def create(
@@ -52,15 +52,16 @@ class ModelFactory:
             **kwargs: Forwarded to the underlying create call (e.g. torch_dtype).
         """
         if custom_fn is not None:
-            logger.info(f"Creating model from custom_fn: {source}")
+            logger.info("Creating model from custom_fn: %s", source)
             return custom_fn(**kwargs)
 
         if source in _registry:
-            logger.info(f"Creating model from registered source: {source}")
+            logger.info("Creating model from registered source: %s", source)
             return _registry[source](**kwargs)
 
         import transformers
+
         cls_name = model_class or "AutoModelForCausalLM"
         auto_cls = getattr(transformers, cls_name)
-        logger.info(f"Creating model from HuggingFace: {source} ({cls_name})")
+        logger.info("Creating model from HuggingFace: %s (%s)", source, cls_name)
         return auto_cls.from_pretrained(source, **kwargs)

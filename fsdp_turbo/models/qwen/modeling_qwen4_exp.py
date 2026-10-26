@@ -102,6 +102,7 @@ from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.ops.rope import rope
 from fsdp_turbo.utils.device import get_accelerator_name
 from fsdp_turbo.utils.log import print_rank
+from fsdp_turbo.utils.model import register_model
 
 from fsdp_turbo.modules.mtp import MultiTokenPredictionBlock
 
@@ -743,6 +744,7 @@ class Qwen4ExpModel(HFQwen4ExpModel):
         return Qwen4ExpModelOutputWithPast(**outputs, rope_deltas=self.rope_deltas)
 
 
+@register_model("qwen4_exp")
 class Qwen4ExpForConditionalGeneration(HFQwen4ExpForConditionalGeneration):
     """Qwen4ExpForConditionalGeneration with fused modules and MTP support.
 

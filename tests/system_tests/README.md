@@ -134,7 +134,9 @@ NUM_STEPS=5 bash run_test_deepseekv4.sh
 
 **模型规格**：DeepSeekV4-4L（4 层、16 专家、topk=16），meta 设备构建 → FSDPTurbo 包裹 → CPU 物化初始化，`max_seq_length=1024`，`batch_size=4`。
 
-Qwen3.5 dense / MoE 两者均为 **CI 冒烟用例**：仅需 `config.json + tokenizer/processor`（不下载真实权重），用 `from_config` 在 `meta` 上建模型 → `to_empty` 物化 → 通过 `fsdp_turbo.utils.model.init_submodule_weights` 调用 text/visual 子模型的 `_init_weights` 随机初始化 → `tie_weights` → `FSDPTurbo` 包裹。其它默认：`BATCH_SIZE=1`、`MAX_LENGTH=512`、`LR=1e-4`、`recompute=True`、混合精度 `bf16` 参数 / `fp32` 约减。
+Qwen3.5 dense / MoE 两者均为 **CI 冒烟用例**：仅需 `config.json + tokenizer/processor`（不下载真实权重），用 `from_config` 在 `meta` 上建模型 → `to_empty` 物化 → 分别调用 text/visual 子模型的 `_init_weights` 随机初始化 → `tie_weights` → `FSDPTurbo` 包裹。其它默认：`BATCH_SIZE=1`、`MAX_LENGTH=512`、`LR=1e-4`、`recompute=True`、混合精度 `bf16` 参数 / `fp32` 约减。
+
+Qwen3.5 dense 用例的语言模型初始化使用测试内的 `_init_language_model_with_legacy_sampling`：仅在 GatedDeltaNet 的 `_init_weights` 调用期间，将默认浮点类型设为 `A_log.dtype`（本用例为 BF16），并通过 `finally` 恢复原默认类型。这样可验证 Transformers 5.16 起将 GDN 临时采样张量改为默认浮点类型所带来的影响；其他模块仍调用原初始化函数，visual 和 MoE 用例继续使用原流程。采样区间沿用安装版本（新版为 `(0.01, 16)`），保留避免 `log(0)` 的修复，因此不保证完全复现 5.15 的初始化参数或旧基线。
 
 Qwen3 为**全层真实权重用例**：`AutoModelForCausalLM.from_pretrained` 加载完整 Qwen3-30B-A3B 权重 + wikitext 数据集，不做减层/随机初始化。CI 需在 `MODEL_PATH=/home/dataset/Qwen3-30B-A3B`、`DATASET_PATH=/home/dataset/wikitext` 处提供真实权重与数据，否则该用例在训练阶段即失败（与基线比对无关）。每步同样在 rank0 打印 `[Rank 0] step N step time: ... loss: ... grad norm: ... memory: ... max memory: ... GB` 汇总行，由 `acquire_json` 解析后参与 loss/grad norm/时间/显存看护。
 

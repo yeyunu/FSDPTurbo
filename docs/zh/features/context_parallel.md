@@ -53,6 +53,10 @@ CP将序列切分到多个rank，每个rank只持有部分序列片段。为保�
 2. **Loss函数替换**：通过`loss_function_patches`将原生损失函数（如`ForCausalLMLoss`）替换为CP感知版本，避免重复进行序列内移位。
 3. **跨rank同步**：CP组内的loss已在forward中完成同步，无需额外的all-reduce。
 
+CP loss兼容不传递额外参数的旧版模型，以及Transformers 5.17起Qwen3.5向loss传递`**kwargs`的调用方式。模块加载时读取`torch.nn.functional.cross_entropy`的函数签名，仅转发其明确支持关键字传参的参数，并排除CP已传入的`input`、`target`、`ignore_index`、`reduction`。`use_cache`等模型前向参数不会传入交叉熵；保留`weight`、`label_smoothing`及旧式`size_average`、`reduce`参数的原有行为，`reduction`参数仍由CP指定。
+
+若提供`shift_labels`，它必须是完整序列上已移位的标签，loss直接pad并切分，不再移位；未提供时沿用完整`labels`的全局移位流程。`num_items_in_batch`支持Tensor或整数，表示全局归一化计数；未提供时沿用CP组内有效token计数。
+
 ## 注意事项
 
 - **序列长度对齐**：`max_seq_length`应能被`ulysses_parallel_size`整除，避免序列切分时出现不等长片段。

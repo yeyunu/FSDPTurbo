@@ -77,6 +77,7 @@ else:
     flash_attn_varlen_func = None
 from fsdp_turbo.memory.chunk_loss.chunk_loss import calculate_lm_loss, chunk_loss
 from fsdp_turbo.utils.device import get_accelerator_name
+from fsdp_turbo.utils.model import register_model
 
 if get_accelerator_name() == "npu":
     import torch_npu
@@ -942,6 +943,7 @@ class ProjectorConfig:
 
 
 # ref https://github.com/huggingface/transformers/blob/78b2929c0554b79e0489b451ce4ece14d265ead2/src/transformers/models/llava/modeling_llava.py#L240
+@register_model("kimi_k3")
 class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
     @classmethod
     def _supports_default_dynamic_cache(cls) -> bool:
