@@ -287,7 +287,21 @@ class Block(nn.Module):
         self.ffn = MoE(layer_id, args)
         self.engram = None
         if engram_layout is not None and layer_id in engram_layout.layer_ids:
-            self.engram = Engram(args, layer_id, engram_layout)
+            if args.use_fused_engram:
+                embedding_dim = (engram_layout.max_ngram_size - 1) * engram_layout.n_heads * engram_layout.head_dim
+                if args.hc_mult != 4:
+                    raise ValueError("Fused Engram requires hc_mult=4.")
+                if args.dim not in (1024, 1280, 1536, 2048, 2560, 5120):
+                    raise ValueError(f"Fused Engram has no TilingKey specialization for dim={args.dim}.")
+                if embedding_dim % 128 != 0:
+                    raise ValueError(
+                        f"Fused Engram requires the flattened memory dim to be a multiple of 128, got {embedding_dim}."
+                    )
+                from .fused_engram import FusedEngram
+
+                self.engram = FusedEngram(args, layer_id, engram_layout)
+            else:
+                self.engram = Engram(args, layer_id, engram_layout)
         self.attn_norm = RMSNorm(args.dim, self.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, self.norm_eps)
         self.hc_mult = hc_mult = args.hc_mult

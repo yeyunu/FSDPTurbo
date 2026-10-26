@@ -2,6 +2,11 @@
 line-length = 120
 target-version = "py310"
 format.quote-style = "preserve"
+# Vendored PyPTO-Pro DSL kernels (pypto-gym MR !819, see the package
+# docstring): kept byte-identical to upstream. The DSL injects names (vf,
+# HMode, ...) into decorated functions (F821 false positives) and the files
+# follow upstream formatting, so the whole package is excluded from ruff.
+extend-exclude = ["fsdp_turbo/ops/npu/engram_pypto"]
 
 [tool.ruff.lint]
 # 追加 D209，不会覆盖、不会屏蔽任何现有规则
@@ -102,6 +107,11 @@ disable = [
   "wrong-import-position",
   "import-error",
 ]
+
+[tool.pylint.main]
+# 与 ruff 的 extend-exclude 同理：vendored PyPTO-Pro DSL 算子目录整体跳过
+# （DSL 装饰器注入的 vf/HMode 等名字对静态分析不可见）
+ignore-paths = [".*engram_pypto.*"]
 
 # ==============================================
 # Bandit 安全门禁专用配置

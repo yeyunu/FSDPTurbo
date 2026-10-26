@@ -72,6 +72,8 @@ class ModelArgs:
     use_triton_inplace_rope: bool = False
     # Use CANN FlashAttentionScore/FlashAttentionScoreGrad in the vision tower.
     use_fused_vision_flash_attn: bool = False
+    # Run the Engram wkv gating through the fused PyPTO-Pro kernels (NPU).
+    use_fused_engram: bool = False
     lightning_indexer_page_size: int = 128
     # candidate pre-filtering: candidate_source_layer < 0 turns it off and the other two are unused
     candidate_source_layer: int = -1

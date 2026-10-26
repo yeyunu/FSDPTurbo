@@ -48,6 +48,8 @@ class ModelConfig:
     # over the trailing rotary block on NPU.
     use_triton_inplace_rope: bool = False
     use_fused_vision_flash_attn: bool = False
+    # Fuse the Engram n-gram memory gating via the PyPTO-Pro kernels on Ascend950DT.
+    use_fused_engram: bool = False
     # DeepSeek-V4.1 head projection precision; cross entropy remains FP32.
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32"
     attn_implementation: str = 'eager'

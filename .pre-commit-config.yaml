@@ -11,7 +11,9 @@ repos:
   - repo: https://gitcode.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
+      # vendored PyPTO-Pro DSL kernels stay byte-identical to upstream (MR !819)
       - id: trailing-whitespace
+        exclude: ^fsdp_turbo/ops/npu/engram_pypto/
       - id: end-of-file-fixer
       - id: check-yaml
         args: ["--allow-multiple-documents"]
@@ -26,6 +28,7 @@ repos:
   - repo: https://gitcode.com/gh_mirrors/ru/ruff-pre-commit
     rev: v0.14.14
     hooks:
+      # ruff-pre-commit 的 entry 已内置 --force-exclude（显式再传会导致参数重复报错）
       - id: ruff-check
         args: ["--config", "pre-commit/pyproject.toml", "--output-format", "github", "--fix"]
         types: [python]

@@ -26,6 +26,9 @@ model:
   use_triton_inplace_rope: true
   # Use CANN FlashAttn/FlashAttnGrad for full bidirectional vision attention.
   use_fused_vision_flash_attn: true
+  # Fuse the Engram n-gram memory gating via the PyPTO-Pro kernels (Ascend950DT);
+  # falls back to eager torch when pypto_pro is unavailable.
+  use_fused_engram: false
 
 # --- Optimizer Configuration ---
 optimizer:

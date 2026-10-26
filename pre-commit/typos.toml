@@ -1,6 +1,7 @@
 [files]
 # these files may be written in non english words
-extend-exclude = []
+# vendored PyPTO-Pro DSL kernels stay byte-identical to upstream (MR !819)
+extend-exclude = ["fsdp_turbo/ops/npu/engram_pypto"]
 ignore-hidden = true
 ignore-files = true
 ignore-dot = true
