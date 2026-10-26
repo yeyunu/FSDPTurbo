@@ -21,6 +21,7 @@ from fsdp_turbo.ops.npu.mx_quant import (
 )
 from fsdp_turbo.ops.npu.permute import permute_npu, unpermute_npu
 from fsdp_turbo.ops.npu.rms_norm import rms_norm_npu
+from fsdp_turbo.ops.npu.fused_attention import npu_fusion_attention_npu
 from fsdp_turbo.ops.npu.rope import inplace_rope_npu, rope_npu
 from fsdp_turbo.ops.npu.qsa import qsa_selected_token_mask_npu
 
@@ -28,6 +29,14 @@ try:
     from fsdp_turbo.ops.npu.sinkhorn import hc_split_sinkhorn_npu
 except ImportError:  # triton is optional; the package must still load without it
     hc_split_sinkhorn_npu = None
+try:
+    from fsdp_turbo.ops.npu.lightning_indexer_score import lightning_indexer_score_npu
+except ImportError:  # triton is optional; the package must still load without it
+    lightning_indexer_score_npu = None
+try:
+    from fsdp_turbo.ops.npu.sparse_flash_attention import sparse_flash_attention_npu
+except ImportError:  # depends on the torch_npu wheel exposing the SFA op
+    sparse_flash_attention_npu = None
 from fsdp_turbo.ops.npu.situ_glu import situ_glu_npu
 from fsdp_turbo.ops.npu.sparse_attention import (
     indexed_sparse_attention_npu,
@@ -64,10 +73,13 @@ __all__ = [
     'permute_npu',
     'unpermute_npu',
     'rms_norm_npu',
+    'npu_fusion_attention_npu',
     'inplace_rope_npu',
     'rope_npu',
     'qsa_selected_token_mask_npu',
     'hc_split_sinkhorn_npu',
+    'lightning_indexer_score_npu',
+    'sparse_flash_attention_npu',
     'mx_to_block_mx_quant_npu',
     'get_float4_dtype',
     'get_hifloat8_dtype',

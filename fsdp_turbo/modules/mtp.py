@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Multi-Token Prediction (MTP) block, ported from MindSpeed-MM ``mindspeed_mm/fsdp/models/mtp.py``.
+
+
+"""Multi-Token Prediction (MTP) block.
 
 Generic across models: the decoder layer, norm and hyper-connection mixer
 classes are injected by the caller. Context-parallel awareness is likewise

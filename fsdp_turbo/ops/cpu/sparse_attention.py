@@ -69,4 +69,63 @@ def indexed_sparse_attention_torch(
     return attention_output.to(query.dtype)
 
 
-__all__ = ["indexed_sparse_attention_torch"]
+@register_op("sparse_flash_attention", "cpu")
+def sparse_flash_attention_torch(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    rope_head_dim: int = 0,
+    query_rope: torch.Tensor | None = None,
+    key_rope: torch.Tensor | None = None,
+    sparse_mode: int = 3,
+) -> torch.Tensor:
+    """Gather-based reference for ``npu_sparse_flash_attention`` (MLA-absorb DSA).
+
+    query is the absorbed query [B, S, N, D]; key and value are the shared latent
+    [B, KV, 1, D]; topk_indices is [B, S, topk] with -1 marking unused slots.
+    The indices already encode causality and padding, so ``sparse_mode`` needs
+    no separate handling here.
+    """
+    del sparse_mode
+    batch_size, sequence_length, _, head_dim = query.shape
+    kv_length = key.shape[1]
+    topk_size = topk_indices.shape[-1]
+
+    safe_indices = topk_indices.clamp(0, kv_length - 1).long()
+    selected_key = torch.gather(
+        key.squeeze(2).unsqueeze(1).expand(-1, sequence_length, -1, -1),
+        2,
+        safe_indices.unsqueeze(-1).expand(batch_size, sequence_length, topk_size, head_dim),
+    )
+    selected_value = torch.gather(
+        value.squeeze(2).unsqueeze(1).expand(-1, sequence_length, -1, -1),
+        2,
+        safe_indices.unsqueeze(-1).expand(batch_size, sequence_length, topk_size, head_dim),
+    )
+
+    attention_scores = torch.einsum("bsnd,bstd->bsnt", query.float(), selected_key.float()) * softmax_scale
+    if rope_head_dim != 0:
+        if query_rope is None or key_rope is None:
+            raise ValueError(f"rope_head_dim={rope_head_dim} but no rope tensors were given.")
+        selected_key_rope = torch.gather(
+            key_rope.squeeze(2).unsqueeze(1).expand(-1, sequence_length, -1, -1),
+            2,
+            safe_indices.unsqueeze(-1).expand(batch_size, sequence_length, topk_size, rope_head_dim),
+        )
+        attention_scores += (
+            torch.einsum("bsnr,bstr->bsnt", query_rope.float(), selected_key_rope.float()) * softmax_scale
+        )
+    attention_scores = attention_scores.masked_fill(topk_indices.unsqueeze(2) < 0, -torch.inf)
+
+    attention_probabilities = torch.softmax(attention_scores, dim=-1)
+    attention_output = torch.einsum(
+        "bsnt,bstd->bsnd",
+        attention_probabilities.to(selected_value.dtype),
+        selected_value,
+    )
+    return attention_output.to(query.dtype)
+
+
+__all__ = ["indexed_sparse_attention_torch", "sparse_flash_attention_torch"]

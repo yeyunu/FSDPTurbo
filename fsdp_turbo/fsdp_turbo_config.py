@@ -32,6 +32,15 @@ class ModelConfig:
     engram_storage_backend: Optional[Literal["host_offload", "elastic_buffer"]] = None
     use_sparse_flash_attn: bool = False
     use_fused_lightning_indexer: bool = False
+    # GLM-5.3-Flash DSA/indexer/attention dispatch knobs (model_config-driven;
+    # train.py injects them into the HF text/vision sub-configs).
+    # dsa_implementation: 'dense' (mask-based) or 'sfa' (npu_sparse_flash_attention).
+    dsa_implementation: str = "dense"
+    # indexer_implementation: 'eager' or 'triton' (lightning_indexer_score).
+    indexer_implementation: str = "eager"
+    # 1 routes MLA/DSA text attention and the vision tower through
+    # npu_fusion_attention; 0 keeps the bit-exact eager path.
+    npu_fused_attention: bool = True
     use_fused_compressor: bool = False
     use_fused_mhc: bool = False
     use_fused_clipped_swiglu: bool = False

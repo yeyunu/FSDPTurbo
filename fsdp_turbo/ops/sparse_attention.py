@@ -41,4 +41,40 @@ def indexed_sparse_attention(
     )
 
 
-__all__ = ["indexed_sparse_attention"]
+__all__ = ["indexed_sparse_attention", "sparse_flash_attention"]
+
+
+# rightDownCausal: the causal triangle anchored at the bottom right, matching
+# the NPU operator's sparse_mode=3.
+SFA_SPARSE_MODE_CAUSAL = 3
+
+
+def sparse_flash_attention(
+    query,
+    key,
+    value,
+    topk_indices,
+    softmax_scale,
+    rope_head_dim=0,
+    query_rope=None,
+    key_rope=None,
+    sparse_mode=SFA_SPARSE_MODE_CAUSAL,
+):
+    """Attend over the indexer's selected keys without building a dense mask.
+
+    query is the absorbed MLA query [B, S, N, kv_lora_rank]; key and value are
+    the shared compressed latent [B, KV, 1, kv_lora_rank]; topk_indices is the
+    indexer's [B, S, topk] with -1 marking unused slots.
+    """
+    return dispatch_op(
+        "sparse_flash_attention",
+        query,
+        key,
+        value,
+        topk_indices,
+        softmax_scale,
+        rope_head_dim=rope_head_dim,
+        query_rope=query_rope,
+        key_rope=key_rope,
+        sparse_mode=sparse_mode,
+    )
