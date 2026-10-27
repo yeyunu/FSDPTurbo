@@ -31,6 +31,13 @@ def _cmp_mask_mode(has_compressed_kv: bool) -> int:
     return mode
 
 
+@lru_cache(maxsize=16)
+def _is_a2_or_a3(device_index: int | None) -> bool:
+    device_name = torch.accelerator.get_device_name(device_index)
+    normalized_name = device_name.upper().replace("-", "").replace(" ", "")
+    return any(model in normalized_name for model in ("ASCEND910B", "ASCEND910C", "ASCEND910_93"))
+
+
 def _residual_tensor(residual, batch_size: int, device, required: bool):
     if not required:
         return None
@@ -577,7 +584,9 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
                 ctx.residual,
                 batch_size,
                 query.device,
-                ctx.has_compressed_kv and ctx.compress_ratio != 1,
+                # A2/A3 Grad requires a zero ratio-one residual; A5 requires it to remain absent.
+                # Remove this workaround once A3 and A5 operator behavior is aligned.
+                ctx.has_compressed_kv and (ctx.compress_ratio != 1 or _is_a2_or_a3(query.device.index)),
             ),
             ori_topk_length=None,
             cmp_topk_length=None,
