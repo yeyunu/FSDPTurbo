@@ -4,6 +4,9 @@
 import torch
 import torch.distributed as dist
 
+from .communication import split_forward_gather_backward
+from .utils import cal_split_sizes
+
 
 DEFAULT_SEQUENCE_PAD_VALUES = {
     "input_ids": 0,
@@ -16,9 +19,9 @@ def sequence_parallel_range(seq_len: int, group):
     """Return the contiguous sequence interval owned by the current rank."""
     world_size = dist.get_world_size(group)
     rank = dist.get_rank(group)
-    chunk = seq_len // world_size
-    start = rank * chunk
-    return start, start + chunk
+    sizes = cal_split_sizes(seq_len, world_size)
+    start = sum(sizes[:rank])
+    return start, start + sizes[rank]
 
 
 def pad_tensor_to_group(tensor, group, dim: int, pad_value=0):
@@ -99,6 +102,7 @@ def shard_fused_sequence_inputs(
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor | None,
     group,
+    gather_backward: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Pad and shard a complete fused multimodal sequence before the LM."""
     if inputs_embeds.dim() != 3:
@@ -120,7 +124,12 @@ def shard_fused_sequence_inputs(
     if attention_mask is None and inputs_embeds.size(1) % world_size:
         attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
 
-    inputs_embeds = split_tensor_to_group(pad_tensor_to_group(inputs_embeds, group, dim=1, pad_value=0), group, dim=1)
+    inputs_embeds = pad_tensor_to_group(inputs_embeds, group, dim=1, pad_value=0)
+    if gather_backward:
+        split_sizes = cal_split_sizes(inputs_embeds.size(1), world_size)
+        inputs_embeds = split_forward_gather_backward(inputs_embeds, group, dim=1, split_sizes=split_sizes)
+    else:
+        inputs_embeds = split_tensor_to_group(inputs_embeds, group, dim=1)
     position_ids = split_tensor_to_group(pad_tensor_to_group(position_ids, group, dim=-1, pad_value=0), group, dim=-1)
     if attention_mask is not None:
         attention_mask = split_tensor_to_group(

@@ -4,6 +4,7 @@
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -149,9 +150,15 @@ class GatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         cache_params=None,
         attention_mask: Optional[torch.Tensor] = None,
+        *,
+        ulysses_group=None,
         **kwargs,
     ):
-        ulysses_group, ulysses_rank, ulysses_size = get_ulysses_context()
+        if ulysses_group is None:
+            ulysses_group, ulysses_rank, ulysses_size = get_ulysses_context()
+        else:
+            ulysses_rank = dist.get_rank(ulysses_group)
+            ulysses_size = dist.get_world_size(ulysses_group)
 
         if ulysses_size > 1 and cache_params is not None:
             label = "Qwen3.5 MoE" if "Moe" in type(self).__name__ else "Qwen3.5"

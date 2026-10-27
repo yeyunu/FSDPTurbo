@@ -7,6 +7,7 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 
+from fsdp_turbo.distributed.context_parallel.communication import all_to_all
 from fsdp_turbo.distributed.context_parallel.ulysses.utils import ulysses_all_to_all
 
 
@@ -39,6 +40,8 @@ def ulysses_context_parallel_attention(
     ulysses_group,
     scatter_dim: int = 1,
     gather_dim: int = 2,
+    flash_attention: bool = False,
+    total_seq_len: int | None = None,
     **kwargs,
 ):
     """Run full attention after exchanging sequence and head dimensions."""
@@ -46,7 +49,25 @@ def ulysses_context_parallel_attention(
     is_multi_dimensional = query.dim() > 3
 
     attention_mask = kwargs.get("attention_mask")
-    if is_multi_dimensional and attention_mask is None and kwargs.get("is_causal", True) is not False:
+    if flash_attention:
+        # HF FA2 consumes BHSD Q/K/V, a 2D padding mask and returns BSHD.
+        # All ranks must gather a mask even if HF elided an all-valid local mask.
+        # Visual varlen attention uses global cu_seqlens instead of a padding
+        # mask; supplying a mask would override those frame boundaries in FA2.
+        if kwargs.get("cu_seq_lens_q") is None:
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    query.shape[0], query.shape[gather_dim], device=query.device, dtype=torch.bool
+                )
+            attention_mask = attention_mask.to(dtype=torch.bool)
+            gathered_masks = [torch.empty_like(attention_mask) for _ in range(ulysses_size)]
+            dist.all_gather(gathered_masks, attention_mask.contiguous(), group=ulysses_group)
+            kwargs["attention_mask"] = torch.cat(gathered_masks, dim=-1)
+        if key.shape[scatter_dim] % ulysses_size:
+            repeats = query.shape[scatter_dim] // key.shape[scatter_dim]
+            key = key.repeat_interleave(repeats, dim=scatter_dim)
+            value = value.repeat_interleave(repeats, dim=scatter_dim)
+    elif is_multi_dimensional and attention_mask is None and kwargs.get("is_causal", True) is not False:
         attention_mask = _full_causal_mask_from_local(None, query, ulysses_group, gather_dim)
         kwargs["attention_mask"] = attention_mask
     if (
@@ -62,26 +83,29 @@ def ulysses_context_parallel_attention(
         dist.all_gather(gathered_masks, attention_mask.contiguous(), group=ulysses_group)
         kwargs["attention_mask"] = torch.cat(gathered_masks, dim=-2).contiguous()
 
-    query = ulysses_all_to_all(
+    query = all_to_all(
         query,
         ulysses_group,
         scatter_dim=scatter_dim,
         gather_dim=gather_dim,
+        gather_size=total_seq_len,
     )
-    key = ulysses_all_to_all(
+    key = all_to_all(
         key,
         ulysses_group,
         scatter_dim=scatter_dim,
         gather_dim=gather_dim,
+        gather_size=total_seq_len,
     )
-    value = ulysses_all_to_all(
+    value = all_to_all(
         value,
         ulysses_group,
         scatter_dim=scatter_dim,
         gather_dim=gather_dim,
+        gather_size=total_seq_len,
     )
 
-    if is_multi_dimensional:
+    if is_multi_dimensional and not flash_attention:
         attention_mask = kwargs.get("attention_mask")
         if attention_mask is not None and attention_mask.dim() > 2:
             kwargs["attention_mask"] = _to_additive_attention_mask(attention_mask, query.dtype)
@@ -93,7 +117,7 @@ def ulysses_context_parallel_attention(
     else:
         attn_output, rest = output, []
 
-    attn_output = ulysses_all_to_all(
+    attn_output = all_to_all(
         attn_output,
         ulysses_group,
         scatter_dim=scatter_dim,
