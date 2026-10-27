@@ -171,10 +171,25 @@ class FSDPTurbo(torch.nn.Module):
             if not matched:
                 raise RuntimeError(f"Configured module patch did not match the model: target={spec['target']!r}.")
 
-    def apply_recompute_modules(self):
+    def apply_recompute_modules(self) -> None:
+        """Apply configured module recomputation and MXFP8 replay contexts."""
         if not self.config.memory.recompute:
             return
-        self.model = recompute_modules(self.model, self.config.memory.recompute_plan)
+        from contextlib import nullcontext
+        from fsdp_turbo.quantization.core.recompute_phase import (
+            mark_module_for_recompute,
+            mxfp8_recompute_context,
+        )
+
+        def mxfp8_context_factory(module):
+            if module is None:
+                return None
+            mark_module_for_recompute(module)
+            return lambda: (nullcontext(), mxfp8_recompute_context(module))
+
+        self.model = recompute_modules(
+            self.model, self.config.memory.recompute_plan, context_fn_factory=mxfp8_context_factory
+        )
 
     def apply_swap_activation_modules(self):
         if not self.config.memory.swap_activation:
