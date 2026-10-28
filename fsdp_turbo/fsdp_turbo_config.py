@@ -713,14 +713,6 @@ class FSDPTurboConfig:
             if self.distributed.ep_plan is None
             else self.distributed.ep_plan
         )
-        if (
-            self.model.use_fused_clipped_swiglu
-            and self.distributed.ep_plan.apply_modules
-            and self.distributed.ep_plan.dispatcher != "custom_native_eager_forward"
-        ):
-            raise ValueError(
-                "model.use_fused_clipped_swiglu requires DeepSeek-V4.1's custom_native_eager_forward EP dispatcher."
-            )
         if self.distributed.ep_plan.gradient_divide_factor is None:
             # Divide across all expert mesh dims (edp * efsdp * ep). torchrun
             # sets WORLD_SIZE; fall back to 1 for non-distributed runs.

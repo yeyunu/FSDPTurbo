@@ -1,10 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+from __future__ import annotations
+
+from typing import Callable, Iterable, Optional
+
 import torch
 
 from torch.distributed.tensor import DTensor
 from fsdp_turbo.distributed.expert_parallel.comm import gather_along_first_dim_expert_parallel
 from fsdp_turbo.ops.moe import permute, unpermute, grouped_matmul
+from fsdp_turbo.ops.clipped_swiglu import clipped_swiglu
 from fsdp_turbo.distributed.expert_parallel.utils import (
     fixed_router_for_debug,
     normalize_expert_args,
@@ -13,31 +18,53 @@ from fsdp_turbo.distributed.expert_parallel.utils import (
 _DOMINO_NUM_SLICES = 2
 
 
-def experts_computation(hidden_states, split_list, gate_up_weights, down_weights, act_fn, act_limit, fused):
-    gate, up = grouped_matmul(hidden_states, split_list, gate_up_weights, use_eager=not fused).chunk(2, dim=-1)
-    if act_limit is not None:
-        gate = gate.clamp(max=act_limit)
-        up = up.clamp(min=-act_limit, max=act_limit)
-    act = act_fn(gate) * up
+def experts_computation(
+    hidden_states: torch.Tensor,
+    split_list: torch.Tensor,
+    gate_up_weights: torch.Tensor,
+    down_weights: torch.Tensor,
+    act_fn: Callable[[torch.Tensor], torch.Tensor],
+    act_limit: Optional[float],
+    fused: bool,
+    use_fused_clipped_swiglu: bool = False,
+) -> torch.Tensor:
+    """Compute a local Domino slice, preserving its dtype and original activation fallback."""
+    intermediate = grouped_matmul(hidden_states, split_list, gate_up_weights, use_eager=not fused)
+    if use_fused_clipped_swiglu and act_limit is not None and act_limit > 0:
+        act = clipped_swiglu(intermediate, act_limit)
+    else:
+        gate, up = intermediate.chunk(2, dim=-1)
+        if act_limit is not None:
+            gate = gate.clamp(max=act_limit)
+            up = up.clamp(min=-act_limit, max=act_limit)
+        act = act_fn(gate) * up
     hidden_states = grouped_matmul(act, split_list, down_weights, use_eager=not fused)
     return hidden_states
 
 
-def get_domino_experts_forward_fn(ep_group, fused=True, fixed_router=False):
+def get_domino_experts_forward_fn(
+    ep_group: torch.distributed.ProcessGroup,
+    fused: bool = True,
+    fixed_router: bool = False,
+) -> Callable[[torch.nn.Module, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """
     Generate a forward function for expert parallel processing with DOMINO optimization.
 
     Args:
         ep_group: Expert parallel process group
         fused: Whether to use fused grouped matmul operations
+        fixed_router: Whether to generate fixed routes for debugging.
+
+    Returns:
+        An unbound expert forward accepting the owner, tokens, indices and probabilities.
 
     """
 
     comm_streams = {}
 
     def domino_experts_forward(
-        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
-    ):
+        self: torch.nn.Module, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
+    ) -> torch.Tensor:
         """
         Forward pass for expert parallel processing with DOMINO optimization.
 
@@ -83,6 +110,7 @@ def get_domino_experts_forward_fn(ep_group, fused=True, fixed_router=False):
             num_global_experts,
             expert_ids_per_ep_rank,
             comm_stream,
+            use_fused_clipped_swiglu=getattr(self, "use_fused_clipped_swiglu", False),
         )
         hidden_states = torch.cat(hidden_states_list, dim=0)
         return hidden_states.view(*hidden_states_shape)
@@ -91,18 +119,20 @@ def get_domino_experts_forward_fn(ep_group, fused=True, fixed_router=False):
 
 
 def dispatch_mlp_combine(
-    ep_group,
-    fused,
+    ep_group: torch.distributed.ProcessGroup,
+    fused: bool,
     hidden_states_list: list[torch.Tensor],
     top_k_index_list: list[torch.Tensor],
     top_k_weights_list: list[torch.Tensor],
-    weights,
-    act_fn,
-    act_limit,
-    num_global_experts,
-    expert_ids_per_ep_rank,
-    comm_stream=None,
-):
+    weights: tuple[torch.Tensor, torch.Tensor],
+    act_fn: Callable[[torch.Tensor], torch.Tensor],
+    act_limit: Optional[float],
+    num_global_experts: int,
+    expert_ids_per_ep_rank: torch.Tensor,
+    comm_stream: Optional[torch.accelerator.Stream] = None,
+    use_fused_clipped_swiglu: bool = False,
+) -> list[torch.Tensor]:
+    """Overlap two dispatch/combine slices while selecting the requested expert activation."""
     if not (len(hidden_states_list) == len(top_k_index_list) == len(top_k_weights_list) == _DOMINO_NUM_SLICES):
         raise AssertionError(f"DOMINO dispatcher expects exactly {_DOMINO_NUM_SLICES} slices.")
 
@@ -172,7 +202,16 @@ def dispatch_mlp_combine(
         if p2_out is None:
             return
 
-        mlp_out = experts_computation(p2_out, num_tokens, gate_up_weights, down_weights, act_fn, act_limit, fused)
+        mlp_out = experts_computation(
+            p2_out,
+            num_tokens,
+            gate_up_weights,
+            down_weights,
+            act_fn,
+            act_limit,
+            fused,
+            use_fused_clipped_swiglu=use_fused_clipped_swiglu,
+        )
 
         up2_out = unpermute(mlp_out, up_idx2, use_eager=not fused)
         if up2_out.grad_fn is not None:
@@ -335,17 +374,17 @@ class Domino_AllToAll(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
-        group,
-        inputs,
-        output_split_sizes,
-        input_split_sizes,
-        comm_stream: torch.cuda.Stream = None,
-        producer_event: torch.cuda.Event = None,
-        forward_event_list: torch.cuda.Event = None,
-        backward_event_list: torch.cuda.Event = None,
+        ctx: torch.autograd.function.FunctionCtx,
+        group: torch.distributed.ProcessGroup,
+        inputs: torch.Tensor,
+        output_split_sizes: Optional[Iterable[int]],
+        input_split_sizes: Optional[Iterable[int]],
+        comm_stream: Optional[torch.accelerator.Stream] = None,
+        producer_event: Optional[torch.accelerator.Event] = None,
+        forward_event_list: Optional[list[torch.accelerator.Event]] = None,
+        backward_event_list: Optional[list[torch.accelerator.Event]] = None,
         index: int = 0,
-    ):
+    ) -> torch.Tensor:
         """
         Forward pass implementing AllToAll communication.
 
@@ -355,7 +394,7 @@ class Domino_AllToAll(torch.autograd.Function):
             inputs: Input tensor to distribute
             output_split_sizes: Sizes for output splitting
             input_split_sizes: Sizes for input splitting
-            comm_stream: CUDA stream for communication
+            comm_stream: Accelerator stream for communication
             forward_event: Event to synchronize forward pass
             backward_event: Event to record for backward synchronization
 

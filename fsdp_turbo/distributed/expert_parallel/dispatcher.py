@@ -1,16 +1,23 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
-from typing import Callable, Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from torch.distributed._functional_collectives import all_to_all_single_autograd
 from fsdp_turbo.distributed.expert_parallel.comm import gather_along_first_dim_expert_parallel
 from fsdp_turbo.ops.moe import grouped_matmul, permute, unpermute, swiglu, clipped_swiglu, clamp_swiglu
+from fsdp_turbo.ops.clipped_swiglu import clipped_swiglu as clipped_swiglu_activation
 from fsdp_turbo.quantization.utils import quant_grouped_gemm
 from fsdp_turbo.quantization.qat.w4a16.w4a16_config import W4A16Config
 from fsdp_turbo.quantization.qat.w4a16.w4a16_gmm import mx_quant_group_gemm
 from fsdp_turbo.distributed.expert_parallel.utils import get_num_global_tokens_per_local_expert
 from fsdp_turbo.distributed.expert_parallel.ep_balance import EPBalanceWeights
+
+if TYPE_CHECKING:
+    from fsdp_turbo.quantization.mxfp4_config import QuantBaseConfig as FP4QuantConfig
+    from fsdp_turbo.quantization.mxfp8_config import QuantBaseConfig as FP8QuantConfig
 
 
 def dispatch_preprocess(ep_group, top_k_index, num_global_experts, expert_ids_per_ep_rank):
@@ -81,18 +88,24 @@ def apply_activation(
 
 
 def experts_computation(
-    hidden_states,
-    split_list,
-    gate_up_weights,
-    down_weights,
-    fused,
-    act_fn: Optional[Callable] = None,
+    hidden_states: torch.Tensor,
+    split_list: torch.Tensor,
+    gate_up_weights: torch.Tensor,
+    down_weights: torch.Tensor,
+    fused: bool,
+    act_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     act_limit: Optional[float] = None,
     act_alpha: Optional[float] = None,
     ep_balance: Optional[EPBalanceWeights] = None,
-    quant_config=None,
-    weight_owner=None,
-):
+    quant_config: Optional[FP4QuantConfig | FP8QuantConfig] = None,
+    weight_owner: Optional[torch.nn.Module] = None,
+) -> torch.Tensor:
+    """Run local expert projections, preserving activation dtype and post-down routing.
+
+    The optional owner enables DeepSeek's clipped SiLU-times-up activation for
+    positive limits. Empty token buffers retain zero gradients to both weights.
+    Routing probabilities are applied by the caller during combination.
+    """
     is_w4a16 = isinstance(quant_config, W4A16Config)
 
     if hidden_states.shape[0] == 0:
@@ -134,7 +147,9 @@ def experts_computation(
         return grouped_matmul(x, split_list, w, use_eager=not fused)
 
     intermediate_hidden_states = gemm_fn(hidden_states, gate_up_weights, "gate_up_proj")
-    if is_w4a16:
+    if getattr(weight_owner, "use_fused_clipped_swiglu", False) and act_limit is not None and act_limit > 0:
+        intermediate_activations = clipped_swiglu_activation(intermediate_hidden_states, act_limit)
+    elif is_w4a16:
         intermediate_activations = swiglu(intermediate_hidden_states, dim=-1)
     else:
         intermediate_activations = apply_activation(

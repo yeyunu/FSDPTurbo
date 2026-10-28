@@ -238,12 +238,18 @@ Adapter 已处理 CP loss，`loss_function_patches` 保持为空；完整序列�
 本地 logits，保留分片边界的预测目标；`memory.chunk_loss` 必须关闭，该组合会在配置
 初始化时被拒绝。非 CP 训练仍可使用下文的 chunk loss。
 
-Clipped SwiGLU 融合开关开启后，`swiglu_limit > 0` 的共享专家和原生路由专家
+Clipped SwiGLU 融合开关开启后，`swiglu_limit > 0` 的共享专家和路由专家
 调用 CANN `ClippedSwiglu`，反向调用配套的 `ClippedSwigluGrad`，融合裁剪与激活计算。
-该路径要求 `cann_ops_nn` 同时提供前反向接口及配套 CANN 内核；使用 EP 时，
-dispatcher 须为 `custom_native_eager_forward`。激活保持 FP32 计算，路由权重仍在
-down projection 前乘入，不改变参数布局。默认保持关闭，关闭时继续使用原裁剪与
-SwiGLU 实现；`swiglu_limit <= 0` 时保持普通 SwiGLU。当前融合路径仅支持 eager
+该路径要求 `cann_ops_nn` 同时提供前反向接口及配套 CANN 内核。使用 EP 时，
+内置 `all2all`、`allgather`、`chunkmoe`、`mc2`、`domino` 及
+`custom_native_eager_forward` 已接入该开关。配置层不限制 dispatcher，
+也不要求 `use_fused_ops` 或 `use_swiglu` 为 `true`；其他自定义或 callable dispatcher
+需自行接入融合激活。开关开启且 limit 为正时，已接入路径显式选择 clipped SwiGLU。
+`custom_native_eager_forward` 保持 FP32 激活、在 down projection 前乘路由权重；内置路径沿用 grouped GEMM
+的激活 dtype，在 down projection 后的 combine 阶段乘路由权重。
+开关不改变各路径的 dtype、权重乘入位置或参数布局。默认保持关闭，关闭时继续使用原裁剪与
+SwiGLU 实现；`swiglu_limit <= 0` 时保留各 dispatcher 的原激活路径。
+MC2 遇到任一源 rank 无输入时，所有 rank 统一回退通用 AllToAll。当前融合路径仅支持 eager
 autograd 一阶梯度，不包含 TorchAir 图模式或高阶梯度。
 
 默认 8 卡拓扑为 `FSDP=4, TP=2, EP=4, expert DP=2`。注意力包含 attention
