@@ -9,25 +9,12 @@ from fsdp_turbo.fsdp_turbo import FSDPTurbo
 from fsdp_turbo.fsdp_turbo_config import load_config_from_yaml
 from fsdp_turbo.training.trainer import BaseTrainer
 from fsdp_turbo.utils.log import print_rank
+from fsdp_turbo.utils.model import (
+    convert_model_dtype,
+    set_attn_implementation,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def set_attn_implementation(model_config, attn_implementation):
-    for config in (
-        model_config,
-        getattr(model_config, "text_config", None),
-        getattr(model_config, "vision_config", None),
-    ):
-        if config is not None:
-            config._attn_implementation = attn_implementation
-
-
-def convert_model_dtype(model, dtype):
-    for param in model.parameters():
-        param.data = param.data.to(dtype)
-    for buffer in model.buffers():
-        buffer.data = buffer.data.to(dtype)
 
 
 class KimiK3Trainer(BaseTrainer):

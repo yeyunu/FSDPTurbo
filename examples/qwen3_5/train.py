@@ -7,7 +7,11 @@ from fsdp_turbo.fsdp_turbo import FSDPTurbo
 from fsdp_turbo.fsdp_turbo_config import load_config_from_yaml
 from fsdp_turbo.training.trainer import BaseTrainer
 from fsdp_turbo.utils.log import print_rank
-from fsdp_turbo.utils.model import convert_model_dtype, set_num_hidden_layers
+from fsdp_turbo.utils.model import (
+    convert_model_dtype,
+    set_attn_implementation,
+    set_num_hidden_layers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +23,7 @@ class Qwen35Trainer(BaseTrainer):
         print_rank(logger.info, "> Building Qwen3.5 Model...")
 
         model_config = AutoConfig.from_pretrained(self.config.model.model_name_or_path)
-        model_config._attn_implementation = "eager"
+        set_attn_implementation(model_config, self.config.model.attn_implementation)
         set_num_hidden_layers(model_config, self.config.model.num_hidden_layers)
 
         model = AutoModelForImageTextToText.from_pretrained(

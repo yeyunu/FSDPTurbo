@@ -31,6 +31,54 @@ def get_model_by_name(name):
     return _MODEL_CLASSES.get(name)
 
 
+def set_attn_implementation(model_config, attn_implementation: str) -> None:
+    """Stamp ``attn_implementation`` onto a (possibly nested) HF config.
+
+    Args:
+        model_config: HuggingFace ``PretrainedConfig`` (possibly multimodal with
+            nested ``text_config`` / ``vision_config``).
+        attn_implementation: Attention backend name (e.g. ``"flash_attention_2"``).
+    """
+    for config in (
+        model_config,
+        getattr(model_config, "text_config", None),
+        getattr(model_config, "vision_config", None),
+    ):
+        if config is not None:
+            config._attn_implementation = attn_implementation
+
+
+def set_fused_overrides(model_config, config) -> None:
+    """Propagate fused-operator switches from ``FSDPTurboConfig`` to HF ``model_config``.
+
+    Args:
+        model_config: HuggingFace ``PretrainedConfig`` (possibly multimodal with
+            nested ``text_config`` / ``vision_config``) to stamp the switches on.
+        config: The :class:`~fsdp_turbo.fsdp_turbo_config.FSDPTurboConfig` whose
+            ``model`` and ``distributed.cp_plan`` fields are read.
+    """
+    import dataclasses
+    from fsdp_turbo.ops.flash_attn import register_flash_attention
+
+    register_flash_attention()
+
+    sub_configs = [
+        model_config,
+        getattr(model_config, "text_config", None),
+        getattr(model_config, "vision_config", None),
+    ]
+    if dataclasses.is_dataclass(config.model):
+        fused_fields = [f.name for f in dataclasses.fields(config.model) if f.name.startswith("use_fused_")]
+    else:
+        fused_fields = [k for k in dir(config.model) if k.startswith("use_fused_")]
+    for attr in fused_fields:
+        val = getattr(config.model, attr, False)
+        if val:
+            for sub_cfg in sub_configs:
+                if sub_cfg is not None:
+                    setattr(sub_cfg, attr, val)
+
+
 def set_num_hidden_layers(model_config, num_hidden_layers):
     """Reduce the language-model layer count on a (possibly nested) config.
 

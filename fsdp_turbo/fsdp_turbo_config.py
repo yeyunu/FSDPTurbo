@@ -57,6 +57,8 @@ class ModelConfig:
     mtp_num_layers: int = 0
     # Scaling factor applied to the mean MTP loss before adding to the main loss.
     mtp_loss_scaling_factor: float = 0.1
+    use_fused_causal_conv1d: bool = False
+    use_fused_gdn: bool = False
 
 
 @dataclass
