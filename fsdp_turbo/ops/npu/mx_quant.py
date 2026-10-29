@@ -51,7 +51,7 @@ def dynamic_mx_quant_npu(x, axis=-1, dst_type=None, scale_alg=0, block_size=32, 
     if round_mode is not None:
         kwargs["round_mode"] = round_mode
 
-    if dst_type == torch.float4_e2m1fn_x2:
+    if hasattr(torch, "float4_e2m1fn_x2") and dst_type == torch.float4_e2m1fn_x2:
         kwargs['dst_type'] = torch_npu.float4_e2m1fn_x2
 
     return torch_npu.npu_dynamic_mx_quant(x, **kwargs)

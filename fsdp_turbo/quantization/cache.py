@@ -7,6 +7,7 @@ from collections import defaultdict
 import torch
 
 from fsdp_turbo.ops.quantize import w4a16_quant_matmul
+from fsdp_turbo.quantization.mxfp4_config import float4_dtype
 
 
 _weight_cache: dict[int, Any] = {}
@@ -55,8 +56,8 @@ def cached_weight_fakequant(
             scale_dtype=torch.float8_e8m0fnu,
             pertoken_scale_dtype=torch.float8_e8m0fnu,
             output_dtype=torch.bfloat16,
-            x1_dtype=torch.float4_e2m1fn_x2,
-            x2_dtype=torch.float4_e2m1fn_x2,
+            x1_dtype=float4_dtype(),
+            x2_dtype=float4_dtype(),
             group_sizes=[1, 1, 32],
         )
 
@@ -80,8 +81,8 @@ def cached_weight_fakequant(
             scale_dtype=torch.float8_e8m0fnu,
             pertoken_scale_dtype=torch.float8_e8m0fnu,
             output_dtype=torch.bfloat16,
-            x1_dtype=torch.float4_e2m1fn_x2,
-            x2_dtype=torch.float4_e2m1fn_x2,
+            x1_dtype=float4_dtype(),
+            x2_dtype=float4_dtype(),
             group_sizes=[1, 1, 32],
         )
 

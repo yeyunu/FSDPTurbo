@@ -6,10 +6,26 @@ from typing import Optional, NamedTuple
 import torch
 
 from fsdp_turbo.fsdp_turbo_config import QuantizeConfig
+from fsdp_turbo.quantization.mxfp8_config import float4_dtype as _npu_float4_dtype
+
+
+def float4_dtype():
+    """float4 e2m1 dtype across torch versions.
+
+    Prefer ``torch.float4_e2m1fn_x2`` when the running torch exposes it (newer
+    torch versions), otherwise fall back to the NPU float4 dtype, or ``None``
+    when neither is available (e.g. torch 2.7.1 without torch_npu).
+    """
+    if hasattr(torch, "float4_e2m1fn_x2"):
+        return torch.float4_e2m1fn_x2
+    return _npu_float4_dtype()
+
+
+_FLOAT4_E2M1 = float4_dtype()
 
 
 class FP4Format:
-    DEFAULT_QUANT_TYPE = torch.float4_e2m1fn_x2
+    DEFAULT_QUANT_TYPE = _FLOAT4_E2M1
 
     def __init__(
         self,
@@ -45,7 +61,7 @@ class FP4Format:
 
 
 class FormatEnum(Enum):
-    E2M1 = FP4Format(6, 2, 1, torch.float4_e2m1fn_x2)
+    E2M1 = FP4Format(6, 2, 1, _FLOAT4_E2M1)
 
 
 class _FormatConfig(NamedTuple):

@@ -65,9 +65,9 @@ def w4a16_quant_matmul_npu(
         scale_dtype = torch_npu.float8_e8m0fnu
     if pertoken_scale_dtype is None:
         pertoken_scale_dtype = torch_npu.float8_e8m0fnu
-    if x1_dtype == torch.float4_e2m1fn_x2:
+    if hasattr(torch, "float4_e2m1fn_x2") and x1_dtype == torch.float4_e2m1fn_x2:
         x1_dtype = torch_npu.float4_e2m1fn_x2
-    if x2_dtype == torch.float4_e2m1fn_x2:
+    if hasattr(torch, "float4_e2m1fn_x2") and x2_dtype == torch.float4_e2m1fn_x2:
         x2_dtype = torch_npu.float4_e2m1fn_x2
 
     return torch_npu.npu_quant_matmul(

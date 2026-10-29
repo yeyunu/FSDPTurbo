@@ -3,10 +3,11 @@ from functools import partial
 
 import torch
 
-from fsdp_turbo.quantization.qat.w4a16.w4a16_config import W4A16Config
-from fsdp_turbo.quantization.cache import cached_weight_fakequant
-from fsdp_turbo.quantization.utils import register_quantize_module_handler
 from fsdp_turbo.ops.quantize import dynamic_mx_quant
+from fsdp_turbo.quantization.cache import cached_weight_fakequant
+from fsdp_turbo.quantization.mxfp4_config import float4_dtype
+from fsdp_turbo.quantization.qat.w4a16.w4a16_config import W4A16Config
+from fsdp_turbo.quantization.utils import register_quantize_module_handler
 
 
 @torch._dynamo.allow_in_graph
@@ -28,7 +29,7 @@ class matmul_with_hp_or_lp_weight(torch.autograd.Function):
 
         weight_fwd = cached_weight_fakequant(
             weight,
-            partial(dynamic_mx_quant, dst_type=torch.float4_e2m1fn_x2),
+            partial(dynamic_mx_quant, dst_type=float4_dtype()),
             bias,
             block_size,
         )
