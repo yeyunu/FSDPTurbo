@@ -17,6 +17,7 @@ from .activation import limited_swiglu, silu_mul
 from .engram import Engram, EngramLayout
 from .experts import DeepSeekV41Experts
 from .model_args import ModelArgs
+from .runtime import ContextParallelAttentionState
 from .utils import set_dtype
 
 
@@ -377,18 +378,24 @@ class Block(nn.Module):
         start_pos: int,
         pre_mix: torch.Tensor,
         image_mask: torch.Tensor | None,
-        *attn_args,
+        *attn_args: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         sfa_layout: str = "BSND",
         cu_seqlens: torch.Tensor | None = None,
         engram_hash_ids: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cp_group: torch.distributed.ProcessGroup | None = None,
+        cp_state: ContextParallelAttentionState | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, ContextParallelAttentionState]:
         """`pre_mix` collapses the hc_mult copies down to one input for this block's attention. Each
         sub-block's own `hc_mixes` produces the mix for the *next* one, so attention uses what the
         previous layer's FFN produced and the FFN uses what this attention produced.
 
         image_mask: [b, s] bool, True inside image spans (selects the VL routing bias).
+        attn_args: Additional tensor inputs consumed by specialized attention subclasses.
+        cp_group: Explicit KV-AllGather group for this block's attention, or None.
+        cp_state: CP tensors from the preceding layer; returned alongside hidden
+            states so activation checkpointing retains the correct dependencies.
         """
         # Run inside Block.forward so its FSDP pre-hook has materialized the
         # small Engram projection/gates. The embedding itself stays sharded.
@@ -400,8 +407,16 @@ class Block(nn.Module):
         )
         x = self.attn_norm(x)
         x = self.attn(
-            x, start_pos, *attn_args, attention_mask=attention_mask, sfa_layout=sfa_layout, cu_seqlens=cu_seqlens
+            x,
+            start_pos,
+            *attn_args,
+            attention_mask=attention_mask,
+            sfa_layout=sfa_layout,
+            cu_seqlens=cu_seqlens,
+            **({"cp_group": cp_group, "cp_state": cp_state} if cp_group is not None else {}),
         )
+        if cp_group is not None:
+            x, cp_state = x
         x = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = x
@@ -411,7 +426,7 @@ class Block(nn.Module):
         x = self.ffn_norm(x)
         x = self.ffn(x, image_mask)
         x = self.hc_post(x, residual, ffn_post, ffn_comb)
-        return x, ffn_pre
+        return (x, ffn_pre, cp_state) if cp_group is not None else (x, ffn_pre)
 
 
 def make_identity_pre_mix(x: torch.Tensor, hc_mult: int) -> torch.Tensor:

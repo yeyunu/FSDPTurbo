@@ -1,19 +1,12 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 from __future__ import annotations
 
-import inspect
 from functools import wraps
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 
 from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import kv_allgather
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-    from typing import TypeVar
-
-    _AttentionOutput = TypeVar("_AttentionOutput")
 
 
 def get_kv_allgather_attention_fn(fn, group: Optional[torch.distributed.ProcessGroup] = None):
@@ -116,35 +109,5 @@ def get_kv_allgather_compressor_attention_fn(
         attn_output, attn_weights = fn(module, query, key, value, *args, **kwargs)
 
         return attn_output, attn_weights
-
-    return wrapper
-
-
-def get_kv_allgather_compressor_sparse_attention_fn(
-    fn: Callable[..., _AttentionOutput], group: torch.distributed.ProcessGroup
-) -> Callable[..., _AttentionOutput]:
-    """Bind a CP group to a compressed sparse attention forward.
-
-    The target accepts a keyword-only ``cp_group`` argument and owns its sparse
-    indices, compression and cross-layer KV state. Unlike full attention, these
-    must use global sequence coordinates before the final attention operation.
-    A single-rank group preserves the original forward path.
-
-    Raises ValueError for a missing group, an incompatible target signature, or
-    a caller-supplied ``cp_group``. The returned callable preserves the result type.
-    """
-    if group is None:
-        raise ValueError("Compressor sparse attention CP requires an explicit process group.")
-    parameter = inspect.signature(fn).parameters.get("cp_group")
-    if parameter is None or parameter.kind != inspect.Parameter.KEYWORD_ONLY:
-        raise ValueError("Compressor sparse attention targets must accept keyword-only cp_group.")
-
-    @wraps(fn)
-    def wrapper(module, *args, **kwargs):
-        if "cp_group" in kwargs:
-            raise ValueError("cp_group is supplied by the context-parallel wrapper.")
-        if torch.distributed.get_world_size(group) > 1:
-            kwargs["cp_group"] = group
-        return fn(module, *args, **kwargs)
 
     return wrapper

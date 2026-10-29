@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 from fsdp_turbo.fsdp_turbo_config import load_config_from_yaml
 from fsdp_turbo.models.deepseek.deepseek_v41 import (
@@ -47,22 +49,51 @@ logger = logging.getLogger(__name__)
 
 
 class DeepseekV41Trainer(BaseTrainer):
+    """Prepare aligned V4.1 text/image batches and build the training components."""
+
     def prepare_batch(self, batch: _TrainingBatch) -> _TrainingBatch:
-        """Reject unsupported full batches before the base trainer pads and shards them."""
+        """Align right-padded batches; defer image batches' CP split until fusion."""
         cp_size = self.config.distributed.kv_allgather_parallel_size
         if cp_size > 1:
             from fsdp_turbo.models.deepseek.deepseek_v41.context_parallel import validate_sequence_length
 
             layout = batch.get("sfa_layout", "BSND")
             if layout not in ("BSND", ["BSND"], ("BSND",)) or batch.get("actual_seq_len") is not None:
-                raise ValueError("DeepSeek-V4.1 CP currently supports unpacked BSND text only.")
-            validate_sequence_length(batch["input_ids"].shape[1], cp_size, self._model_args())
-            if batch.get("images") is not None or batch.get("token_types") is not None:
-                raise ValueError("DeepSeek-V4.1 CP currently supports text batches only.")
+                raise ValueError("DeepSeek-V4.1 CP currently supports unpacked BSND input only.")
+            batch = dict(batch)
+            input_ids = batch["input_ids"]
             mask = batch.get("attention_mask")
-            if mask is not None and not bool(mask.bool().all()):
-                raise ValueError("DeepSeek-V4.1 CP currently requires unpadded equal-length text.")
+            if mask is None:
+                mask = torch.ones_like(input_ids)
+            if mask.shape != input_ids.shape or not bool(((mask == 0) | (mask == 1)).all()):
+                raise ValueError("DeepSeek-V4.1 CP requires a binary attention_mask matching input_ids.")
+            if bool((~mask[:, :-1].bool() & mask[:, 1:].bool()).any()):
+                raise ValueError("DeepSeek-V4.1 CP supports right padding only.")
+            args = self._model_args()
+            alignment = cp_size * math.lcm(1, *(r for r in args.compress_ratios[: args.n_layers] if r > 1))
+            length = input_ids.shape[1]
+            padded_length = math.ceil(length / alignment) * alignment
+            validate_sequence_length(padded_length, cp_size, args)
+            padding = padded_length - length
+            pad_id = self.tokenizer.pad_token_id
+            batch["input_ids"] = F.pad(input_ids, (0, padding), value=0 if pad_id is None else pad_id)
+            batch["attention_mask"] = F.pad(mask, (0, padding), value=0)
+            if batch.get("token_types") is not None:
+                batch["token_types"] = F.pad(batch["token_types"], (0, padding), value=-1)
+            if batch.get("labels") is not None:
+                batch["labels"] = F.pad(batch["labels"].masked_fill(~mask.bool(), -100), (0, padding), value=-100)
+            positions = torch.arange(padded_length, device=input_ids.device).unsqueeze(0)
+            if batch.get("position_ids") is not None:
+                if not torch.equal(batch["position_ids"], positions[:, :length].expand_as(batch["position_ids"])):
+                    raise ValueError("DeepSeek-V4.1 CP requires global contiguous position_ids.")
+            batch["position_ids"] = positions.expand(input_ids.shape[0], -1)
         return super().prepare_batch(batch)
+
+    def _split_batch_for_context_parallel(self, batch: _TrainingBatch) -> _TrainingBatch:
+        """Keep full image coordinates until the backbone has fused image features."""
+        if batch.get("images") is not None or batch.get("token_types") is not None:
+            return batch
+        return super()._split_batch_for_context_parallel(batch)
 
     def _model_args(self):
         if not hasattr(self, "_cached_model_args"):

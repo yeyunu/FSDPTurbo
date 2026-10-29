@@ -37,6 +37,8 @@ from fsdp_turbo.utils.patch import apply_module_patches
 
 
 class FSDPTurbo(torch.nn.Module):
+    """Apply configured model parallelism, memory policies and quantization."""
+
     def __init__(self, config: FSDPTurboConfig, model: torch.nn.Module):
         super().__init__()
         self.config = config
@@ -87,7 +89,8 @@ class FSDPTurbo(torch.nn.Module):
             self.config.distributed.tp_plan,
         )
 
-    def apply_cp_modules(self):
+    def apply_cp_modules(self) -> None:
+        """Configure native CP groups or the selected legacy attention/loss wrappers."""
         cp_plan = self.config.distributed.cp_plan
         ulysses_enabled = self.config.distributed.ulysses_parallel_size > 1
         kcp_enabled = self.config.distributed.kcp_parallel_size > 1
@@ -114,7 +117,7 @@ class FSDPTurbo(torch.nn.Module):
 
         # Attention wrappers compose on their own axes. A causal-LM loss must
         # instead see the complete context-parallel domain and is installed once.
-        if self.parallel_state.get_cp_group_size() > 1:
+        if self.parallel_state.get_cp_group_size() > 1 and cp_plan.loss_function_patches:
             apply_cp_loss_patches(cp_plan.loss_function_patches, self.parallel_state.get_cp_group())
 
     def apply_ep_modules(self):

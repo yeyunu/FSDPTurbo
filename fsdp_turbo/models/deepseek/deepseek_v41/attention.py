@@ -8,11 +8,11 @@ from torch import nn
 from fsdp_turbo.ops.sparse_attention import indexed_sparse_attention
 
 from .compressor import Compressor
-from .context_parallel import attention_forward
+from .context_parallel import compute_context_parallel_attention
 from .indexer import Indexer
 from .layers import ColumnParallelLinear, Linear, RMSNorm, RowParallelLinear, apply_rotary_emb, precompute_freqs_cis
 from .model_args import ModelArgs
-from .runtime import shared_attn
+from .runtime import ContextParallelAttentionState, shared_attn
 from .utils import _packed_freqs, _packed_sequence_lengths
 
 
@@ -167,6 +167,13 @@ class Attention(nn.Module):
             if packed_lengths is not None
             else (start_pos + seqlen) // ratio
         )
+        if compress_len == 0 and self.training and start_pos == 0:
+            # No complete block exists yet, including very short training inputs.
+            shared_attn.compress_kv = x.new_empty(bsz, 0, self.head_dim)
+            idxs = self._compress_topk_idxs(
+                x, qr, None, start_pos, offset, 0, attention_mask=attention_mask, cu_seqlens=cu_seqlens
+            )
+            return shared_attn.compress_kv, idxs
         latent = None
         if self.is_kv_source:
             latent = self.compressor(x, start_pos, cu_seqlens=cu_seqlens)
@@ -203,10 +210,11 @@ class Attention(nn.Module):
         sfa_layout: str = "BSND",
         cu_seqlens: torch.Tensor | None = None,
         cp_group: torch.distributed.ProcessGroup | None = None,
-    ) -> torch.Tensor:
+        cp_state: ContextParallelAttentionState | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ContextParallelAttentionState]:
         """Attend to local queries, using globally gathered KV when CP is enabled."""
         if cp_group is not None:
-            return attention_forward(self, x, start_pos, cp_group)
+            return compute_context_parallel_attention(self, x, start_pos, cp_group, cp_state)
         bsz, seqlen, _ = x.size()
         packed_cu_seqlens = cu_seqlens if sfa_layout == "TND" else None
         packed_lengths = _packed_sequence_lengths(seqlen, packed_cu_seqlens) if start_pos == 0 else None

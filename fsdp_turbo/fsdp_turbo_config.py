@@ -210,6 +210,8 @@ class TPPlanConfig:
 
 @dataclass
 class CPPlanConfig:
+    """Configure function wrappers; native KV-AllGather models need no patch plan."""
+
     ulysses_function_patches: List[Dict[str, Any]] = field(default_factory=list)
     kcp_function_patches: List[Dict[str, Any]] = field(default_factory=list)
     kv_allgather_function_patches: List[Dict[str, Any]] = field(default_factory=list)
@@ -401,6 +403,8 @@ class QuantizationConfig:
 
 @dataclass
 class FSDPTurboConfig:
+    """Training configuration normalized and validated on construction."""
+
     model: ModelConfig = field(default_factory=ModelConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     data: DataConfig = field(default_factory=DataConfig)
@@ -579,7 +583,7 @@ class FSDPTurboConfig:
         )
 
     def validate_cp_config(self) -> None:
-        """Normalize CP patch specs and reject unsupported parallel configurations."""
+        """Validate native CP or normalize function patches and parallel constraints."""
         kcp_parallel_size = self.distributed.kcp_parallel_size
         ulysses_parallel_size = self.distributed.ulysses_parallel_size
         for field_name, size in (
@@ -629,25 +633,32 @@ class FSDPTurboConfig:
                     raise ValueError(
                         "KDA context-parallel patches must use ulysses_function_patches or kcp_function_patches."
                     )
-                if patch_type == "compressor_sparse_attention" and field_name != "kv_allgather_function_patches":
-                    raise ValueError("Compressor sparse attention CP must use kv_allgather_function_patches.")
+                if patch_type == "compressor_sparse_attention":
+                    raise ValueError(
+                        "DeepSeek-V4.1 CP uses the model's native interface; remove compressor_sparse_attention patches."
+                    )
                 normalized.append(normalized_patch)
             setattr(self.distributed.cp_plan, field_name, normalized)
 
-        compressor_sparse_patches = [
-            spec
-            for spec in self.distributed.cp_plan.kv_allgather_function_patches
-            if spec["type"] == "compressor_sparse_attention"
-        ]
-        if compressor_sparse_patches:
-            if len(self.distributed.cp_plan.kv_allgather_function_patches) != 1:
-                raise ValueError("DeepSeek-V4.1 CP requires exactly one compressor sparse attention patch.")
+        # An enabled KV axis without wrappers requires the model's native API.
+        # The CP entry verifies that API when the model is available.
+        if (
+            self.distributed.kv_allgather_parallel_size > 1
+            and not self.distributed.cp_plan.kv_allgather_function_patches
+        ):
+            if any(
+                (
+                    self.distributed.cp_plan.ulysses_function_patches,
+                    self.distributed.cp_plan.kcp_function_patches,
+                    self.distributed.cp_plan.loss_function_patches,
+                    self.module_patches,
+                )
+            ):
+                raise ValueError("Native KV-AllGather CP cannot be combined with function or module patches.")
             if ulysses_parallel_size != 1 or kcp_parallel_size != 1 or self.distributed.tensor_parallel_size != 1:
                 raise ValueError("DeepSeek-V4.1 KV-AllGather requires Ulysses=KCP=TP=1.")
-            if self.memory.recompute or self.memory.chunk_batch or self.distributed.cp_plan.loss_function_patches:
-                raise ValueError("DeepSeek-V4.1 CP does not support recompute/chunk_batch or external loss patches.")
-            if self.data.is_multimodal:
-                raise ValueError("DeepSeek-V4.1 CP currently supports text batches only.")
+            if self.memory.chunk_batch:
+                raise ValueError("DeepSeek-V4.1 CP does not support chunk_batch.")
             if self.data.sfa_layout == "TND":
                 raise ValueError("DeepSeek-V4.1 CP currently supports BSND input only.")
             if any(
@@ -689,13 +700,6 @@ class FSDPTurboConfig:
                 )
         if ulysses_parallel_size > 1 and not self.distributed.cp_plan.ulysses_function_patches:
             raise ValueError("distributed.cp_plan.ulysses_function_patches must be set when Ulysses is enabled.")
-        if (
-            self.distributed.kv_allgather_parallel_size > 1
-            and not self.distributed.cp_plan.kv_allgather_function_patches
-        ):
-            raise ValueError(
-                "distributed.cp_plan.kv_allgather_function_patches must be set when KV-AllGather CP is enabled."
-            )
 
     def validate_ep_config(self) -> None:
         """expert parallelize plan
@@ -800,12 +804,11 @@ class FSDPTurboConfig:
         if self.distributed.expert_parallel_size <= 1:
             raise ValueError("Host-offload Engram requires expert_parallel_size > 1.")
         if self.distributed.kv_allgather_parallel_size != 1 or self.distributed.ulysses_parallel_size != 1:
-            compressor_sparse_cp = any(
-                spec["type"] == "compressor_sparse_attention"
-                for spec in self.distributed.cp_plan.kv_allgather_function_patches
-            )
-            if not compressor_sparse_cp:
-                raise ValueError("Host-offload Engram CP requires the compressor_sparse_attention KV-AllGather patch.")
+            if (
+                self.distributed.kv_allgather_parallel_size == 1
+                or self.distributed.cp_plan.kv_allgather_function_patches
+            ):
+                raise ValueError("Host-offload Engram CP requires native KV-AllGather CP without function patches.")
 
     def validate_module_patches(self):
         """Validate the namespace-neutral module patch configuration.

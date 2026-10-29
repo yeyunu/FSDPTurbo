@@ -1,7 +1,11 @@
 """DeepSeek-V4.1 model assembly and compatibility exports for its components."""
 
+from __future__ import annotations
+
 # Explicit aliases preserve legacy exports while keeping Ruff aware of their public use.
 # pylint: disable=useless-import-alias
+
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F  # noqa: F401 - retained for legacy imports
@@ -60,6 +64,7 @@ from .layers import (
 )
 from .model_args import ModelArgs as ModelArgs
 from .runtime import (
+    ContextParallelAttentionState,
     SharedAttentionRuntime as SharedAttentionRuntime,
     shared_attn as shared_attn,
 )
@@ -70,6 +75,11 @@ from .utils import (
     set_dtype as set_dtype,
 )
 from .vision import Aligner, ViT
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
+    from .image_processor import ImageInput
 
 
 class Transformer(nn.Module):
@@ -118,7 +128,7 @@ class Transformer(nn.Module):
     def encode_image(self, patches: torch.Tensor, n_vit_h: int, n_vit_w: int) -> torch.Tensor:
         return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
 
-    def merge_image_embeddings(self, images, h: torch.Tensor):
+    def merge_image_embeddings(self, images: list[list[ImageInput] | None], h: torch.Tensor) -> None:
         """Overwrite each image's token span in h with its ViT/aligner features. The IMAGE slots take
         the aligner rows in row-major order; the span delimiters take learned embeddings.
         """
@@ -138,6 +148,10 @@ class Transformer(nn.Module):
         vision_features = self.vision(patches, grid_sizes)
         aligned_features = self.aligner(vision_features, grid_sizes)
         if not image_records:
+            # FSDP must reduce the same parameters on image and text-only ranks.
+            dummy_sum = sum(features.sum() for features in aligned_features)
+            dummy_sum = dummy_sum + self.image_start.sum() + self.image_end.sum() + self.image_newline.sum()
+            h.add_(dummy_sum.to(h.dtype) * 0)
             return
 
         feature_iterator = iter(aligned_features)
@@ -155,18 +169,21 @@ class Transformer(nn.Module):
         self,
         input_ids: torch.Tensor,
         start_pos: int = 0,
-        images=None,
+        images: list[list[ImageInput] | None] | None = None,
         token_types: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         output_hidden_states: bool = False,
         sfa_layout: str = "BSND",
         cu_seqlens: torch.Tensor | None = None,
         engram_hashes: torch.Tensor | None = None,
+        cp_group: ProcessGroup | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, ...] | None]:
         """Run the shared backbone path used by training and generation.
 
         CP supplies local rows of globally computed ``engram_hashes`` to retain
         n-gram history across shard boundaries; other callers leave it unset.
+        ``cp_group`` is passed to every block explicitly. Image CP batches stay
+        complete until fusion, then select local embedding and mask rows.
         """
         if start_pos == 0:
             shared_attn.reset()
@@ -199,10 +216,22 @@ class Transformer(nn.Module):
             assert start_pos == 0, "image spans must be prefilled in a single chunk"
             self.merge_image_embeddings(images, h)
 
+        if cp_group is not None and images is not None:
+            from fsdp_turbo.distributed.context_parallel.batch import (
+                split_tensor_to_group,
+            )
+
+            h = split_tensor_to_group(h, cp_group)
+            image_mask = split_tensor_to_group(image_mask, cp_group)
+            engram_mask = split_tensor_to_group(engram_mask, cp_group)
+            if attention_mask is not None:
+                attention_mask = split_tensor_to_group(attention_mask, cp_group)
+
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         pre_mix = make_identity_pre_mix(h, self.hc_mult)
         main_hiddens = []
         collected_hidden_states = [h] if output_hidden_states else None
+        cp_state = ContextParallelAttentionState() if cp_group is not None else None
 
         for layer_id, layer in enumerate(self.layers):
             engram_hash_ids = (
@@ -215,7 +244,7 @@ class Transformer(nn.Module):
             # not their output.
             if layer_id in self.target_layer_ids:
                 main_hiddens.append(h.mean(dim=2))
-            h, pre_mix = layer(
+            layer_output = layer(
                 h,
                 start_pos,
                 pre_mix,
@@ -225,7 +254,13 @@ class Transformer(nn.Module):
                 cu_seqlens=cu_seqlens,
                 engram_hash_ids=engram_hash_ids,
                 engram_mask=engram_mask,
+                cp_group=cp_group,
+                **({"cp_state": cp_state} if cp_group is not None else {}),
             )
+            if cp_group is not None:
+                h, pre_mix, cp_state = layer_output
+            else:
+                h, pre_mix = layer_output
             if collected_hidden_states is not None:
                 collected_hidden_states.append(h)
 

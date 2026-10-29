@@ -7,7 +7,6 @@ from torch import nn
 from fsdp_turbo.ops.vision_flash_attention import fused_vision_flash_attention
 from fsdp_turbo.ops.rope import rope
 from fsdp_turbo.ops.rms_norm import rms_norm
-from fsdp_turbo.ops.npu.mx_quant import swiglu_npu
 from .activation import packed_swiglu
 
 
@@ -106,17 +105,17 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
+    """Packed SwiGLU feed-forward projection for the vision encoder."""
+
     def __init__(self, args):
         super().__init__()
         self.w1 = nn.Linear(args.vision_dim, 2 * args.vision_inter_dim, bias=False)
         self.w2 = nn.Linear(args.vision_inter_dim, args.vision_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project and apply the device-dispatched SwiGLU activation."""
         gate_up = self.w1(x)
-        if gate_up.dtype == torch.bfloat16:
-            intermediate = swiglu_npu(gate_up)
-        else:
-            intermediate = packed_swiglu(gate_up)
+        intermediate = packed_swiglu(gate_up)
         return self.w2(intermediate)
 
 

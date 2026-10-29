@@ -77,13 +77,13 @@ class Indexer(torch.nn.Module):
         self,
         x: torch.Tensor,
         qr: torch.Tensor,
-        latent: torch.Tensor,
+        latent: torch.Tensor | None,
         start_pos: int,
         offset: int,
         *,
         attention_mask: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
-    ):
+    ) -> torch.Tensor:
         """`latent` is this layer's RoPE-free compressed latent, None when this layer does not
         compress or when its current group is still incomplete. An index-key owner turns it into
         index keys here, which has to happen before Attention overwrites that same storage with

@@ -13,8 +13,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from fsdp_turbo.distributed.context_parallel.patch import CP_GROUP_ATTR
-
 from .engram.host_offload_engram import HostOffloadEngram
 
 from . import model as reference_model
@@ -63,11 +61,13 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         *,
         chunk_loss: bool = False,
         chunk_loss_size: int = 512,
-    ):
+    ) -> None:
+        """Wrap the reference backbone with causal loss and optional chunked logits."""
         super().__init__()
         self.model = backbone
         self.model_args = model_args
         self.chunk_loss = chunk_loss
+        self._kv_cp_group: torch.distributed.ProcessGroup | None = None
         if chunk_loss:
             self.model.head = ChunkedLMHead(backbone.head, chunk_loss_size=chunk_loss_size)
 
@@ -88,16 +88,15 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
             engram_rows_per_chunk=engram_rows_per_chunk,
         )
 
-    @property
-    def _kv_cp_group(self):
-        """Use the group installed on this model's attention methods by the CP wrapper."""
-        groups = [getattr(layer.attn.forward, CP_GROUP_ATTR, None) for layer in getattr(self.model, "layers", ())]
-        group = groups[0] if groups else None
-        if any(item is not group for item in groups):
-            raise ValueError("DeepSeek-V4.1 CP requires every attention layer to use the same group.")
-        if group is not None and torch.distributed.get_world_size(group) > 1:
-            return group
-        return None
+    def set_context_parallel_group(self, group: torch.distributed.ProcessGroup) -> None:
+        """Configure CP before training without modifying any module's methods.
+
+        The adapter passes this group to every attention layer and to CP loss.
+        A single-rank group retains the ordinary training/inference path.
+        """
+        if group is None:
+            raise ValueError("Native KV-AllGather CP requires an explicit process group.")
+        self._kv_cp_group = group if torch.distributed.get_world_size(group) > 1 else None
 
     def forward(
         self,
@@ -115,8 +114,8 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
     ) -> DeepseekV41CausalLMOutput:
         """Compute training logits and optional causal loss.
 
-        CP consumes equal contiguous text shards and complete, unshifted labels
-        on every rank. Unsupported cache, layout and input combinations raise
+        CP consumes text shards or complete image batches fused before sharding,
+        with complete, unshifted labels. Unsupported cache/layout combinations raise
         ValueError before the corresponding model computation.
         """
         if use_cache:
@@ -182,13 +181,16 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         if cp_group is not None:
             from .context_parallel import prepare_cp_inputs
 
-            hash_input_ids, hash_slice = prepare_cp_inputs(
+            hash_input_ids, hash_slice, full_mask = prepare_cp_inputs(
                 self, input_ids, position_ids, attention_mask, labels, images, token_types
             )
             if self.model.engram_hash is not None:
                 # Hash complete token history before slicing so CP shard edges
                 # do not become artificial n-gram sequence boundaries.
-                engram_hashes = self.model.engram_hash(hash_input_ids, 0)[:, hash_slice]
+                hash_mask = full_mask if token_types is None else full_mask & (token_types < 0)
+                engram_hashes = self.model.engram_hash(hash_input_ids, 0, hash_mask)[:, hash_slice]
+            if labels is not None:
+                labels = labels.masked_fill(~full_mask.to(device=labels.device), -100)
 
         hidden_states, _, collected_hidden_states = self.model.forward_backbone(
             input_ids,
@@ -199,6 +201,7 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
             sfa_layout=sfa_layout,
             cu_seqlens=cu_seqlens,
             engram_hashes=engram_hashes,
+            cp_group=cp_group,
         )
         shift_labels = None
         if labels is not None and cp_group is None:

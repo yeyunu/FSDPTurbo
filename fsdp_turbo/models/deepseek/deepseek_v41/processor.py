@@ -163,6 +163,7 @@ class DeepSeekV41Processor:
 
     preserves_image_marker_positions = True
     supports_image_safe_truncation = True
+    supports_empty_image_batch = True
 
     def __init__(self, tokenizer, model_args):
         self.tokenizer = tokenizer

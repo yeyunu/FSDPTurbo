@@ -1,6 +1,20 @@
 """Shared cross-layer attention cache for DeepSeek-V4.1."""
 
 import torch
+from typing import NamedTuple
+
+
+class ContextParallelAttentionState(NamedTuple):
+    """Pass cross-layer CP tensors explicitly across activation-checkpoint boundaries.
+
+    Each layer returns a new state; replay never reads a later layer's mutable
+    cache. Floating tensors keep their autograd edges to the source layers.
+    """
+
+    compress_kv: torch.Tensor | None = None
+    index_k: torch.Tensor | None = None
+    topk_idxs: torch.Tensor | None = None
+    candidates: torch.Tensor | None = None
 
 
 class SharedAttentionRuntime:

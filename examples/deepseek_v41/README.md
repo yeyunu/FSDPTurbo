@@ -191,7 +191,7 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 | Packed TND/BSND SparseFlashMla 训练 | 支持；需配套 CANN 算子包 |
 | 官方 FP8/FP4 checkpoint 加载 | 暂不支持 |
 | V4.1 attention tensor parallel | 暂不支持 |
-| V4.1 eager KV-AllGather context parallel（小算子 CP） | 支持；仅无 padding 的等长 BSND 文本，TP/Ulysses/KCP=1，关闭全部融合开关、Triton RoPE、recompute、chunk_batch 和 chunk_loss |
+| V4.1 eager KV-AllGather context parallel（小算子 CP） | 支持非 packing BSND 纯文本、图文及右侧 padding，可配合 Block 重计算；TP/Ulysses/KCP=1，关闭全部融合开关、Triton RoPE、chunk_batch 和 chunk_loss |
 | CSA2 跨层压缩状态与稀疏索引结构 | 支持构造与结构验证 |
 | CANN Compressor/CompressorGrad 融合压缩算子 | 可选；设置 `model.use_fused_compressor: true` |
 | Lightning Indexer 融合算子 | 可选；支持 Atlas A3（Ascend 910_93）、Ascend 910B/910C 和 Ascend950DT |
@@ -199,7 +199,7 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 | Clipped SwiGLU 前反向融合 | 可选；设置 `model.use_fused_clipped_swiglu: true`，模型的 `swiglu_limit` 必须大于 0 |
 | Inplace-RoPE Triton算子 | 可选；设置 `model.use_triton_inplace_rope: true` |
 | 视觉 FlashAttentionScore/Grad 融合算子 | 可选；设置 `model.use_fused_vision_flash_attn: true`；仅支持 BF16 |
-| CSA2 activation recompute | 暂不支持 |
+| CSA2 activation recompute | eager CP 路径支持；普通共享缓存路径暂不支持 |
 | Engram BF16 训练、哈希表常驻行切分 | 支持（CPU 两进程已验证） |
 | Engram Host BF16 + ActiveRowAdam FP32 moments | 已接入可选后端；ElasticBuffer 需要配套 CANN 算子包 |
 | DSpark 训练 | 暂不支持 |
@@ -230,13 +230,34 @@ MHC 融合开关同时替换每个 Attention/FFN 前的 projection、Sinkhorn、
 `cann_ops_transformer` 与 CANN/torch-npu 版本配套；默认保持关闭，关闭时继续运行
 原 FP32 投影、softmax pooling 实现。
 
-小算子 CP 沿用通用配置：设置 `distributed.kv_allgather_parallel_size`，在
-`cp_plan.kv_allgather_function_patches` 中使用 `type: compressor_sparse_attention`，
-`target_functions` 指定 `fsdp_turbo.models.deepseek.deepseek_v41.attention.Attention.forward`。
-Adapter 已处理 CP loss，`loss_function_patches` 保持为空；完整序列长度须整除 CP 数，
-本地序列长度须整除各层压缩比。CP 使用完整、未移位的 labels，在全局移位后匹配
-本地 logits，保留分片边界的预测目标；`memory.chunk_loss` 必须关闭，该组合会在配置
-初始化时被拒绝。非 CP 训练仍可使用下文的 chunk loss。
+小算子 CP 使用模型原生接口，配置如下：
+
+```yaml
+distributed:
+  kv_allgather_parallel_size: 2
+```
+
+支持非 packing BSND 文本、图文及右侧 padding。示例 Trainer 按 CP 数与各层压缩比
+要求补齐完整序列，补齐后不得超过 `data.max_seq_length`；仅接受前缀连续有效的
+二值 mask。labels 保持完整未移位，padding 目标被屏蔽，全局移位保留分片边界的预测目标。
+不支持左侧 padding、mask 空洞或 TND；TP/Ulysses/KCP 必须为 1，关闭全部融合开关、
+Triton RoPE、chunk_batch 和 chunk_loss。非 CP 训练可使用下文的 chunk loss。
+
+CP 可配合框架现有的非重入重计算，按 Block 开启：
+
+```yaml
+memory:
+  recompute: true
+  recompute_plan:
+    - model.layers.{*}
+```
+
+CP 的跨层压缩 KV、索引和候选状态随层输入/输出显式传递，重放使用该层前向时的
+状态，不读取后续层覆盖的共享缓存。普通路径仍沿用原实现。
+
+图文数据设置 `data.is_multimodal: true` 并使用现有 processor。完整视觉融合后再切分
+语言序列，允许图片跨分片，保留 MoE 图像路由，Engram 历史排除图片和 padding。
+支持混合纯文本及整批无图；视觉编码仍在各 CP rank 重复执行，不承诺视觉显存随 CP 缩减。
 
 Clipped SwiGLU 融合开关开启后，`swiglu_limit > 0` 的共享专家和路由专家
 调用 CANN `ClippedSwiglu`，反向调用配套的 `ClippedSwigluGrad`，融合裁剪与激活计算。

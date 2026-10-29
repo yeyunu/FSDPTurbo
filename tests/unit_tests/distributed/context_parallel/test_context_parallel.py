@@ -12,7 +12,7 @@ from fsdp_turbo.distributed.context_parallel.patch import (
     apply_cp_loss_patches,
     apply_function_patch_specs,
 )
-from fsdp_turbo.fsdp_turbo_config import CPPlanConfig, DistributedConfig, FSDPTurboConfig
+from fsdp_turbo.fsdp_turbo_config import CPPlanConfig, DistributedConfig, FSDPTurboConfig, MemoryConfig
 
 
 class ContextParallelConfigTests(unittest.TestCase):
@@ -64,14 +64,21 @@ class ContextParallelConfigTests(unittest.TestCase):
             ],
         )
 
-    def test_enabled_cp_requires_axis_patch_specs(self):
-        cases = (
-            ("ulysses_function_patches", DistributedConfig(ulysses_parallel_size=2)),
-            ("kv_allgather_function_patches", DistributedConfig(kv_allgather_parallel_size=2)),
+    def test_cp_patch_requirements_match_axis_interface(self):
+        with self.assertRaisesRegex(ValueError, "ulysses_function_patches"):
+            FSDPTurboConfig(distributed=DistributedConfig(ulysses_parallel_size=2))
+        config = FSDPTurboConfig(distributed=DistributedConfig(kv_allgather_parallel_size=2))
+        self.assertEqual(config.distributed.cp_plan, CPPlanConfig())
+        checkpointed = FSDPTurboConfig(
+            distributed=DistributedConfig(kv_allgather_parallel_size=2),
+            memory=MemoryConfig(recompute=True, recompute_plan=["model.layers.{*}"]),
         )
-        for field_name, distributed in cases:
-            with self.subTest(field_name=field_name), self.assertRaisesRegex(ValueError, field_name):
-                FSDPTurboConfig(distributed=distributed)
+        self.assertTrue(checkpointed.memory.recompute)
+        with self.assertRaisesRegex(ValueError, "does not support chunk_batch"):
+            FSDPTurboConfig(
+                distributed=DistributedConfig(kv_allgather_parallel_size=2),
+                memory=MemoryConfig(chunk_batch=True),
+            )
 
 
 class ContextParallelBatchTests(unittest.TestCase):

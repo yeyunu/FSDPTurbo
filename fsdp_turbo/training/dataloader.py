@@ -296,7 +296,7 @@ class _MultimodalCollator:
         # ranks with text-only samples skip self.visual(...) entirely, causing the
         # FSDP all-gather for the vision encoder to hang (HCCL timeout).
         fake_image_appended = False
-        if not images:
+        if not images and not getattr(self.processor, "supports_empty_image_batch", False):
             dummy_image = Image.new("RGB", (64, 64), (255, 255, 255))
             images = [dummy_image]
             fake_messages = [{"role": "user", "content": [{"type": "image"}]}]
