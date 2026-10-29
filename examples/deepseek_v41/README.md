@@ -302,11 +302,17 @@ Recompute 与 activation swap 的 plan 可继续匹配 decoder 层，但不能�
 
 有 `labels` 时，分块模式返回 `loss`，`logits=None`，不生成全量 logits，也
 不需要收集全部中间 hidden states。没有 `labels` 时仍沿用普通 logits 路径。
-仅在 `chunk_loss: true` 时，模型 adapter 初始化才装配 `ChunkedLMHead`；
-关闭时保留原始 head 对象和普通 logits/loss 路径。训练入口只传配置，不再
-替换 head 或注入 loss 回调。分块 head 的 forward 返回 `(logits, loss)`，保留
-`model.head.weight` 参数名及 FSDP forward 边界，可继续使用现有 FSDP plan
-和 checkpoint。
+adapter 初始化时直接调用已有
+`apply_chunkloss_module(head)`，forward 通过
+`self.model.head(hidden_states, self.loss_function, labels)` 进入模型自己的 loss 方法。
+adapter 保留原有的因果移位、padding 和 TND 边界屏蔽；普通投影复用通用
+`calculate_lm_loss`，HF32 分支沿用现有算子。原 head 类型、初始化分布、
+`model.head.weight` 参数名与 FSDP forward 边界保持不变。
+`ParallelHead` 继承 `nn.Linear`，不使用 bias，权重仍在 FSDP 分片后初始化。
+
+模型工厂继续使用原有 `chunk_loss`、`chunk_loss_size` 参数，训练入口与 YAML
+保持不变，不额外传递工厂或 loss 回调；不新增独立 loss 文件。
+`fsdp_turbo/memory/chunk_loss/chunkloss_lm_head.py` 保持主仓原样。
 
 沿用主仓通用实现，跨块权重梯度按传入 head 权重的 dtype 累加。
 BF16 head 投影配合 BF16 梯度累加时，该缓冲区占用为

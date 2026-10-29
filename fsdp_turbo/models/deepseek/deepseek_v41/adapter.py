@@ -13,12 +13,21 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from fsdp_turbo.memory.chunk_loss.chunkloss_lm_head import apply_chunkloss_module
+from fsdp_turbo.memory.chunk_loss.chunk_loss import (
+    calculate_lm_loss,
+    chunk_loss as compute_chunk_loss,
+    fixed_cross_entropy,
+)
+from fsdp_turbo.ops.hf32_linear import hf32_linear
+
 from .engram.host_offload_engram import HostOffloadEngram
 
 from . import model as reference_model
-from .lm_head import ChunkedLMHead
 
 if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
     from .image_processor import ImageInput
 
 
@@ -62,14 +71,60 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         chunk_loss: bool = False,
         chunk_loss_size: int = 512,
     ) -> None:
-        """Wrap the reference backbone with causal loss and optional chunked logits."""
+        """Assemble an optional loss-aware head before parallel wrapping.
+
+        The head calls this adapter's loss_function with already shifted targets.
+        """
         super().__init__()
         self.model = backbone
         self.model_args = model_args
-        self.chunk_loss = chunk_loss
+        self.enable_chunk_loss = chunk_loss
+        self.chunk_size = chunk_loss_size
         self._kv_cp_group: torch.distributed.ProcessGroup | None = None
         if chunk_loss:
-            self.model.head = ChunkedLMHead(backbone.head, chunk_loss_size=chunk_loss_size)
+            apply_chunkloss_module(backbone.head)
+
+    def _calculate_head_loss(self, hidden_states, head_weight, head_bias, *, shift_labels, alpha, reduction):
+        if not self.model.head.use_hf32:
+            return calculate_lm_loss(
+                hidden_states, head_weight, head_bias, shift_labels=shift_labels, alpha=alpha, reduction=reduction
+            )
+        logits = hf32_linear(hidden_states, head_weight).float()
+        loss = fixed_cross_entropy(
+            logits.reshape(-1, logits.size(-1)), shift_labels.reshape(-1), alpha=alpha, reduction=reduction
+        )
+        return loss, logits
+
+    def loss_function(
+        self,
+        hidden_states: torch.Tensor,
+        head_weight: torch.Tensor,
+        head_bias: torch.Tensor | None,
+        shift_labels: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute chunked mean loss for aligned labels, or full logits without labels.
+
+        Called by the public head interface inside its FSDP forward boundary.
+        Targets equal to -100 are ignored; entirely ignored targets yield zero.
+        Projection follows the head's compute_dtype/use_hf32; loss uses FP32.
+        """
+        hidden_states = hidden_states.to(self.model.head.compute_dtype)
+        head_weight = head_weight.to(self.model.head.compute_dtype)
+        if head_bias is not None:
+            head_bias = head_bias.to(self.model.head.compute_dtype)
+        if shift_labels is None:
+            if self.model.head.use_hf32:
+                logits = hf32_linear(hidden_states, head_weight)
+                return logits if head_bias is None else logits + head_bias
+            return F.linear(hidden_states, head_weight, head_bias)
+        num_items = (shift_labels != -100).sum().clamp_min(1)
+        loss_kwargs_chunks = [
+            dict(shift_labels=labels, alpha=num_items, reduction="sum")
+            for labels in torch.split(shift_labels, self.chunk_size, dim=1)
+        ]
+        return compute_chunk_loss(
+            hidden_states, head_weight, head_bias, self._calculate_head_loss, loss_kwargs_chunks, self.chunk_size
+        )
 
     def from_pretrained(
         self,
@@ -213,10 +268,15 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
             if attention_mask is not None:
                 shift_labels = shift_labels.masked_fill(~attention_mask[:, 1:].bool(), -100)
 
-        if self.chunk_loss:
-            logits, loss = self.model.head(hidden_states, shift_labels=shift_labels)
+        if self.enable_chunk_loss and shift_labels is not None:
+            logits = None
+            loss = self.model.head(hidden_states[:, :-1], self.loss_function, shift_labels)
         else:
-            logits = self.model.head(hidden_states, full_logits=True)
+            logits = (
+                self.model.head(hidden_states, self.loss_function)
+                if self.enable_chunk_loss
+                else self.model.head(hidden_states, full_logits=True)
+            )
             loss = None
             if labels is not None and cp_group is not None:
                 from fsdp_turbo.distributed.context_parallel.loss import cp_compute_lm_loss
@@ -253,7 +313,7 @@ def build_deepseek_v41_model_args(
 def _build_deepseek_v41_model(
     model_args,
     *,
-    tokenizer=None,
+    tokenizer: PreTrainedTokenizerBase | None = None,
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
     chunk_loss: bool = False,
     chunk_loss_size: int = 512,
@@ -277,7 +337,7 @@ def build_deepseek_v41_model(
     model_args: reference_model.ModelArgs | None = None,
     config_path: str | Path | None = None,
     model_name_or_path: str | Path | None = None,
-    tokenizer=None,
+    tokenizer: PreTrainedTokenizerBase | None = None,
     engram_storage_backend: Literal["host_offload", "elastic_buffer"] = "host_offload",
     use_sparse_flash_attn: bool = False,
     use_fused_lightning_indexer: bool = False,
@@ -294,7 +354,8 @@ def build_deepseek_v41_model(
     """Build an uninitialized BF16 model from model_args or a selected config JSON.
 
     Host Engram tables start on meta storage. FSDPTurbo later shards and
-    initializes them without allocating their full storage.
+    initializes them without allocating their full storage. chunk_loss enables
+    the public chunk-loss head, using this adapter's loss_function.
     """
     if model_args is None:
         model_args = build_deepseek_v41_model_args(config_path=config_path, model_name_or_path=model_name_or_path)

@@ -134,9 +134,15 @@ def apply_rotary_emb(
     )
 
 
-class ParallelHead(nn.Module):
-    def __init__(self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6):
-        super().__init__()
+class ParallelHead(nn.Linear):
+    """Bias-free Linear head with independent projection precision and deferred initialization."""
+
+    def __init__(self, vocab_size: int, dim: int, norm_eps: float = 1e-6, hc_eps: float = 1e-6) -> None:
+        """Allocate FP32 weights; FSDPTurbo initializes them after sharding."""
+        # Match Linear above: avoid initializing the full matrix before sharding.
+        nn.Module.__init__(self)
+        self.in_features = dim
+        self.out_features = vocab_size
         self.vocab_size = vocab_size
         self.dim = dim
         self.norm_eps = norm_eps
@@ -145,8 +151,9 @@ class ParallelHead(nn.Module):
         self.compute_dtype = torch.float32
         self.use_hf32 = False
         self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=torch.float32))
+        self.register_parameter("bias", None)
 
-    def forward(self, x: torch.Tensor, full_logits=False):
+    def forward(self, x: torch.Tensor, full_logits: bool = False) -> torch.Tensor:
         """x: [b, s, d]. Generation only needs the last position, so that is the default."""
         if not full_logits:
             x = x[:, -1]
