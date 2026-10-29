@@ -2,9 +2,23 @@
 from fsdp_turbo.ops.npu.cce_loss import cce_loss_npu
 from fsdp_turbo.ops.npu.attn_res import attn_res_npu
 from fsdp_turbo.ops.npu.clipped_swiglu import clipped_swiglu_npu
-from fsdp_turbo.ops.npu.causal_conv1d import causal_conv1d_npu, causal_conv1d_update_npu
-from fsdp_turbo.ops.npu.gdn import chunk_gdn_npu, fused_recurrent_gdn_npu
-from fsdp_turbo.ops.npu.chunk_kda import chunk_kda_npu
+from fsdp_turbo.utils.log import log_warning_once
+
+# Linear-attention kernels need optional packages (fla, fla_npu, triton_ascend_kernels). Their absence must not
+# unregister the core MoE / norm / attention ops below: a failed package import is swallowed in
+# fsdp_turbo.ops, after which every dispatch silently falls back to the (slow, dtype-different) CPU implementation.
+try:
+    from fsdp_turbo.ops.npu.causal_conv1d import causal_conv1d_npu, causal_conv1d_update_npu
+    from fsdp_turbo.ops.npu.gdn import chunk_gdn_npu, fused_recurrent_gdn_npu
+    from fsdp_turbo.ops.npu.chunk_kda import chunk_kda_npu
+except ImportError as _error:
+    causal_conv1d_npu = causal_conv1d_update_npu = chunk_gdn_npu = fused_recurrent_gdn_npu = chunk_kda_npu = None
+    import logging as _logging
+
+    log_warning_once(
+        _logging.getLogger(__name__),
+        f"Linear-attention NPU ops (causal_conv1d / gdn / kda) are unavailable: {_error}",
+    )
 from fsdp_turbo.ops.npu.engram import engram_backward_npu, engram_forward_npu, engram_wkv_npu
 from fsdp_turbo.ops.npu.grouped_matmul import grouped_matmul_npu, w4a16_grouped_matmul_npu
 from fsdp_turbo.ops.npu.grouped_matmul_mc2 import all2all_grouped_matmul_npu, grouped_matmul_all2all_npu
