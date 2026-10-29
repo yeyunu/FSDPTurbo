@@ -7,6 +7,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy
 from fsdp_turbo.fsdp_turbo_config import FSDPPlanConfig
 from fsdp_turbo.distributed.fine_grained_fully_shard import get_fsdp_strategy
+from fsdp_turbo.distributed.fully_shard_parallel.prefetch import disable_default_backward_prefetch
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.str_match import module_name_match
 from fsdp_turbo.utils.dtype import get_dtype
@@ -38,6 +39,10 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, 
         fully_shard_fn(module, hook_module=hook_module, **module_config)
     fully_shard_fn(model, **config)
     set_modules_to_prefetch(model, fsdp_modules, fsdp_plan)
+    if fsdp_plan.num_to_backward_prefetch == 0:
+        # FSDP2's default backward prefetch is enabled when no explicit list
+        # is set, so a configured depth of zero needs an explicit override.
+        disable_default_backward_prefetch(model.modules())
     return model
 
 

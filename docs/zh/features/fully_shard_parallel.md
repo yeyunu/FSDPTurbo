@@ -53,7 +53,7 @@ distributed:
 ### 通信预取
 
 - `num_to_forward_prefetch`：前向时提前预取后续N层的全量参数，隐藏AllGather通信。
-- `num_to_backward_prefetch`：反向时提前预取后续N层参数，隐藏通信。
+- `num_to_backward_prefetch`：反向时提前预取后续N层参数，隐藏通信。设为 `0` 时关闭反向预取，包括 FSDP2 自带的一层默认预取。
 - `prefetch_modules`：可选，按前向实际执行顺序排列的`apply_modules`模式列表，须将每个模式恰好列出一次。配置初始化时检查列表类型及模式是否完整、无重复；校验不会改变用户指定的顺序。模式内按模块注册顺序展开，重叠匹配的模块只保留首次出现；反向使用展开列表的逆序。未配置时沿用模块注册顺序。
 - `hook_modules`：指定通信挂钩模块（如`model.language_model.layers.{*}`），实现细粒度通信调度。
 

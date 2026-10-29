@@ -9,6 +9,7 @@ from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import (
     get_offload_policy,
     get_mixprecision_policy,
 )
+from fsdp_turbo.distributed.fully_shard_parallel.prefetch import disable_default_backward_prefetch
 from fsdp_turbo.fsdp_turbo_config import EPPlanConfig, FSDPPlanConfig
 from fsdp_turbo.distributed.fine_grained_fully_shard import get_fsdp_strategy
 from fsdp_turbo.utils.log import print_rank
@@ -84,6 +85,10 @@ def expert_fully_shard_modules(
 
     set_modules_to_prefetch_efsdp(model, efsdp_modules, fsdp_plan)
 
+    if fsdp_plan.num_to_backward_prefetch == 0:
+        # FSDP2's default backward prefetch is enabled when no explicit list
+        # is set, so a configured depth of zero needs an explicit override.
+        disable_default_backward_prefetch(model.modules())
     return model
 
 
