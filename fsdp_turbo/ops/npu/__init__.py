@@ -1,24 +1,11 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+import logging
+
 from fsdp_turbo.ops.npu.cce_loss import cce_loss_npu
 from fsdp_turbo.ops.npu.attn_res import attn_res_npu
 from fsdp_turbo.ops.npu.clipped_swiglu import clipped_swiglu_npu
 from fsdp_turbo.utils.log import log_warning_once
 
-# Linear-attention kernels need optional packages (fla, fla_npu, triton_ascend_kernels). Their absence must not
-# unregister the core MoE / norm / attention ops below: a failed package import is swallowed in
-# fsdp_turbo.ops, after which every dispatch silently falls back to the (slow, dtype-different) CPU implementation.
-try:
-    from fsdp_turbo.ops.npu.causal_conv1d import causal_conv1d_npu, causal_conv1d_update_npu
-    from fsdp_turbo.ops.npu.gdn import chunk_gdn_npu, fused_recurrent_gdn_npu
-    from fsdp_turbo.ops.npu.chunk_kda import chunk_kda_npu
-except ImportError as _error:
-    causal_conv1d_npu = causal_conv1d_update_npu = chunk_gdn_npu = fused_recurrent_gdn_npu = chunk_kda_npu = None
-    import logging as _logging
-
-    log_warning_once(
-        _logging.getLogger(__name__),
-        f"Linear-attention NPU ops (causal_conv1d / gdn / kda) are unavailable: {_error}",
-    )
 from fsdp_turbo.ops.npu.engram import engram_backward_npu, engram_forward_npu, engram_wkv_npu
 from fsdp_turbo.ops.npu.grouped_matmul import grouped_matmul_npu, w4a16_grouped_matmul_npu
 from fsdp_turbo.ops.npu.grouped_matmul_mc2 import all2all_grouped_matmul_npu, grouped_matmul_all2all_npu
@@ -41,18 +28,6 @@ from fsdp_turbo.ops.npu.partial_rotary import cann_partial_rotary
 from fsdp_turbo.ops.npu.fused_attention import npu_fusion_attention_npu
 from fsdp_turbo.ops.npu.qsa import qsa_selected_token_mask_npu
 
-try:
-    from fsdp_turbo.ops.npu.sinkhorn import hc_split_sinkhorn_npu
-except ImportError:  # triton is optional; the package must still load without it
-    hc_split_sinkhorn_npu = None
-try:
-    from fsdp_turbo.ops.npu.lightning_indexer_score import lightning_indexer_score_npu
-except ImportError:  # triton is optional; the package must still load without it
-    lightning_indexer_score_npu = None
-try:
-    from fsdp_turbo.ops.npu.sparse_flash_attention import sparse_flash_attention_npu
-except ImportError:  # depends on the torch_npu wheel exposing the SFA op
-    sparse_flash_attention_npu = None
 from fsdp_turbo.ops.npu.situ_glu import situ_glu_npu
 from fsdp_turbo.ops.npu.sparse_attention import (
     indexed_sparse_attention_npu,
@@ -65,6 +40,39 @@ from fsdp_turbo.ops.npu.vision_flash_attention import fused_vision_flash_attenti
 from fsdp_turbo.ops.npu.hf32_linear import hf32_linear_npu
 from fsdp_turbo.ops.npu.flash_attn import flash_attention_npu
 from fsdp_turbo.ops.npu.rotary_mul import rotary_mul_npu
+
+_logger = logging.getLogger(__name__)
+
+# Linear-attention kernels need optional packages (fla, fla_npu, triton_ascend_kernels). Their absence must not
+# unregister the core MoE / norm / attention ops below: a failed package import is swallowed in
+# fsdp_turbo.ops, after which every dispatch silently falls back to the (slow, dtype-different) CPU implementation.
+try:
+    from fsdp_turbo.ops.npu.causal_conv1d import causal_conv1d_npu, causal_conv1d_update_npu
+except ImportError as _error:
+    causal_conv1d_npu = causal_conv1d_update_npu = None
+    log_warning_once(_logger, f"NPU causal convolution is unavailable: {_error}")
+try:
+    from fsdp_turbo.ops.npu.gdn import chunk_gdn_npu, fused_recurrent_gdn_npu
+except ImportError as _error:
+    chunk_gdn_npu = fused_recurrent_gdn_npu = None
+    log_warning_once(_logger, f"NPU GDN is unavailable: {_error}")
+try:
+    from fsdp_turbo.ops.npu.chunk_kda import chunk_kda_npu
+except ImportError as _error:
+    chunk_kda_npu = None
+    log_warning_once(_logger, f"NPU KDA is unavailable: {_error}")
+try:
+    from fsdp_turbo.ops.npu.sinkhorn import hc_split_sinkhorn_npu
+except ImportError:  # triton is optional; the package must still load without it
+    hc_split_sinkhorn_npu = None
+try:
+    from fsdp_turbo.ops.npu.lightning_indexer_score import lightning_indexer_score_npu
+except ImportError:  # triton is optional; the package must still load without it
+    lightning_indexer_score_npu = None
+try:
+    from fsdp_turbo.ops.npu.sparse_flash_attention import sparse_flash_attention_npu
+except ImportError:  # depends on the torch_npu wheel exposing the SFA op
+    sparse_flash_attention_npu = None
 
 __all__ = [
     'cce_loss_npu',

@@ -1,20 +1,35 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
-# Copyright 2026 the HuggingFace Team. All rights reserved.
-# Copyright 2026, Huawei Technologies Co., Ltd. All rights reserved.
-"""FSDPTurbo modeling for Qwen3.5-MoE."""
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Qwen3.5 MoE model with portable core operators and the Turbo forward and loss."""
 
+import inspect
+from collections.abc import Callable
 from functools import partial
-from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-
+from transformers import initialization as init
 from transformers.cache_utils import Cache
+from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
-from transformers.utils import can_return_tuple
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig, Qwen3_5MoeVisionConfig
+from transformers.processing_utils import Unpack
+from transformers.utils import TransformersKwargs, can_return_tuple
 
 from fsdp_turbo.distributed.context_parallel.batch import (
     cal_split_sizes,
@@ -28,187 +43,93 @@ from fsdp_turbo.distributed.context_parallel.communication import (
 from fsdp_turbo.distributed.context_parallel.loss import cp_compute_lm_loss
 from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_attention import ulysses_context_parallel_attention
 from fsdp_turbo.modules.gated_delta_net import GatedDeltaNet
+from fsdp_turbo.ops.causal_conv1d import causal_conv1d, causal_conv1d_update
+from fsdp_turbo.ops.gdn import chunk_gdn, fused_recurrent_gdn
+from fsdp_turbo.ops.flash_attn import flash_attention_forward
+from fsdp_turbo.ops.moe import grouped_matmul, permute, swiglu, unpermute
 from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.ops.rotary_mul import rotary_mul
 from fsdp_turbo.utils.model import register_model
 
 
-class Qwen3_5MoeRMSNorm(hf.Qwen3_5MoeRMSNorm):
-    """RMSNorm that dispatches to the fused ``ops.rms_norm`` on accelerator."""
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return rms_norm(x, 1.0 + self.weight.float(), self.eps).type_as(x)
+def _attention_interface(implementation: str) -> Callable:
+    if implementation == "flash_attention_2":
+        return flash_attention_forward
+    return ALL_ATTENTION_FUNCTIONS.get_interface(implementation, hf.eager_attention_forward)
 
 
 class Qwen3_5MoeRMSNormGated(hf.Qwen3_5MoeRMSNormGated):
-    """Gated RMSNorm that dispatches to the fused ``ops.rms_norm`` on accelerator."""
+    """Apply the norm-before-gate convention used by the training kernels."""
 
-    def forward(self, hidden_states: torch.Tensor, gate: Optional[torch.Tensor] = None) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
-        normed = rms_norm(hidden_states, self.weight.float(), self.variance_epsilon)
-        return (normed * F.silu(gate.to(normed.dtype))).to(input_dtype)
-
-
-def _apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split q/k into rotary / non-rotary parts and apply ``rotary_mul`` on the rotary part."""
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_embed = rotary_mul(q_rot, cos, sin)
-    k_embed = rotary_mul(k_rot, cos, sin)
-    q_embed = torch.cat([q_embed, q_pass], dim=-1)
-    k_embed = torch.cat([k_embed, k_pass], dim=-1)
-    return q_embed, k_embed
+    def forward(self, hidden_states: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Normalize and scale hidden states before applying the SiLU gate."""
+        normalized = rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        return normalized * F.silu(gate)
 
 
-def _apply_rotary_pos_emb_vision(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply full-dim rotation in float32 then cast back to original dtype."""
-    orig_q_dtype = q.dtype
-    orig_k_dtype = k.dtype
-    q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
-    q_embed = rotary_mul(q, cos, sin)
-    k_embed = rotary_mul(k, cos, sin)
-    return q_embed.to(orig_q_dtype), k_embed.to(orig_k_dtype)
+class Qwen3_5MoeRMSNorm(hf.Qwen3_5MoeRMSNorm):
+    """Apply Qwen's 1 + weight scale through the common normalization operator."""
 
-
-class Qwen3_5MoeAttention(hf.Qwen3_5MoeAttention):
-    """Attention layer using fused rotary embedding and fused q/k RMSNorm."""
-
-    def __init__(self, config, layer_idx):
-        super().__init__(config, layer_idx)
-        self.ulysses_group = None
-        self.q_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
-    def forward(
-        self,
-        hidden_states,
-        position_embeddings,
-        attention_mask=None,
-        past_key_values=None,
-        cache_position=None,
-        **kwargs,
-    ):
-        # MRoPE has three coordinate planes; FA packing detection needs one
-        # text-position plane, not three concatenated sequences.
-        position_ids = kwargs.get("position_ids")
-        if position_ids is not None and position_ids.ndim == 3:
-            kwargs["position_ids"] = position_ids[0]
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-        query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
-        )
-        gate = gate.reshape(*input_shape, -1)
-        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        cos, sin = position_embeddings
-        query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        if past_key_values is not None:
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-                cache_kwargs,
-            )
-
-        raw_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, hf.eager_attention_forward
-        )
-        attention_interface = partial(raw_interface, self)
-        attention_kwargs = dict(
-            attention_mask=attention_mask,
-            scaling=self.scaling,
-            dropout=self.attention_dropout if self.training else 0.0,
-            **kwargs,
-        )
-        if self.ulysses_group is not None:
-            attn_output, attn_weights = ulysses_context_parallel_attention(
-                attention_interface,
-                query_states,
-                key_states,
-                value_states,
-                ulysses_group=self.ulysses_group,
-                flash_attention=True,
-                **attention_kwargs,
-            )
-        else:
-            attn_output, attn_weights = attention_interface(query_states, key_states, value_states, **attention_kwargs)
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = attn_output * torch.sigmoid(gate)
-        attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize hidden states with the Qwen residual scale."""
+        use_eager = hidden_states.device.type != "npu"
+        weight = 1.0 + (self.weight.float() if use_eager else self.weight)
+        return rms_norm(
+            hidden_states,
+            weight,
+            self.eps,
+            use_eager=use_eager,
+        ).to(hidden_states.dtype)
 
 
 class Qwen3_5MoeGatedDeltaNet(hf.Qwen3_5MoeGatedDeltaNet):
-    """Gated delta net layer using fused causal conv1d, fused GDN and fused gated RMSNorm.
+    """GDN computation with explicit convolution and recurrent cache state."""
 
-    All operator functions are resolved from instance attributes so that both
-    this class's own ``forward`` and the CP-aware ``GatedDeltaNet.forward``
-    (installed by ``ulysses_function_patches``) share the same dispatch path.
-    """
-
-    def __init__(self, config, layer_idx):
+    def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int) -> None:
         super().__init__(config, layer_idx)
-        self.cp_group = None
-        self.use_fused_conv1d = getattr(config, "use_fused_causal_conv1d", False)
-        self.use_fused_gdn = getattr(config, "use_fused_gdn", False)
         self.norm = Qwen3_5MoeRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+        self.cp_group = None
+        self.gdn_implementation = getattr(
+            config, "gdn_implementation", "auto" if getattr(config, "use_fused_gdn", False) else "eager"
+        )
+        self.causal_conv1d_implementation = getattr(
+            config,
+            "causal_conv1d_implementation",
+            "auto" if getattr(config, "use_fused_causal_conv1d", False) else "eager",
+        )
 
-        if self.use_fused_gdn:
-            from fsdp_turbo.ops.gdn import chunk_gdn, fused_recurrent_gdn
+    def causal_conv1d_fn(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        activation: str | None = None,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        """Adapt channel-first Ulysses convolution inputs to the portable op."""
+        output, _ = causal_conv1d(
+            x.transpose(1, 2),
+            weight.transpose(0, 1),
+            bias=bias,
+            activation=activation,
+            head_num=(2 * self.num_k_heads + self.num_v_heads) // dist.get_world_size(self.cp_group),
+            implementation=self.causal_conv1d_implementation,
+        )
+        return output.transpose(1, 2)
 
-            self.chunk_gated_delta_rule = chunk_gdn
-            self.recurrent_gated_delta_rule = fused_recurrent_gdn
-        else:
-            self.chunk_gated_delta_rule = hf.torch_chunk_gated_delta_rule
-            self.recurrent_gated_delta_rule = hf.torch_recurrent_gated_delta_rule
-
-        if self.use_fused_conv1d:
-            from fsdp_turbo.ops.causal_conv1d import causal_conv1d, causal_conv1d_update
-
-            def _fused_conv1d_fn(x, weight, bias=None, activation=None, **kw):
-                output, _ = causal_conv1d(
-                    x.transpose(1, 2).contiguous(),
-                    weight.transpose(0, 1),
-                    bias=bias,
-                    activation=activation,
-                    cu_seqlens=kw.get("cu_seqlens"),
-                )
-                return output.transpose(1, 2).contiguous()
-
-            def _fused_conv1d_update(x, cache, weight, bias=None, activation=None):
-                output, cache = causal_conv1d_update(
-                    x.transpose(1, 2).contiguous(),
-                    cache,
-                    weight,
-                    bias=bias,
-                    activation=activation,
-                )
-                return output.transpose(1, 2).contiguous()
-
-            self.causal_conv1d_fn = _fused_conv1d_fn
-            self.causal_conv1d_update = _fused_conv1d_update
-        else:
-            self.causal_conv1d_fn = hf.causal_conv1d_fn
-            self.causal_conv1d_update = hf.causal_conv1d_update
+    def chunk_gated_delta_rule(self, *args: torch.Tensor, **kwargs: object) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Use the configured GDN backend for the Ulysses path."""
+        return chunk_gdn(*args, implementation=self.gdn_implementation, **kwargs)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Optional[Cache] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        **kwargs,
+        cache_params: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
     ) -> torch.Tensor:
+        """Compute one GDN layer, retaining HF Cache continuation semantics."""
         if self.cp_group is not None:
             return GatedDeltaNet.forward(
                 self,
@@ -219,184 +140,249 @@ class Qwen3_5MoeGatedDeltaNet(hf.Qwen3_5MoeGatedDeltaNet):
                 **kwargs,
             )
         hidden_states = hf.apply_mask_to_padding_states(hidden_states, attention_mask)
-        batch_size, seq_len, _ = hidden_states.shape
-        use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx)
-
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)
-        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
-
-        if use_precomputed_states and seq_len == 1 and not cache_params.layers[self.layer_idx].record_past:
-            conv_state = cache_params.layers[self.layer_idx].conv_states[0]
-            mixed_qkv = self.causal_conv1d_update(
+        batch_size, sequence_length, _ = hidden_states.shape
+        has_state = cache_params is not None and cache_params.has_previous_state(self.layer_idx, state_idx=0)
+        decode = has_state and sequence_length == 1 and not cache_params.layers[self.layer_idx].record_past
+        recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if has_state else None
+        mixed_qkv = self.in_proj_qkv(hidden_states)
+        gate = self.in_proj_z(hidden_states).reshape(batch_size, sequence_length, -1, self.head_v_dim)
+        beta = self.in_proj_b(hidden_states).sigmoid()
+        decay = -self.A_log.float().exp() * F.softplus(self.in_proj_a(hidden_states).float() + self.dt_bias)
+        cu_seqlens = kwargs.get("cu_seqlens")
+        if cu_seqlens is not None:
+            cu_seqlens = cu_seqlens.to(torch.int64)
+        if decode:
+            mixed_qkv, _ = causal_conv1d_update(
                 mixed_qkv,
-                conv_state,
+                cache_params.layers[self.layer_idx].conv_states[0],
                 self.conv1d.weight.squeeze(1),
                 self.conv1d.bias,
-                self.activation,
+                activation=self.activation,
+                implementation=self.causal_conv1d_implementation,
             )
         else:
             if cache_params is not None:
                 mixed_qkv = cache_params.update_conv_state(
-                    mixed_qkv, self.layer_idx, conv_kernel_size=self.conv_kernel_size
-                )
-            mixed_qkv = self.causal_conv1d_fn(
+                    mixed_qkv.transpose(1, 2),
+                    self.layer_idx,
+                    conv_kernel_size=self.conv_kernel_size,
+                ).transpose(1, 2)
+            mixed_qkv, _ = causal_conv1d(
                 mixed_qkv,
-                self.conv1d.weight.squeeze(1),
+                self.conv1d.weight.squeeze(1).transpose(0, 1),
                 self.conv1d.bias,
                 activation=self.activation,
-                **kwargs,
+                cu_seqlens=cu_seqlens,
+                head_num=2 * self.num_k_heads + self.num_v_heads,
+                implementation=self.causal_conv1d_implementation,
             )
-            if cache_params is not None:
-                mixed_qkv = mixed_qkv[:, :, -seq_len:]
-
-        mixed_qkv = mixed_qkv.transpose(1, 2)
-        query, key, value = torch.split(
-            mixed_qkv,
-            [self.key_dim, self.key_dim, self.value_dim],
-            dim=-1,
-        )
-        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
-        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
-
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-        if self.num_v_heads // self.num_k_heads > 1:
+            mixed_qkv = mixed_qkv[:, -sequence_length:]
+        query, key, value = torch.split(mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        query = query.reshape(batch_size, sequence_length, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(batch_size, sequence_length, self.num_k_heads, self.head_k_dim)
+        value = value.reshape(batch_size, sequence_length, self.num_v_heads, self.head_v_dim)
+        if self.num_v_heads != self.num_k_heads:
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_precomputed_states else None
-        cu_seqlens = kwargs.pop("cu_seq_lens_q", None)
-        if cu_seqlens is None:
-            cu_seqlens = kwargs.pop("cu_seqlens", None)
-
-        if use_precomputed_states and seq_len == 1:
-            core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(
+        if decode:
+            output, state = fused_recurrent_gdn(
                 query,
                 key,
                 value,
-                g=g,
-                beta=beta,
+                decay,
+                beta,
                 initial_state=recurrent_state,
-                output_final_state=cache_params is not None,
+                output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-                **kwargs,
+                implementation="eager",
             )
         else:
-            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+            output, state = chunk_gdn(
                 query,
                 key,
                 value,
-                g=g,
-                beta=beta,
+                decay,
+                beta,
                 initial_state=recurrent_state,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
                 cu_seqlens=cu_seqlens,
-                **kwargs,
+                implementation=self.gdn_implementation,
             )
-
         if cache_params is not None:
-            cache_params.update_recurrent_state(last_recurrent_state, self.layer_idx)
-        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
-        z = z.reshape(-1, self.head_v_dim)
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
-        return self.out_proj(core_attn_out)
+            cache_params.update_recurrent_state(state, self.layer_idx)
+        output = self.norm(output.reshape(-1, self.head_v_dim), gate.reshape(-1, self.head_v_dim))
+        return self.out_proj(output.reshape(batch_size, sequence_length, -1))
 
 
-class Qwen3_5MoeDecoderLayer(hf.Qwen3_5MoeDecoderLayer):
-    """Decoder layer that assembles FSDPTurbo attention / GDN / MoE / norm sublayers."""
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotate the configured prefix of Q/K and preserve non-rotary channels."""
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
 
-    def __init__(self, config, layer_idx):
-        hf.GradientCheckpointingLayer.__init__(self)
-        self.hidden_size = config.hidden_size
-        self.layer_type = config.layer_types[layer_idx]
-        self.block_type = self.layer_type
-        if self.layer_type == "linear_attention":
-            self.linear_attn = Qwen3_5MoeGatedDeltaNet(config, layer_idx)
-        elif self.layer_type == "full_attention":
-            self.self_attn = Qwen3_5MoeAttention(config, layer_idx)
-        self.mlp = hf.Qwen3_5MoeSparseMoeBlock(config)
-        self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    # Keep half or full tensor for later concatenation
+    rotary_dim = cos.shape[-1]
+    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+
+    q_embed = rotary_mul(q_rot, cos, sin)
+    k_embed = rotary_mul(k_rot, cos, sin)
+
+    # Concatenate back to full shape
+    q_embed = torch.cat([q_embed, q_pass], dim=-1)
+    k_embed = torch.cat([k_embed, k_pass], dim=-1)
+    return q_embed, k_embed
 
 
-class Qwen3_5MoeTextModel(hf.Qwen3_5MoeTextModel):
-    """Text model that rebuilds decoder layers and final norm with FSDPTurbo subclasses."""
+class Qwen3_5MoeAttention(hf.Qwen3_5MoeAttention):
+    """Text attention with explicit Turbo backend selection and Qwen gating."""
 
-    def __init__(self, config):
-        hf.Qwen3_5MoePreTrainedModel.__init__(self, config)
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
-        self.layers = nn.ModuleList(
-            [Qwen3_5MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
-        )
-        self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = hf.Qwen3_5MoeTextRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
-        self.cp_group = None
-        self.post_init()
+    def __init__(self, config: Qwen3_5MoeTextConfig, layer_idx: int) -> None:
+        super().__init__(config, layer_idx)
+        self.ulysses_group = None
+        self.q_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
-        position_ids=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        use_cache=None,
-        cache_position=None,
-        **kwargs,
-    ):
-        if self.cp_group is not None:
-            if past_key_values is not None or cache_position is not None or use_cache:
-                raise NotImplementedError("Qwen3.5 CP does not support KV cache.")
-            if any(
-                kwargs.get(name) is not None
-                for name in (
-                    "cu_seqlens",
-                    "cu_seq_lens_q",
-                    "cu_seq_lens_k",
-                    "seq_split_lens",
-                )
-            ):
-                raise NotImplementedError("Qwen3.5 CP does not support packed sequences.")
-            if inputs_embeds is None:
-                inputs_embeds = self.embed_tokens(input_ids)
-            if position_ids is None:
-                position_ids = torch.arange(inputs_embeds.size(1), device=inputs_embeds.device).unsqueeze(0)
-                position_ids = position_ids.expand(inputs_embeds.size(0), -1)
-            inputs_embeds, position_ids, attention_mask = shard_fused_sequence_inputs(
-                inputs_embeds=inputs_embeds,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                group=self.cp_group,
-                gather_backward=True,
-            )
-            input_ids, use_cache = None, False
-        return super().forward(
-            input_ids=input_ids,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Project Q/K/V, update KV cache, and apply gated attention."""
+        if kwargs.get("position_ids") is not None and kwargs["position_ids"].ndim == 3:
+            kwargs["position_ids"] = kwargs["position_ids"][0]
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states, gate = torch.chunk(
+            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
+        )
+        gate = gate.reshape(*input_shape, -1)
+
+        query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        attention_interface = _attention_interface(self.config._attn_implementation)
+        total_seq_len = query_states.shape[2]
+        attention_kwargs = dict(
             attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            cache_position=cache_position,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            is_causal=True,
             **kwargs,
         )
+        if self.ulysses_group is not None:
+            cp_attention = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, hf.eager_attention_forward
+            )
+            attn_output, attn_weights = ulysses_context_parallel_attention(
+                partial(cp_attention, self),
+                query_states,
+                key_states,
+                value_states,
+                ulysses_group=self.ulysses_group,
+                flash_attention=True,
+                **attention_kwargs,
+            )
+        else:
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                total_seq_len=total_seq_len,
+                seq_split_lens=None,
+                **attention_kwargs,
+            )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output * torch.sigmoid(gate)
+
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+class Qwen3_5MoeExperts(hf.Qwen3_5MoeExperts):
+    """Keep native HF expert weights with optional grouped matrix multiplication."""
+
+    def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
+        """Reuse HF parameter shapes and read the existing compute option."""
+        super().__init__(config)
+        self.use_grouped_expert_matmul = getattr(config, "use_grouped_expert_matmul", False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        """Route tokens with HF weights in [expert, output, input] layout."""
+        if not self.use_grouped_expert_matmul:
+            return super().forward(hidden_states, top_k_index, top_k_weights)
+        use_eager = hidden_states.device.type != "npu"
+        permuted, row_ids = permute(hidden_states, top_k_index.to(torch.int32), use_eager=use_eager)
+        counts = torch.bincount(top_k_index.reshape(-1), minlength=self.num_experts).to(torch.int64)
+        projected = grouped_matmul(permuted, counts, self.gate_up_proj, use_eager=use_eager)
+        activated = swiglu(projected, fused=not use_eager)
+        projected = grouped_matmul(activated, counts, self.down_proj, use_eager=use_eager)
+        return unpermute(projected, row_ids, probs=top_k_weights, use_eager=use_eager)
+
+
+class Qwen3_5MoeSparseMoeBlock(hf.Qwen3_5MoeSparseMoeBlock):
+    """Evaluate routed experts before the shared expert, matching MM gradient accumulation."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply routed and shared experts and return their combined output."""
+        batch_size, sequence_length, hidden_size = hidden_states.shape
+        flattened_states = hidden_states.reshape(-1, hidden_size)
+        _, routing_weights, selected_experts = self.gate(flattened_states)
+        expert_output = self.experts(flattened_states, selected_experts, routing_weights)
+        shared_output = self.shared_expert(flattened_states)
+        shared_output = torch.sigmoid(self.shared_expert_gate(flattened_states)) * shared_output
+        return (expert_output + shared_output).reshape(batch_size, sequence_length, hidden_size)
+
+
+def apply_rotary_pos_emb_vision(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute vision RoPE in FP32 before restoring Q/K dtypes."""
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = rotary_mul(q, cos, sin)
+    k_embed = rotary_mul(k, cos, sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+    return q_embed, k_embed
 
 
 class Qwen3_5MoeVisionAttention(hf.Qwen3_5MoeVisionAttention):
-    """Vision attention using fused vision rotary embedding."""
+    """Packed bidirectional attention for independent image and video frames."""
 
-    def __init__(self, config):
+    def __init__(self, config: Qwen3_5MoeVisionConfig) -> None:
         super().__init__(config)
         self.cp_group = None
 
-    def forward(
+    def _forward_cp(
         self, hidden_states, cu_seqlens, rotary_pos_emb=None, position_embeddings=None, max_seqlen=None, **kwargs
     ):
         seq_length = hidden_states.shape[0]
@@ -405,7 +391,7 @@ class Qwen3_5MoeVisionAttention(hf.Qwen3_5MoeVisionAttention):
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, self.head_dim).permute(1, 0, 2, 3).unbind(0)
         )
         cos, sin = position_embeddings
-        query_states, key_states = _apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
         raw_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, hf.eager_attention_forward
@@ -468,22 +454,91 @@ class Qwen3_5MoeVisionAttention(hf.Qwen3_5MoeVisionAttention):
         attn_output = self.proj(attn_output)
         return attn_output
 
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> torch.Tensor:
+        """Attend within each sequence delimited by cumulative lengths."""
+        if self.cp_group is not None:
+            return self._forward_cp(hidden_states, cu_seqlens, rotary_pos_emb, position_embeddings, **kwargs)
+        seq_length = hidden_states.shape[0]
+        query_states, key_states, value_states = (
+            self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        )
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
-class Qwen3_5MoeVisionBlock(hf.Qwen3_5MoeVisionBlock):
-    def __init__(self, config):
-        hf.GradientCheckpointingLayer.__init__(self)
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.norm2 = nn.LayerNorm(config.hidden_size, eps=1e-6)
-        self.attn = Qwen3_5MoeVisionAttention(config)
-        self.mlp = hf.Qwen3_5MoeVisionMLP(config)
+        attention_interface = _attention_interface(self.config._attn_implementation)
+
+        if self.config._attn_implementation == "flash_attention_2":
+            query_states = query_states.unsqueeze(0)
+            key_states = key_states.unsqueeze(0)
+            value_states = value_states.unsqueeze(0)
+
+            # Flash Attention 2: Use cu_seqlens for variable length attention
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            attn_output, _ = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                cu_seq_lens_q=cu_seqlens,
+                cu_seq_lens_k=cu_seqlens,
+                max_length_q=max_seqlen,
+                max_length_k=max_seqlen,
+                is_causal=False,
+                total_seq_len=seq_length,
+                input_layout="1TND",
+                **kwargs,
+            )
+        else:
+            query_states = query_states.transpose(0, 1).unsqueeze(0)
+            key_states = key_states.transpose(0, 1).unsqueeze(0)
+            value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+            # Other implementations: Process each chunk separately
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            splits = [
+                torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+            ]
+
+            attn_outputs = [
+                attention_interface(
+                    self,
+                    q,
+                    k,
+                    v,
+                    attention_mask=None,
+                    scaling=self.scaling,
+                    dropout=0.0 if not self.training else self.attention_dropout,
+                    is_causal=False,
+                    **kwargs,
+                )[0]
+                for q, k, v in zip(*splits)
+            ]
+            attn_output = torch.cat(attn_outputs, dim=1)
+
+        attn_output = attn_output.reshape(seq_length, -1).contiguous()
+        attn_output = self.proj(attn_output)
+        return attn_output
 
 
 class Qwen3_5MoeVisionPatchMerger(hf.Qwen3_5MoeVisionPatchMerger):
-    def __init__(self, config, use_postshuffle_norm=False):
+    """Merge vision patches while retaining upstream Ulysses support."""
+
+    def __init__(self, config: Qwen3_5MoeVisionConfig, use_postshuffle_norm: bool = False) -> None:
         super().__init__(config, use_postshuffle_norm=use_postshuffle_norm)
         self.cp_group = None
 
-    def forward(self, x, *, sequence_length=None):
+    def forward(self, x: torch.Tensor, *, sequence_length: int | None = None) -> torch.Tensor:
+        """Normalize and merge patches, gathering across the CP group when set."""
         if self.cp_group is None:
             return super().forward(x)
         gather_sizes = cal_split_sizes(sequence_length, dist.get_world_size(self.cp_group))
@@ -507,84 +562,229 @@ class Qwen3_5MoeVisionPatchMerger(hf.Qwen3_5MoeVisionPatchMerger):
 
 
 class Qwen3_5MoeVisionModel(hf.Qwen3_5MoeVisionModel):
-    """Vision tower that rebuilds blocks with fused rotary attention when configured."""
+    """Vision model using the MM bilinear position interpolation convention."""
 
-    def __init__(self, config):
+    config: Qwen3_5MoeVisionConfig
+
+    def __init__(self, config: Qwen3_5MoeVisionConfig) -> None:
         super().__init__(config)
-        self.blocks = nn.ModuleList([Qwen3_5MoeVisionBlock(config) for _ in range(config.depth)])
-        self.merger = Qwen3_5MoeVisionPatchMerger(config, use_postshuffle_norm=False)
+        self._rotary_takes_hidden_states = len(inspect.signature(self.rotary_pos_emb.forward).parameters) == 2
         self.cp_group = None
+        self.merger = Qwen3_5MoeVisionPatchMerger(config, use_postshuffle_norm=False)
 
-    def forward(self, hidden_states, grid_thw, **kwargs):
-        if self.cp_group is None:
-            return super().forward(hidden_states, grid_thw, **kwargs)
+    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        """Interpolate learned positions for image and video grids.
+
+        Args:
+            grid_thw: Tensor of ``(frames, height, width)`` for each image or video.
+
+        Returns:
+            Position embeddings in merged-patch order and the embedding weight dtype.
+        """
+        grids = grid_thw.tolist()
+        indices = [[] for _ in range(4)]
+        weights = [[] for _ in range(4)]
+        for _, height, width in grids:
+            rows = torch.linspace(0, self.num_grid_per_side - 1, height)
+            columns = torch.linspace(0, self.num_grid_per_side - 1, width)
+            row_floor, column_floor = rows.int(), columns.int()
+            row_ceil = (row_floor + 1).clamp(max=self.num_grid_per_side - 1)
+            column_ceil = (column_floor + 1).clamp(max=self.num_grid_per_side - 1)
+            row_delta, column_delta = rows - row_floor, columns - column_floor
+            row_base = row_floor * self.num_grid_per_side
+            row_ceil_base = row_ceil * self.num_grid_per_side
+            corners = (
+                row_base[:, None] + column_floor[None],
+                row_base[:, None] + column_ceil[None],
+                row_ceil_base[:, None] + column_floor[None],
+                row_ceil_base[:, None] + column_ceil[None],
+            )
+            corner_weights = (
+                (1 - row_delta)[:, None] * (1 - column_delta)[None],
+                (1 - row_delta)[:, None] * column_delta[None],
+                row_delta[:, None] * (1 - column_delta)[None],
+                row_delta[:, None] * column_delta[None],
+            )
+            for corner in range(4):
+                indices[corner].extend(corners[corner].flatten().tolist())
+                weights[corner].extend(corner_weights[corner].flatten().tolist())
+
+        device = self.pos_embed.weight.device
+        index_tensor = torch.tensor(indices, dtype=torch.long, device=device)
+        weight_tensor = torch.tensor(weights, dtype=self.pos_embed.weight.dtype, device=device)
+        positions = self.pos_embed(index_tensor) * weight_tensor[:, :, None]
+        positions = positions[0] + positions[1] + positions[2] + positions[3]
+        positions = positions.split([height * width for _, height, width in grids])
+        merge_size = self.config.spatial_merge_size
+        return torch.cat(
+            [
+                position.repeat(frames, 1)
+                .view(frames, height // merge_size, merge_size, width // merge_size, merge_size, -1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+                for position, (frames, height, width) in zip(positions, grids)
+            ]
+        )
+
+    @hf.merge_with_config_defaults
+    @hf.capture_outputs
+    def forward(
+        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs: Unpack[TransformersKwargs]
+    ) -> hf.BaseModelOutputWithPooling:
+        """Run the HF vision blocks with MM-compatible interpolated positions.
+
+        Args:
+            hidden_states: Flattened input patches.
+            grid_thw: Tensor of ``(frames, height, width)`` for each image or video.
+            **kwargs: Additional arguments forwarded to the HF vision blocks.
+
+        Returns:
+            Unmerged and spatially merged vision features.
+        """
+        position_ids = hf.get_vision_position_ids(grid_thw, self.spatial_merge_size, kwargs=kwargs)
+        cu_seqlens, max_seqlen = hf.get_vision_attention_seqlens(grid_thw, self.config, kwargs=kwargs)
         hidden_states = self.patch_embed(hidden_states)
-
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        hidden_states = hidden_states + pos_embeds
-
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-
-        seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len, -1)
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-
-        sequence_lengths = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cpu()
-        cu_seqlens = sequence_lengths.cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-
-        # MM's pure Ulysses path splits the whole concatenated sequence.
-        rotary_pos_emb = split_tensor_to_group(rotary_pos_emb, self.cp_group, dim=0)
-        split_sizes = cal_split_sizes(seq_len, dist.get_world_size(self.cp_group))
-        hidden_states = split_forward_gather_backward(hidden_states, self.cp_group, dim=0, split_sizes=split_sizes)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        position_embeddings = (emb.cos(), emb.sin())
-        for blk in self.blocks:
-            hidden_states = blk(
+        hidden_states = hidden_states + self.fast_pos_embed_interpolate(grid_thw)
+        seq_length = hidden_states.shape[0]
+        hidden_states = hidden_states.reshape(seq_length, -1)
+        if self._rotary_takes_hidden_states:
+            position_embeddings = self.rotary_pos_emb(hidden_states, position_ids)
+        else:
+            rotary_pos_emb = self.rotary_pos_emb(position_ids).reshape(seq_length, -1)
+            rotary_pos_emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            position_embeddings = (rotary_pos_emb.cos(), rotary_pos_emb.sin())
+        if self.cp_group is not None:
+            split_sizes = cal_split_sizes(seq_length, dist.get_world_size(self.cp_group))
+            hidden_states = split_forward_gather_backward(hidden_states, self.cp_group, dim=0, split_sizes=split_sizes)
+            position_embeddings = tuple(
+                split_tensor_to_group(value, self.cp_group, dim=0) for value in position_embeddings
+            )
+        for block in self.blocks:
+            hidden_states = block(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+        if self.cp_group is None:
+            merged = self.merger(hidden_states)
+        else:
+            merged = self.merger(hidden_states, sequence_length=seq_length)
+            gather_sizes = cal_split_sizes(seq_length // self.spatial_merge_size**2, dist.get_world_size(self.cp_group))
+            merged = gather_forward_split_backward(
+                merged, self.cp_group, dim=0, grad_scale="up", gather_sizes=gather_sizes
+            )
+        return hf.BaseModelOutputWithPooling(last_hidden_state=hidden_states, pooler_output=merged)
 
-        merged_hidden_states = self.merger(hidden_states, sequence_length=seq_len)
 
-        # Aggregate the full merged features.
-        gather_sizes = cal_split_sizes(seq_len // self.spatial_merge_size**2, dist.get_world_size(self.cp_group))
-        merged_hidden_states = gather_forward_split_backward(
-            merged_hidden_states,
-            self.cp_group,
-            dim=0,
-            grad_scale="up",
-            gather_sizes=gather_sizes,
+class Qwen3_5MoeTextModel(hf.Qwen3_5MoeTextModel):
+    """Assemble training components and initialize GDN without replacing parameters."""
+
+    def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
+        super().__init__(config)
+        for index, layer in enumerate(self.layers):
+            if config.layer_types[index] == "linear_attention":
+                layer.linear_attn = Qwen3_5MoeGatedDeltaNet(config, index)
+            else:
+                layer.self_attn = Qwen3_5MoeAttention(config, index)
+            layer.mlp = Qwen3_5MoeSparseMoeBlock(config)
+            layer.mlp.experts = Qwen3_5MoeExperts(config)
+            layer.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            layer.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.cp_group = None
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> hf.BaseModelOutputWithPast:
+        """Shard text inputs for CP and delegate decoder execution to Transformers."""
+        if self.cp_group is not None:
+            if past_key_values is not None or cache_position is not None or use_cache:
+                raise NotImplementedError("Qwen3.5 CP does not support KV cache.")
+            if any(
+                kwargs.get(name) is not None
+                for name in (
+                    "cu_seqlens",
+                    "cu_seq_lens_q",
+                    "cu_seq_lens_k",
+                    "seq_split_lens",
+                )
+            ):
+                raise NotImplementedError("Qwen3.5 CP does not support packed sequences.")
+            if inputs_embeds is None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            if position_ids is None:
+                position_ids = torch.arange(inputs_embeds.size(1), device=inputs_embeds.device).unsqueeze(0)
+                position_ids = position_ids.expand(inputs_embeds.size(0), -1)
+            inputs_embeds, position_ids, attention_mask = shard_fused_sequence_inputs(
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                group=self.cp_group,
+                gather_backward=True,
+            )
+            input_ids, use_cache = None, False
+        return super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            **kwargs,
         )
-        return hf.BaseModelOutputWithPooling(
-            last_hidden_state=hidden_states,
-            pooler_output=merged_hidden_states,
-        )
+
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Module) -> None:
+        """Preserve HF initialization guards and Tensor/DTensor layouts for GDN."""
+        if isinstance(module, hf.Qwen3_5MoeGatedDeltaNet):
+            init.ones_(module.dt_bias)
+            init.copy_(
+                module.A_log,
+                torch.empty_like(module.A_log, dtype=torch.float32).uniform_(0.01, 16).log_(),
+            )
+        else:
+            super()._init_weights(module)
 
 
 class Qwen3_5MoeModel(hf.Qwen3_5MoeModel):
-    """Multimodal wrapper that assembles FSDPTurbo text and vision submodels."""
+    """Use HF's multimodal forward with the training text model and vision attention."""
 
-    def __init__(self, config):
+    def __init__(self, config: hf.Qwen3_5MoeConfig) -> None:
+        # Initialize the HF base before assembling the custom text subtree.
         hf.Qwen3_5MoePreTrainedModel.__init__(self, config)
         self.visual = Qwen3_5MoeVisionModel._from_config(config.vision_config)
         self.language_model = Qwen3_5MoeTextModel._from_config(config.text_config)
         self.rope_deltas = None
+        for block in self.visual.blocks:
+            block.attn = Qwen3_5MoeVisionAttention(config.vision_config)
         self.post_init()
 
 
 @register_model("qwen3_5_moe")
 class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
-    def __init__(self, config):
+    """Qwen3.5 MoE with native HF expert weights and the Turbo forward/loss."""
+
+    def __init__(self, config: hf.Qwen3_5MoeConfig) -> None:
+        """Assemble Turbo components using compute options from the HF text config."""
         hf.Qwen3_5MoePreTrainedModel.__init__(self, config)
         self.model = Qwen3_5MoeModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.cp_group = None
         self.post_init()
 
-    def configure_context_parallel(self, *, cp_group, ulysses_group):
+    def configure_context_parallel(self, *, cp_group: dist.ProcessGroup, ulysses_group: dist.ProcessGroup) -> None:
         """Bind externally created groups to the model's existing CP-aware modules."""
 
         if cp_group is None or ulysses_group is None:
@@ -603,8 +803,8 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
             raise ValueError("Language and vision attention heads must be divisible by the Ulysses group size.")
         self.cp_group = cp_group
         self.model.language_model.cp_group = cp_group
-        for layer in self.model.language_model.layers:
-            if layer.layer_type == "linear_attention":
+        for index, layer in enumerate(self.model.language_model.layers):
+            if text_config.layer_types[index] == "linear_attention":
                 layer.linear_attn.cp_group = cp_group
             else:
                 layer.self_attn.ulysses_group = ulysses_group
@@ -628,8 +828,9 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
         video_grid_thw: torch.LongTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
-        **kwargs,
+        **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | hf.Qwen3_5MoeCausalLMOutputWithPast:
+        """Compute multimodal outputs and the configured LM and router losses."""
         if self.cp_group is not None:
             if getattr(self, "enable_chunk_loss", False) or kwargs.get("output_router_logits", False):
                 raise NotImplementedError("Qwen3.5 CP with chunk loss or router auxiliary loss is not supported.")

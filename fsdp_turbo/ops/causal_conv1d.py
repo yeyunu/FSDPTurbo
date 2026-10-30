@@ -20,8 +20,15 @@ def causal_conv1d(
     cu_seqlens: Optional[torch.Tensor] = None,
     output_final_state: bool = False,
     head_num: int = 1,
-):
-    """Apply a causal depthwise convolution using the active device backend."""
+    implementation: str = 'auto',
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Apply a causal depthwise convolution with the selected backend."""
+    if implementation not in ('auto', 'eager', 'ascendc'):
+        raise ValueError(f'Unsupported causal convolution implementation: {implementation}')
+    device_type = 'cpu' if implementation == 'eager' else x.device.type
+    if implementation == 'ascendc' and device_type != 'npu':
+        raise ValueError('AscendC causal convolution requires NPU tensors.')
+    backend_options = {'implementation': implementation} if device_type == 'npu' else {}
     return dispatch_op(
         'causal_conv1d',
         x,
@@ -33,6 +40,8 @@ def causal_conv1d(
         cu_seqlens,
         output_final_state,
         head_num=head_num,
+        device_type=device_type,
+        **backend_options,
     )
 
 
@@ -43,8 +52,14 @@ def causal_conv1d_update(
     bias: Optional[torch.Tensor] = None,
     residual: Optional[torch.Tensor] = None,
     activation: Optional[str] = None,
-):
-    """Apply an incremental causal convolution and update ``cache`` in place."""
+    implementation: str = 'auto',
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Update the convolution cache, using the eager path when requested."""
+    if implementation not in ('auto', 'eager', 'ascendc'):
+        raise ValueError(f'Unsupported causal convolution implementation: {implementation}')
+    device_type = 'cpu' if implementation == 'eager' else x.device.type
+    if implementation == 'ascendc' and device_type != 'npu':
+        raise ValueError('AscendC causal convolution requires NPU tensors.')
     return dispatch_op(
         'causal_conv1d_update',
         x,
@@ -53,6 +68,7 @@ def causal_conv1d_update(
         bias,
         residual,
         activation,
+        device_type=device_type,
     )
 
 

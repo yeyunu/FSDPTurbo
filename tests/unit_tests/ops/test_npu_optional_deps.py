@@ -20,4 +20,7 @@ def test_core_npu_ops_register_without_optional_linear_attention_deps(monkeypatc
 
     for op in ('permute', 'unpermute', 'grouped_matmul'):
         assert 'npu' in _OPERATOR_REGISTRY[op], f'{op} lost its NPU implementation'
-    assert npu.chunk_gdn_npu is None
+    # GDN selects the AscendC or FLA backend lazily, so importing the package
+    # does not require the optional FLA backend to be installed.
+    assert callable(npu.chunk_gdn_npu)
+    assert _OPERATOR_REGISTRY['chunk_gated_delta_rule']['npu'] is npu.chunk_gdn_npu

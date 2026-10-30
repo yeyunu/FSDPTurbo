@@ -45,8 +45,12 @@ else:
 
 
 @register_op('causal_conv1d', 'npu')
-def causal_conv1d_npu(*args, head_num=1, **kwargs):
+def causal_conv1d_npu(
+    *args: object, head_num: int = 1, implementation: str = 'auto', **kwargs: object
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run causal convolution with the selected NPU implementation."""
+    if implementation == 'ascendc' and _CAUSAL_CONV1D_BACKEND != 'ascendc':
+        raise RuntimeError('AscendC causal convolution requires fla_npu.')
     if _CAUSAL_CONV1D_BACKEND == 'ascendc':
         return _causal_conv1d_impl(*args, head_num=head_num, **kwargs)
     return _causal_conv1d_impl(*args, **kwargs)

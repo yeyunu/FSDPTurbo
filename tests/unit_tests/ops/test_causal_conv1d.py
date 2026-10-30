@@ -87,3 +87,49 @@ def test_causal_conv1d_supports_packed_variable_length_sequences(monkeypatch):
 
     torch.testing.assert_close(output, torch.cat((first_output, second_output), dim=1))
     torch.testing.assert_close(final_state, torch.cat((first_state, second_state), dim=0))
+
+
+def test_causal_conv1d_batched_bfloat16_weight_gradient(monkeypatch):
+    monkeypatch.setattr(torch.accelerator, 'current_accelerator', lambda: torch.device('cpu'))
+    torch.manual_seed(42)
+    inputs = torch.randn(3, 16, 8, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(4, 8, dtype=torch.bfloat16, requires_grad=True)
+    reference_inputs = inputs.detach().clone().requires_grad_()
+    reference_weight = weight.detach().clone().requires_grad_()
+    upstream_gradient = torch.randn_like(inputs)
+
+    output, state = causal_conv1d(inputs, weight, activation='silu')
+    reference = F.conv1d(
+        reference_inputs.transpose(1, 2),
+        reference_weight.transpose(0, 1).unsqueeze(1),
+        padding=3,
+        groups=8,
+    )[:, :, : inputs.shape[1]]
+    reference = F.silu(reference).transpose(1, 2)
+    output.backward(upstream_gradient)
+    reference.backward(upstream_gradient)
+
+    assert state is None
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+    torch.testing.assert_close(inputs.grad, reference_inputs.grad, rtol=0, atol=0)
+    torch.testing.assert_close(weight.grad, reference_weight.grad, rtol=0, atol=0)
+
+
+def test_explicit_backend_selects_eager_and_rejects_ascendc_on_cpu(monkeypatch):
+    import importlib
+    import pytest
+    from types import SimpleNamespace
+
+    module = importlib.import_module('fsdp_turbo.ops.causal_conv1d')
+    calls = []
+    monkeypatch.setattr(module, 'dispatch_op', lambda *args, **kwargs: calls.append(kwargs) or (None, None))
+    simulated_npu = SimpleNamespace(device=SimpleNamespace(type='npu'))
+    module.causal_conv1d(simulated_npu, None, implementation='eager')
+    assert calls[-1]['device_type'] == 'cpu'
+    module.causal_conv1d(simulated_npu, None, implementation='ascendc')
+    assert calls[-1]['device_type'] == 'npu'
+    assert calls[-1]['implementation'] == 'ascendc'
+    with pytest.raises(ValueError, match='requires NPU'):
+        module.causal_conv1d(torch.empty(1), None, implementation='ascendc')
+    with pytest.raises(ValueError, match='Unsupported'):
+        module.causal_conv1d(torch.empty(1), None, implementation='unknown')

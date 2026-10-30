@@ -430,6 +430,11 @@ def _flash_gdn_bwd(
     q_hat=None,
     k_hat=None,
 ):
+    if dht is not None:
+        raise NotImplementedError(
+            "The installed AscendC state-backward kernel ignores final-state gradients (dht); "
+            "use implementation='eager' when the final state participates in autograd."
+        )
     if use_composite_core and is_arch35():
         dq, dk, dv, db, dg, dh0, _, _ = chunk_gated_delta_rule_bwd(
             q_hat,
@@ -453,6 +458,9 @@ def _flash_gdn_bwd(
         if dg.dtype != torch.float32:
             raise ValueError(f"dg current type is {dg.dtype}, should be float32")
         return dq, dk, dv, db, dg, dh0
+
+    if initial_state is not None:
+        raise NotImplementedError("Initial-state gradients require the Ascend 950 composite core.")
 
     # Step-by-step path (non-A5 or non-composite fallback)
     # Triton [B, T, H, D] -> AscendC [B, H, T, D]
@@ -628,6 +636,7 @@ class _ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q_rstd = q_rstd_out
         if k_rstd is None and k_rstd_out is not None:
             k_rstd = k_rstd_out
+        ctx.set_materialize_grads(False)
         ctx.save_for_backward(q, k, v, g, beta, A)
         ctx.q_rstd = q_rstd
         ctx.k_rstd = k_rstd
@@ -707,12 +716,17 @@ def chunk_gdn_ascendc(
     chunk_size: int = 64,
     head_first: bool = False,
     use_composite_core: bool = True,
-    **kwargs,
-):
+    **kwargs: object,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     r"""AscendC GDN entry point.
 
     Expects q/k/v in ``[B, T, H, D]`` (time-first) and g/beta in ``[B, T, H]``.
     Returns ``(o, final_state)`` where o is ``[B, T, H, V]``.
+    Like the MindSpeed-MM AscendC core, final state uses the initial state's
+    dtype when supplied, otherwise FP32.
+    The Ascend 950 composite backward requires a BF16 initial state matching q.
+    Final-state gradients are rejected:
+    the currently supported state-backward kernel ignores its dht argument.
 
     When ``use_composite_core=True`` (default), the fused
     ``chunk_gated_delta_rule_fwd`` AscendC operator is used for the forward

@@ -1,7 +1,11 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """NPU flash attention via ``npu_fusion_attention``.
 
-Query/key/value arrive in **BNSD** layout ``[B, H, S, D]``.
+Query/key/value arrive in **BNSD** layout ``[B, H, S, D]``, or **1TND**
+layout ``[1, T, H, D]`` when ``input_layout="1TND"`` is supplied.
+
+The 1TND path follows MindSpeed-MM: single sequences use BSND, while packed
+sequences use TND with cumulative sequence boundaries.
 
 Mask strategy aligns with MindSpeed-MM:
   - ``is_causal=True``: ``sparse_mode=3`` (built-in causal).  When a 4-D
@@ -82,12 +86,48 @@ def flash_attention_npu(
     is_causal=True,
     **kwargs,
 ):
-    """NPU ``npu_fusion_attention`` path (BNSD layout).
+    """NPU ``npu_fusion_attention`` path for BNSD and 1TND inputs.
 
     Returns output in BSHD ``[B, S, H, D]``.
     """
     if scaling is None:
         scaling = query.shape[-1] ** -0.5
+
+    if kwargs.get("input_layout") == "1TND":
+        import torch_npu
+
+        cu_q = kwargs.get("cu_seq_lens_q")
+        cu_k = kwargs.get("cu_seq_lens_k", cu_q)
+        cu_q = cu_q.tolist() if isinstance(cu_q, torch.Tensor) else cu_q
+        cu_k = cu_k.tolist() if isinstance(cu_k, torch.Tensor) else cu_k
+        head_num = query.shape[2]
+        layout = "TND"
+        if (cu_q is None or len(cu_q) == 2) and (cu_k is None or len(cu_k) == 2):
+            layout = "BSND"
+            cu_q = cu_k = None
+        else:
+            query, key, value = (tensor.squeeze(0) for tensor in (query, key, value))
+
+        atten_mask = attention_mask
+        if atten_mask is None or atten_mask.ndim != 2 or atten_mask.shape[0] != atten_mask.shape[1]:
+            atten_mask = _get_attn_mask(query.device) if is_causal else None
+        attn_output = torch_npu.npu_fusion_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            head_num,
+            layout,
+            pse=None,
+            padding_mask=None,
+            atten_mask=atten_mask,
+            actual_seq_qlen=cu_q,
+            actual_seq_kvlen=cu_k,
+            scale=scaling,
+            keep_prob=1.0 - dropout,
+            inner_precise=0,
+            sparse_mode=3 if is_causal else 0,
+        )[0]
+        return (attn_output.unsqueeze(0) if layout == "TND" else attn_output), None
 
     head_num = query.shape[1]
     cu_seq_lens_q = kwargs.get("cu_seq_lens_q")

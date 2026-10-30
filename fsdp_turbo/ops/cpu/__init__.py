@@ -3,6 +3,7 @@ from fsdp_turbo.ops.cpu.cce_loss import cce_loss_cpu
 from fsdp_turbo.ops.cpu.attn_res import attn_res_cpu
 from fsdp_turbo.ops.cpu.clipped_swiglu import clipped_swiglu_cpu
 from fsdp_turbo.ops.cpu.causal_conv1d import causal_conv1d_cpu, causal_conv1d_update_cpu
+from fsdp_turbo.ops.cpu.gdn import chunk_gdn_cpu, recurrent_gdn_cpu
 from fsdp_turbo.ops.cpu.chunk_kda import chunk_kda_cpu
 from fsdp_turbo.ops.cpu.engram import engram_backward_cpu, engram_forward_cpu, engram_wkv_cpu
 from fsdp_turbo.ops.cpu.fused_attention import npu_fusion_attention_cpu
@@ -34,6 +35,8 @@ __all__ = [
     'causal_conv1d_cpu',
     'causal_conv1d_update_cpu',
     'chunk_kda_cpu',
+    'chunk_gdn_cpu',
+    'recurrent_gdn_cpu',
     'engram_forward_cpu',
     'engram_backward_cpu',
     'engram_wkv_cpu',

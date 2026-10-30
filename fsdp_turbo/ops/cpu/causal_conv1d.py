@@ -74,6 +74,21 @@ def causal_conv1d_cpu(
         raise ValueError("x must be [B, T, D] and weight must be [W, D]")
 
     kernel_size = weight.shape[0]
+    if cu_seqlens is None and initial_state is None and not output_final_state:
+        output = F.conv1d(
+            x.transpose(1, 2),
+            weight.transpose(0, 1).unsqueeze(1),
+            bias=bias,
+            padding=kernel_size - 1,
+            groups=x.shape[-1],
+        )[:, :, : x.shape[1]]
+        if activation in ('silu', 'swish'):
+            output = F.silu(output)
+        output = output.transpose(1, 2)
+        if residual is not None:
+            output = output + residual
+        return output, None
+
     if cu_seqlens is None:
         sequences = [x[batch_index] for batch_index in range(x.shape[0])]
         state_count = x.shape[0]
