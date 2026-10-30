@@ -42,6 +42,13 @@ YAML 的`recompute_plan`只支持模块 pattern 列表。更细的控制可由�
   多个上下文可用`compose_checkpoint_contexts`按序组合。
 - **mxfp8组合**：`FSDPTurbo.apply_recompute_modules`在开启 mxfp8 时负责注入相位切换上下文，
   并在包装前完成模块打标；memory 包不依赖 quantization。
+- **模型侧 replay 上下文注册**：模型若在进程级保存跨层共享状态，可调`register_replay_context(fn)`
+  注册一个「只在反向 replay 窗口内生效」的上下文。注册工厂在**原始前向**接线时被调用一次，
+  它返回的对象必须是可重复进入的（每次重算重新进入），并与 checkpoint 自身的 context_fn 按序嵌套
+  （不替换它，故 mxfp8 相位机与方法级条目仍生效）；`unregister_replay_context(fn)`可注销。
+  DeepSeek-V4.1 的`adapter.py`即以此注册 shared_attn 的重算隔离：工厂在前向时抓取
+  `SharedAttentionRuntime.snapshot()`，replay 期间在私有副本上读写（`publish` 是唯一写入口），
+  退出时恢复 live 状态，见`runtime.py`的`replay_window`。
 - **方法级条目**：`module.pattern.method_name`只包装匹配模块上的同名方法，向 factory 传`None`。
 - **去重与嵌套**：多个 pattern 命中同一模块或方法时只包装一次；`reject_nested=True`时在接线期拒绝
   模块间的祖先/后代嵌套。方法相关的动态嵌套仅告警，需由调用方排除。
@@ -51,3 +58,4 @@ YAML 的`recompute_plan`只支持模块 pattern 列表。更细的控制可由�
 - **与上下文并行（CP）的组合**：重计算与Ulysses CP可同时开启，重计算作用于CP切分后的本rank序列片段，两者互不冲突。
 - **与CPU Offload的组合**：重计算降低激活显存，CPU Offload降低参数/梯度显存，两者叠加可进一步压缩显存峰值，但会增加计算与数据搬运开销。
 - **粒度选择**：建议以Transformer层（`model.layers.{*}`）为重计算单位，逐层开启可在显存与耗时之间取得平衡。全部开启显存最省但耗时增加最多。
+- **跨层共享状态**：模型若在进程级共享跨层状态（如DeepSeek-V4.1的 shared_attn 槽位），开启重计算前必须注册 replay 上下文，且必须在**前向接线时捕获**需要的状态：只暂停 replay 期间的写入并不够——前向结束后槽位已被最后一批 source 覆盖，早先分组的重算仍会读到错版本；同时应隔离 replay 期间的写入并在退出时恢复 live 状态。

@@ -1,3 +1,4 @@
+# Copyright c) 2024 NVIDIA CORPORATION.
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 
 """Packed DeepSeek-V4.1 routed experts compatible with FSDPTurbo EP."""
@@ -210,6 +211,16 @@ class DeepSeekV41Experts(nn.Module):
 
     def _forward_eager(self, hidden_states, topk_indices, topk_weights):
         """Original per-expert arithmetic, also the accuracy reference."""
+        # The per-expert grouping below (unique/where) is data-dependent: under activation
+        # recompute, optimizer updates shift router outputs slightly, so the replayed forward
+        # can group one token differently and the saved-tensor counts diverge (CheckpointError).
+        # Identity hooks keep these data-dependent saves out of the checkpoint's accounting;
+        # the graph itself is identical, so gradients are unaffected.
+        with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
+            return self._forward_eager_impl(hidden_states, topk_indices, topk_weights)
+
+    def _forward_eager_impl(self, hidden_states, topk_indices, topk_weights):
+        """Original per-expert arithmetic, also the accuracy reference."""
         original_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, self.hidden_dim)
         topk_indices = topk_indices.reshape(hidden_states.size(0), -1)
@@ -237,6 +248,17 @@ class DeepSeekV41Experts(nn.Module):
         return output.view(original_shape)
 
     def _forward_grouped(self, hidden_states, topk_indices, topk_weights):
+        """Group projections only; preserve per-expert activation and sum order.
+
+        CPU execution of this private method is useful for structural tests;
+        the public fast path is restricted to supported NPU input dtypes.
+        """
+        # Same data-dependent-grouping hazard as _forward_eager: isolate the saves from
+        # the checkpoint's accounting so replayed groupings cannot desynchronize it.
+        with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
+            return self._forward_grouped_impl(hidden_states, topk_indices, topk_weights)
+
+    def _forward_grouped_impl(self, hidden_states, topk_indices, topk_weights):
         """Group projections only; preserve per-expert activation and sum order.
 
         CPU execution of this private method is useful for structural tests;

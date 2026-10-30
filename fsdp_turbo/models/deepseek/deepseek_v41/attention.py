@@ -158,7 +158,7 @@ class Attention(nn.Module):
             if self.indexer.freqs_cis is None:
                 self.indexer.freqs_cis = self.freqs_cis
             idxs = self.indexer(x, qr, latent, start_pos, offset, attention_mask=attention_mask, cu_seqlens=cu_seqlens)
-        shared_attn.topk_idxs = idxs
+        shared_attn.publish("topk_idxs", idxs)
         return idxs
 
     def _compress_kv(self, x, qr, start_pos, offset, *, attention_mask=None, cu_seqlens=None):
@@ -175,16 +175,16 @@ class Attention(nn.Module):
         )
         if compress_len == 0 and self.training and start_pos == 0:
             # No complete block exists yet, including very short training inputs.
-            shared_attn.compress_kv = x.new_empty(bsz, 0, self.head_dim)
+            compress_kv = shared_attn.publish("compress_kv", x.new_empty(bsz, 0, self.head_dim))
             idxs = self._compress_topk_idxs(
                 x, qr, None, start_pos, offset, 0, attention_mask=attention_mask, cu_seqlens=cu_seqlens
             )
-            return shared_attn.compress_kv, idxs
+            return compress_kv, idxs
         latent = None
         if self.is_kv_source:
             latent = self.compressor(x, start_pos, cu_seqlens=cu_seqlens)
             if not (self.training and start_pos == 0):
-                shared_attn.compress_kv = self.compress_kv_cache
+                shared_attn.publish("compress_kv", self.compress_kv_cache)
         # the indexer needs the latent before RoPE, so it runs before the cache is written
         idxs = self._compress_topk_idxs(
             x, qr, latent, start_pos, offset, compress_len, attention_mask=attention_mask, cu_seqlens=cu_seqlens
@@ -201,11 +201,16 @@ class Attention(nn.Module):
                 )
             latent = apply_rotary_emb(latent, freqs, use_triton_inplace_rope=self.use_triton_inplace_rope)
             if self.training and start_pos == 0:
-                shared_attn.compress_kv = latent
+                # Use the write itself: during a replay the slot holds the captured state, so
+                # re-reading it would return a different (previous-group) tensor.
+                compress_kv = shared_attn.publish("compress_kv", latent)
             else:
                 self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent
-        # read after the write, so this does not depend on the slice aliasing the cache
-        return shared_attn.compress_kv[:bsz, :compress_len], idxs
+                compress_kv = shared_attn.compress_kv
+        else:
+            compress_kv = shared_attn.compress_kv
+        # pylint: disable-next=unsubscriptable-object
+        return compress_kv[:bsz, :compress_len], idxs
 
     def _rope_q_o(self, x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False):
         """RoPE for the large per-layer q/o tensors.

@@ -106,11 +106,13 @@ class Indexer(torch.nn.Module):
                 compressed_start, compressed_end = compressed_slice
                 part_latent = None if latent is None else latent[:, compressed_start:compressed_end]
                 if not self.owns_k:
-                    shared_attn.index_k = full_index_k[:, compressed_start:compressed_end]
+                    # pylint: disable-next=unsubscriptable-object
+                    shared_attn.publish("index_k", full_index_k[:, compressed_start:compressed_end])
                 if self.uses_candidates:
                     if shared_attn.packed_candidates is None:
                         raise RuntimeError("Packed candidate masks were not published by the source layer.")
-                    shared_attn.candidates = shared_attn.packed_candidates[document_index]
+                    # pylint: disable-next=unsubscriptable-object
+                    shared_attn.publish("candidates", shared_attn.packed_candidates[document_index])
                 part_indices = self(
                     x[:, token_start:token_end],
                     qr[:, token_start:token_end],
@@ -125,14 +127,15 @@ class Indexer(torch.nn.Module):
                 if self.is_candidate_source:
                     candidate_parts.append(shared_attn.candidates)
                 if self.owns_k:
+                    # pylint: disable-next=unsubscriptable-object
                     key_parts.append(shared_attn.index_k[:, : compressed_end - compressed_start])
             if self.owns_k:
-                shared_attn.index_k = torch.cat(key_parts, dim=1)
+                shared_attn.publish("index_k", torch.cat(key_parts, dim=1))
             else:
-                shared_attn.index_k = full_index_k
+                shared_attn.publish("index_k", full_index_k)
             if self.is_candidate_source:
-                shared_attn.packed_candidates = candidate_parts
-            shared_attn.candidates = None
+                shared_attn.publish("packed_candidates", candidate_parts)
+            shared_attn.publish("candidates", None)
             return torch.cat(index_parts, dim=1)
 
         # latent is None while a group is still filling up, so there is nothing to publish yet
@@ -146,10 +149,10 @@ class Indexer(torch.nn.Module):
             k = self.k_norm(self.wk(latent))
             k = apply_rotary_emb(k, freqs, use_triton_inplace_rope=self.use_triton_inplace_rope)
             if self.training and start_pos == 0:
-                shared_attn.index_k = k
+                shared_attn.publish("index_k", k)
             else:
                 self.k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k
-                shared_attn.index_k = self.k_cache
+                shared_attn.publish("index_k", self.k_cache)
 
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.index_head_dim))
         q = apply_rotary_emb(
@@ -157,6 +160,7 @@ class Indexer(torch.nn.Module):
             self.freqs_cis[start_pos:end_pos],
             use_triton_inplace_rope=self.use_triton_inplace_rope,
         )
+        # pylint: disable-next=unsubscriptable-object
         index_k = shared_attn.index_k[:bsz, : end_pos // ratio]
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
 
@@ -188,8 +192,8 @@ class Indexer(torch.nn.Module):
             )
             idxs, new_candidates, new_candidate_lengths = fused_lightning_indexer(q, index_k, weights, **indexer_kwargs)
             if self.is_candidate_source:
-                shared_attn.candidate_block_indices = new_candidates
-                shared_attn.candidate_block_length = new_candidate_lengths
+                shared_attn.publish("candidate_block_indices", new_candidates)
+                shared_attn.publish("candidate_block_length", new_candidate_lengths)
             return idxs
 
         index_score = _compute_index_score(q, index_k, weights)
@@ -202,11 +206,15 @@ class Indexer(torch.nn.Module):
             compress_lens = end_pos // ratio
 
         if self.is_candidate_source:
-            shared_attn.candidates = select_candidate_blocks(
-                index_score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size
+            shared_attn.publish(
+                "candidates",
+                select_candidate_blocks(
+                    index_score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size
+                ),
             )
         elif self.uses_candidates:
             # level two: score with our own weights, but only inside the source's candidate blocks
+            # pylint: disable-next=invalid-unary-operand-type
             index_score = index_score.masked_fill(~shared_attn.candidates, -torch.inf)
 
         # top-k by score, re-sorted into position order; unreachable -> -1, rest shifted by offset

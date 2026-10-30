@@ -18,6 +18,101 @@ logger = logging.getLogger(__name__)
 CheckpointContextFn = Callable[[], tuple[AbstractContextManager, AbstractContextManager]]
 CheckpointContextFnFactory = Callable[[Optional[nn.Module]], Optional[CheckpointContextFn]]
 
+ReplayContextFn = Callable[[nn.Module], AbstractContextManager]
+
+_replay_context_fns: List[ReplayContextFn] = []
+
+
+def register_replay_context(fn: ReplayContextFn) -> ReplayContextFn:
+    """Register a context entered around every checkpoint replay.
+
+    Model adapters use this to freeze model-specific state while a source layer's
+    forward is replayed during backward; the context must be a no-op for modules
+    that do not need it. The factory is called during the original forward (so it
+    can capture that moment) and the object it returns is re-entered on every
+    recompute, hence it must support being entered repeatedly. Registering the
+    same factory twice is a no-op.
+
+    Args:
+        fn: Factory receiving the checkpointed module and returning a re-entrant context manager.
+
+    Returns:
+        The same factory, so this can be used as a decorator.
+    """
+    if fn not in _replay_context_fns:
+        _replay_context_fns.append(fn)
+    return fn
+
+
+def unregister_replay_context(fn: ReplayContextFn) -> ReplayContextFn:
+    """Undo :func:`register_replay_context`.
+
+    Args:
+        fn: The factory previously registered.
+
+    Returns:
+        The same factory.
+    """
+    if fn in _replay_context_fns:
+        _replay_context_fns.remove(fn)
+    return fn
+
+
+class _ReplayContext:
+    """Re-entrant context entered around every checkpoint replay.
+
+    Non-reentrant checkpoint calls ``context_fn()`` once during the original
+    forward and keeps the returned replay context in the graph, entering it again
+    for every recompute -- each backward pass over a retained graph included. A
+    generator-based context manager can only be entered once, so this object
+    rebuilds its ``ExitStack`` on every ``__enter__`` and re-enters the contexts
+    captured at forward time; entries are stacked so repeated or nested entries
+    never share or drop an ``ExitStack``.
+    """
+
+    def __init__(self, contexts: List[AbstractContextManager]) -> None:
+        self._contexts = contexts
+        self._entered_stacks: List[ExitStack] = []
+
+    def __enter__(self) -> "_ReplayContext":
+        stack = ExitStack()
+        self._entered_stacks.append(stack)
+        try:
+            for context in self._contexts:
+                stack.enter_context(context)
+        except BaseException as error:
+            self._entered_stacks.pop()
+            stack.__exit__(type(error), error, error.__traceback__)
+            raise
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return self._entered_stacks.pop().__exit__(*exc_info)
+
+
+def _replay_context(module: nn.Module, base_context: Optional[AbstractContextManager] = None) -> _ReplayContext:
+    """Build the context entered around every checkpoint replay of ``module``.
+
+    The registered factories are invoked here, i.e. while checkpoint runs the
+    original forward, so they capture the state of that moment; each recompute
+    then only re-enters the objects returned here, once per replay. Factories
+    registered with :func:`register_replay_context` must therefore return
+    re-entrant context objects. Nothing is entered here, so a factory raising
+    leaks no context.
+
+    Args:
+        module: Checkpointed module handed to every registered factory.
+        base_context: The checkpoint's own replay context (e.g. the MXFP8 phase
+            machine), re-entered inside the registered contexts on every replay.
+
+    Returns:
+        A re-entrant context to enter once per replay.
+    """
+    contexts = [fn(module) for fn in _replay_context_fns]
+    if base_context is not None:
+        contexts.append(base_context)
+    return _ReplayContext(contexts)
+
 
 @dataclass
 class RecomputePlanConfig:
@@ -280,6 +375,17 @@ def recompute_wrapper(
     context_fn = None
     if context_fn_factory is not None:
         context_fn = context_fn_factory(module)
+
+    if _replay_context_fns:
+        base_context_fn = context_fn
+
+        def replay_aware_context_fn():
+            if base_context_fn is None:
+                return nullcontext(), _replay_context(module)
+            forward_context, replay_context = base_context_fn()
+            return forward_context, _replay_context(module, base_context=replay_context)
+
+        context_fn = replay_aware_context_fn
 
     def wrapper(*args, **kwargs):
         if 'past_key_values' in kwargs:

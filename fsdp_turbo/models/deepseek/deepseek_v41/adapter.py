@@ -19,6 +19,7 @@ from fsdp_turbo.memory.chunk_loss.chunk_loss import (
     chunk_loss as compute_chunk_loss,
     fixed_cross_entropy,
 )
+from fsdp_turbo.memory.recompute.recompute import register_replay_context
 from fsdp_turbo.ops.hf32_linear import hf32_linear
 
 from .engram.host_offload_engram import HostOffloadEngram
@@ -40,6 +41,21 @@ def _load_model_args(*, config_path: str | Path | None = None, model_name_or_pat
         raise FileNotFoundError("Provide config_path or a model_name_or_path directory containing config.json.")
     with selected_path.open("r", encoding="utf-8") as config_file:
         return json.load(config_file)
+
+
+@register_replay_context
+def _shared_attn_replay_isolation(module):
+    """Give a checkpoint replay its own copy of the ``shared_attn`` slots.
+
+    The factory runs when the checkpoint is wired, i.e. at the start of ``module``'s forward, so
+    the snapshot holds exactly the slots the preceding source layers published for this module's
+    consumers. On every recompute the replay reads and writes that copy; the live state is put
+    back on exit so earlier layers' backward keeps consuming the tensors it saved. Capturing only
+    at that point is also why the state cannot come from the end of the forward: with several
+    ``kv_source_layers`` groups the slots then belong to the last group.
+    """
+    runtime = reference_model.shared_attn
+    return runtime.replay_window(runtime.snapshot())
 
 
 @dataclass
@@ -178,8 +194,22 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         if model_inputs:
             unsupported_inputs = ", ".join(sorted(model_inputs))
             raise ValueError(f"Unsupported model inputs: {unsupported_inputs}.")
-        if (images is None) != (token_types is None):
-            raise ValueError("images and token_types must be supplied together.")
+        if images is not None:
+            has_image = any(
+                img is not None
+                for sample in images
+                for img in (sample if isinstance(sample, (list, tuple)) else (sample,))
+            )
+            if not has_image and not self.model_args.vision_enabled:
+                # Text-only batch from the multimodal collate path: the collate always
+                # emits an images entry (all-None placeholders). Drop it only while the
+                # vision tower is off: with the tower enabled the reference forward runs
+                # the vision/aligner dummy forward for this entry, which keeps the
+                # collective order identical on ranks whose batch does contain images.
+                # token_types (all TEXT=-1) is still accepted either way.
+                images = None
+        if images is not None and token_types is None:
+            raise ValueError("images requires token_types to locate image spans.")
         if images is not None and not self.model_args.vision_enabled:
             raise ValueError("Image inputs require an enabled DeepSeek vision tower.")
 
