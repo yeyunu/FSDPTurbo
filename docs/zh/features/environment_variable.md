@@ -60,4 +60,4 @@ export ASCEND_LAUNCH_BLOCKING=1
 
 > [!NOTE]
 >
-> 以上NPU性能调优变量为推荐配置，实际效果因模型规模、硬件型号与并行策略而异，建议结合 [性能数据采集](../tools/profiling.md) 进行调优。
+> 以上NPU性能调优变量为推荐配置，实际效果因模型规模、硬件型号与并行策略而异，建议结合[性能数据采集](../tools/profiling.md)进行调优。

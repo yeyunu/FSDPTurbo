@@ -99,12 +99,12 @@ distributed:
 > [!NOTE]
 >
 > Ulysses CP可能需要通过`module_patches`替换模型forward（参考`examples/qwen3_5/config.yaml`）：
-
-```yaml
-module_patches:
-  - target: transformers.models.xxx.modeling_xxx.XxxModel.forward
-    replacement: fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5.qwen3_5_model_forward
-```
+>
+>```yaml
+>module_patches:
+>  - target: transformers.models.xxx.modeling_xxx.XxxModel.forward
+>   replacement: fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5.qwen3_5_model_forward
+>```
 
 若模型的Ulysses forward已内置在modeling类中（如GLM-5.3-Flash），无需任何替换，需在`cp_plan`中显式声明`ulysses_function_patches: []`以通过配置校验；完全不写该键且`ulysses_parallel_size > 1`时校验报错。
 
