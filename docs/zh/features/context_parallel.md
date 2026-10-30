@@ -57,6 +57,16 @@ CP loss兼容不传递额外参数的旧版模型，以及Transformers 5.17起Qw
 
 若提供`shift_labels`，它必须是完整序列上已移位的标签，loss直接pad并切分，不再移位；未提供时沿用完整`labels`的全局移位流程。`num_items_in_batch`支持Tensor或整数，表示全局归一化计数；未提供时沿用CP组内有效token计数。
 
+## KV AllGather下的Engram边界token
+
+DeepSeek-V4.1的KV AllGather CP将序列切成连续等长分片，Q保持本地、KV全局可见。开启Engram时，n-gram哈希需要回看当前位置左侧最多`max_ngram_size - 1`个token。为避免分片边界处的n-gram被截断，每个CP rank不再all-gather完整序列，而是通过一次变长all-to-all：
+
+1. rank r把本分片尾部`max_ngram_size - 1`个token发给rank r+1；
+2. rank 0没有左邻居，其halo用Engram pad token填充——与`NgramHashState`在n-gram回看越过序列起点时的替换值完全一致；
+3. 各rank在`[halo | 本地分片]`上计算哈希，再切回本地行。
+
+该做法与全量all-gather后哈希逐位等价（已在确定性8卡训练中对拍验证），且交换载荷与CP并行度、序列长度无关。KV AllGather CP当前仅支持训练模式下的纯文本等长分片，不支持padding、图像输入与decode缓存。
+
 ## 注意事项
 
 - **序列长度对齐**：`max_seq_length`应能被`ulysses_parallel_size`整除，避免序列切分时出现不等长片段。

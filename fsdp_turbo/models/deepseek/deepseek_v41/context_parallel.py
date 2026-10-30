@@ -43,14 +43,20 @@ def prepare_cp_inputs(
     labels: torch.Tensor | None,
     images: list[list[ImageInput]] | None,
     token_types: torch.Tensor | None,
-) -> tuple[torch.Tensor, slice, torch.Tensor]:
-    """Validate all ranks before data collectives and return Engram IDs plus a local slice.
+) -> tuple[torch.Tensor, slice, torch.Tensor, torch.Tensor | None]:
+    """Validate all ranks before data collectives and return Engram hash inputs.
 
     Text inputs are contiguous shards. Image batches retain complete token IDs,
     image coordinates and token types until fusion in the backbone. Labels are
-    always complete and unshifted. Return full hash inputs, their local row slice
-    and the complete padding mask. Invalid rank metadata raises before collectives
-    that require matching sequence shapes.
+    always complete and unshifted. Returns the hash input ids, the local row
+    slice into their hashed output, the complete padding mask for labels and a
+    hash mask aligned one-to-one with the hash inputs (``None`` when Engram
+    hashing is disabled). Invalid rank metadata raises before collectives that
+    require matching sequence shapes.
+
+    For text shards the hash inputs carry only the left neighbour's n-gram halo
+    instead of the fully gathered sequence, so the hash mask prepends a halo
+    column rather than spanning the complete sequence.
     """
     group = adapter._kv_cp_group
     size, rank = dist.get_world_size(group), dist.get_rank(group)
@@ -98,13 +104,76 @@ def prepare_cp_inputs(
         full_mask = torch.cat(masks, dim=1)
     if not complete and bool((~full_mask[:, :-1] & full_mask[:, 1:]).any()):
         raise ValueError("DeepSeek-V4.1 CP supports right padding only; left padding and mask holes are unsupported.")
-    if adapter.model.engram_hash is None:
-        return input_ids, slice(None), full_mask
+    hash_state = adapter.model.engram_hash
+    if hash_state is None:
+        return input_ids, slice(None), full_mask, None
     if complete:
-        return input_ids, slice(rank * local_length, (rank + 1) * local_length), full_mask
-    ids = [torch.empty_like(input_ids) for _ in range(size)]
-    dist.all_gather(ids, input_ids.contiguous(), group=group)
-    return torch.cat(ids, dim=1), slice(rank * length, (rank + 1) * length), full_mask
+        # Image batches carry the complete token sequence on every rank, so no
+        # boundary exchange is needed; token_types masks out image spans.
+        hash_mask = local_mask if token_types is None else local_mask & (token_types < 0)
+        return input_ids, slice(rank * local_length, (rank + 1) * local_length), full_mask, hash_mask
+    # An n-gram ending in this shard looks back at most max_ngram_size-1 tokens,
+    # so exchanging the left neighbour's halo replaces the full sequence
+    # all-gather. Right-only padding was validated above, which makes every
+    # halo token from the left neighbour valid; rank 0 fills its halo with the
+    # Engram pad id and keeps it unmasked, hashing like a regular pad token.
+    halo_size = hash_state.layout.max_ngram_size - 1
+    hash_input_ids, hash_slice = exchange_cp_hash_inputs_halo(
+        input_ids, halo_size, adapter.model_args.engram_pad_id, group
+    )
+    halo_mask = input_ids.new_ones((batch, halo_size), dtype=torch.bool)
+    hash_mask = torch.cat((halo_mask, local_mask), dim=1)
+    return hash_input_ids, hash_slice, full_mask, hash_mask
+
+
+def exchange_cp_hash_inputs_halo(
+    input_ids: torch.Tensor, halo_size: int, pad_id: int, group: dist.ProcessGroup
+) -> tuple[torch.Tensor, slice]:
+    """Exchange only the left-neighbour boundary tokens before Engram n-gram hashing.
+
+    Each rank sends the last ``halo_size`` ids of its shard to rank + 1 in one
+    variable all-to-all and prepends the received halo to its local shard.
+    Rank 0 has no left neighbour and fills its halo with ``pad_id``, the same
+    token ``NgramHashState`` substitutes when a look-back crosses the start of
+    the sequence. Hashing ``[halo | local]`` and slicing the local rows is
+    therefore bitwise equal to hashing the fully gathered sequence, while the
+    exchanged payload stays at ``halo_size`` ids regardless of CP size.
+
+    Args:
+        input_ids: Local contiguous shard, shape ``[batch, local_length]``.
+        halo_size: Boundary token count, ``max_ngram_size - 1``.
+        pad_id: Raw Engram pad token id; the hash state maps it to its compressed id.
+        group: Contiguous CP group whose group rank equals the shard order.
+
+    Returns:
+        ``(hash_input_ids, local_slice)`` with ``hash_input_ids`` shaped
+        ``[batch, halo_size + local_length]`` and the slice selecting local rows.
+    """
+    size, rank = dist.get_world_size(group), dist.get_rank(group)
+    batch, length = input_ids.shape
+    send_sizes = [0] * size
+    recv_sizes = [0] * size
+    if rank + 1 < size:
+        send_sizes[rank + 1] = batch * halo_size
+    if rank > 0:
+        recv_sizes[rank - 1] = batch * halo_size
+    if rank + 1 < size:
+        boundary = input_ids[:, -halo_size:].reshape(-1).contiguous()
+    else:
+        boundary = input_ids.new_empty(0)
+    halo_flat = input_ids.new_empty(sum(recv_sizes))
+    dist.all_to_all_single(
+        halo_flat,
+        boundary,
+        output_split_sizes=recv_sizes,
+        input_split_sizes=send_sizes,
+        group=group,
+    )
+    if rank == 0:
+        halo = input_ids.new_full((batch, halo_size), pad_id)
+    else:
+        halo = halo_flat.view(batch, halo_size)
+    return torch.cat((halo, input_ids), dim=1), slice(halo_size, halo_size + length)
 
 
 def _topk_by_position(scores: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.Tensor]:

@@ -266,13 +266,12 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         if cp_group is not None:
             from .context_parallel import prepare_cp_inputs
 
-            hash_input_ids, hash_slice, full_mask = prepare_cp_inputs(
+            hash_input_ids, hash_slice, full_mask, hash_mask = prepare_cp_inputs(
                 self, input_ids, position_ids, attention_mask, labels, images, token_types
             )
             if self.model.engram_hash is not None:
                 # Hash complete token history before slicing so CP shard edges
                 # do not become artificial n-gram sequence boundaries.
-                hash_mask = full_mask if token_types is None else full_mask & (token_types < 0)
                 engram_hashes = self.model.engram_hash(hash_input_ids, 0, hash_mask)[:, hash_slice]
             if labels is not None:
                 labels = labels.masked_fill(~full_mask.to(device=labels.device), -100)

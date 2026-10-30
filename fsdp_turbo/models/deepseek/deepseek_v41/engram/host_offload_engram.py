@@ -237,6 +237,7 @@ class HostOffloadEngram(nn.Module):
         self._table_handle = _TableHandle(self)
         self._storage_registered = False
         self._pending_sparse_grad: torch.Tensor | None = None
+        self._deferred_sparse_parts: list[tuple[torch.Tensor, torch.Tensor]] = []
         self._replica_group = None
         self._replica_size = 1
         self._grad_keepalive = torch.zeros((), requires_grad=True)
@@ -309,7 +310,7 @@ class HostOffloadEngram(nn.Module):
         """Sparse reduce-by-key over replicas of one EP-owned shard."""
         if self._replica_group is None:
             return
-        pending = self._pending_sparse_grad
+        pending = self._materialize_pending_sparse_grad()
         if pending is None:
             ids = torch.empty(0, dtype=torch.int64)
             values = torch.empty(0, self.embedding_dim, dtype=torch.float32)
@@ -388,29 +389,49 @@ class HostOffloadEngram(nn.Module):
         )
         return fetched.reshape(*indices.shape, self.embedding_dim)
 
-    def accumulate_sparse_gradient(self, local_ids, grad_rows):
-        ids = local_ids.reshape(-1).to(device="cpu", dtype=torch.int64)
-        values = grad_rows.reshape(-1, self.embedding_dim).to(device="cpu", dtype=torch.float32)
-        if ids.numel() and (int(ids.min()) < 0 or int(ids.max()) >= self.local_rows):
-            raise IndexError("EngramFetchGrad returned a row outside the owner-local shard.")
-        gradient = torch.sparse_coo_tensor(
-            ids.unsqueeze(0),
-            values,
-            self.weight.shape,
-            dtype=torch.float32,
-            check_invariants=False,
-        ).coalesce()
-        self._pending_sparse_grad = (
-            gradient if self._pending_sparse_grad is None else (self._pending_sparse_grad + gradient).coalesce()
-        )
+    def accumulate_sparse_gradient(self, local_ids: torch.Tensor, grad_rows: torch.Tensor) -> None:
+        """Buffer one backward's sparse gradient on its accelerator tensors.
 
-    def pending_sparse_grad(self):
+        The D2H copies, bounds checks and sparse coalescing are deferred to the
+        optimizer/clip consumers so the backward main stream is not stalled
+        waiting for host synchronization. Parts replay in arrival order,
+        preserving the eager coalescing order and therefore the float32
+        reduction result bit for bit.
+        """
+        self._deferred_sparse_parts.append((local_ids.reshape(-1), grad_rows.reshape(-1, self.embedding_dim)))
+
+    def _materialize_pending_sparse_grad(self) -> torch.Tensor | None:
+        """Replay buffered parts through the original eager coalescing path."""
+        for local_ids, grad_rows in self._deferred_sparse_parts:
+            ids = local_ids.to(device="cpu", dtype=torch.int64)
+            values = grad_rows.to(device="cpu", dtype=torch.float32)
+            if ids.numel() and (int(ids.min()) < 0 or int(ids.max()) >= self.local_rows):
+                raise IndexError("EngramFetchGrad returned a row outside the owner-local shard.")
+            gradient = torch.sparse_coo_tensor(
+                ids.unsqueeze(0),
+                values,
+                self.weight.shape,
+                dtype=torch.float32,
+                check_invariants=False,
+            ).coalesce()
+            self._pending_sparse_grad = (
+                gradient if self._pending_sparse_grad is None else (self._pending_sparse_grad + gradient).coalesce()
+            )
+        self._deferred_sparse_parts.clear()
         return self._pending_sparse_grad
 
-    def scale_pending_sparse_grad(self, scale):
-        if self._pending_sparse_grad is None:
+    def pending_sparse_grad(self) -> torch.Tensor | None:
+        """Return the coalesced sparse gradient, materializing buffered parts.
+
+        Returns ``None`` when no backward accumulated rows for this table.
+        """
+        return self._materialize_pending_sparse_grad()
+
+    def scale_pending_sparse_grad(self, scale: float) -> None:
+        """Materialize and multiply the pending sparse gradient by ``scale``."""
+        gradient = self._materialize_pending_sparse_grad()
+        if gradient is None:
             return
-        gradient = self._pending_sparse_grad
         self._pending_sparse_grad = torch.sparse_coo_tensor(
             gradient.indices(),
             gradient.values() * scale,
@@ -418,13 +439,17 @@ class HostOffloadEngram(nn.Module):
             check_invariants=False,
         ).coalesce()
 
-    def clear_sparse_gradient(self):
+    def clear_sparse_gradient(self) -> None:
+        """Drop buffered and materialized gradients and parameter grads."""
         self._pending_sparse_grad = None
+        self._deferred_sparse_parts.clear()
         self.weight.grad = None
         self._grad_keepalive.grad = None
 
-    def mark_sparse_step_complete(self):
+    def mark_sparse_step_complete(self) -> None:
+        """Discard the step's sparse gradient after the sparse optimizer ran."""
         self._pending_sparse_grad = None
+        self._deferred_sparse_parts.clear()
 
     @staticmethod
     def custom_clip_grad_norm(
