@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """RotaryMul with native interleave mode and bounded coefficient caching.
 
 Retain 128-wide kernel alignment without padding when 32/64-wide interleaved
@@ -10,8 +11,10 @@ from collections import OrderedDict
 import torch
 import torch.nn.functional as F
 
+from fsdp_turbo.ops.npu.partial_rotary import cann_partial_rotary
 from fsdp_turbo.ops.registry import register_op
 from fsdp_turbo.ops.cpu.rope import rope_torch
+from fsdp_turbo.utils.device import IS_CANN_OPS_TRANSFORMER_AVAILABLE
 
 try:
     import torch_npu
@@ -39,6 +42,23 @@ def clear_rope_cache():
     _cache_bytes = 0
 
 
+def _cache_store(key, sources, built):
+    """Store ``built`` under ``key``, evicting LRU entries to respect the budget."""
+    global _cache_bytes
+    if key is None:
+        return
+    size = sum(t.numel() * t.element_size() for t in built if t is not None)
+    size += sum(t.untyped_storage().nbytes() for t in sources)
+    if size > _CACHE_MAX_BYTES:
+        return
+    while _COEFFICIENT_CACHE and (
+        len(_COEFFICIENT_CACHE) >= _CACHE_MAX_ENTRIES or _cache_bytes + size > _CACHE_MAX_BYTES
+    ):
+        _cache_bytes -= _COEFFICIENT_CACHE.popitem(last=False)[1][5]
+    _COEFFICIENT_CACHE[key] = (*sources, *built, size)
+    _cache_bytes += size
+
+
 def _coefficient_key(tensor):
     return (
         tensor.device,
@@ -52,7 +72,7 @@ def _coefficient_key(tensor):
 
 @torch.inference_mode(False)
 @torch.no_grad()
-def _build_coefficients(cos, sin, *, interleaved, inverse, grouping=None):
+def _build_coefficients(cos, sin, *, interleaved, inverse, grouping=None, dtype=None):
     # Cache entries first built in inference must still be usable by training
     # autograd, which cannot save inference tensors for backward.
     cos, sin = cos.float(), sin.float()
@@ -71,17 +91,25 @@ def _build_coefficients(cos, sin, *, interleaved, inverse, grouping=None):
             cos, sin = torch.cat([cos] * factor, -1), torch.cat([sin] * factor, -1)
     else:
         cos, sin = torch.cat((cos, cos), -1), torch.cat((sin, sin), -1)
+    if dtype is not None:
+        cos, sin = cos.to(dtype), sin.to(dtype)
     return cos.contiguous(), sin.contiguous(), (-sin).contiguous()
 
 
-def _pack_coefficients(cos, sin, *, interleaved, inverse, grouping=None):
-    global _cache_bytes
+def _pack_coefficients(cos, sin, *, interleaved, inverse, grouping=None, dtype=None):
     key = None
     # No Python cache mutation in compiled graphs. Inference tensors lack a
     # version counter; bypass caching to avoid stale values after mutation.
     if not torch.compiler.is_compiling():
         try:
-            key = (_coefficient_key(cos), _coefficient_key(sin), interleaved, inverse, grouping)
+            key = (
+                _coefficient_key(cos),
+                _coefficient_key(sin),
+                interleaved,
+                inverse,
+                grouping,
+                dtype,
+            )
         except RuntimeError:
             pass
     if key is not None and key in _COEFFICIENT_CACHE:
@@ -93,17 +121,9 @@ def _pack_coefficients(cos, sin, *, interleaved, inverse, grouping=None):
         interleaved=interleaved,
         inverse=inverse,
         grouping=grouping,
+        dtype=dtype,
     )
-    if key is not None:
-        size = sum(t.numel() * t.element_size() for t in (packed_cos, packed_sin, backward_sin))
-        size += cos.untyped_storage().nbytes() + sin.untyped_storage().nbytes()
-        if size <= _CACHE_MAX_BYTES:
-            while _COEFFICIENT_CACHE and (
-                len(_COEFFICIENT_CACHE) >= _CACHE_MAX_ENTRIES or _cache_bytes + size > _CACHE_MAX_BYTES
-            ):
-                _cache_bytes -= _COEFFICIENT_CACHE.popitem(last=False)[1][5]
-            _COEFFICIENT_CACHE[key] = (cos, sin, packed_cos, packed_sin, backward_sin, size)
-            _cache_bytes += size
+    _cache_store(key, (cos, sin), (packed_cos, packed_sin, backward_sin))
     return packed_cos, packed_sin, backward_sin
 
 
@@ -220,6 +240,113 @@ def rope_npu(x, cos, sin, *, interleaved=False, inverse=False):
     if torch_npu is None or not hasattr(torch_npu, "npu_rotary_mul"):
         raise RuntimeError("Fused RoPE requires torch_npu.npu_rotary_mul")
     return _rotary_mul_adapter(x, cos, sin, interleaved=interleaved, inverse=inverse)
+
+
+@torch.inference_mode(False)
+@torch.no_grad()
+def _pack_partial_coefficients(cos, sin, *, inverse, dtype):
+    """``(r1, r2)`` for ``inplace_partial_rotary_mul``, from ``[S, rd/2]`` rows.
+
+    That operator's D axis must equal the rope width, so this layout gets none of
+    the 128-wide alignment padding ``_build_coefficients`` applies for RotaryMul:
+    adjacent pairs only, duplicated to cover each pair. It shares
+    ``_COEFFICIENT_CACHE`` -- same key function (so storage reuse and ``_version``
+    staleness behave identically) and the same byte budget.
+
+    As in ``_build_coefficients``, the cached entries must be ordinary tensors:
+    coefficients first built during inference are later saved for backward when
+    the same model resumes training.
+    """
+    key = None
+    if not torch.compiler.is_compiling():
+        try:
+            key = (_coefficient_key(cos), _coefficient_key(sin), 'partial', inverse, dtype)
+        except RuntimeError:
+            pass
+    if key is not None and key in _COEFFICIENT_CACHE:
+        _COEFFICIENT_CACHE.move_to_end(key)
+        return _COEFFICIENT_CACHE[key][2:4]
+
+    sequence, half = cos.shape
+    cos, sin = cos.float(), sin.float()
+    if inverse:
+        sin = -sin
+    width = 2 * half
+    r1 = cos.repeat_interleave(2, -1).reshape(1, sequence, 1, width).to(dtype).contiguous()
+    r2 = sin.repeat_interleave(2, -1).reshape(1, sequence, 1, width).to(dtype).contiguous()
+    _cache_store(key, (cos, sin), (r1, r2, None))
+    return r1, r2
+
+
+def _broadcast_coefficients(cos, sin, rope_x):
+    """Give ``rope_npu``/``rope_torch`` the broadcast shape the ``rope`` wrapper produces."""
+    if cos.ndim != 2:
+        return cos, sin
+    shape = (1, cos.shape[0], *([1] if rope_x.ndim == 4 else []), cos.shape[-1])
+    return cos.reshape(shape), sin.reshape(shape)
+
+
+def _partial_coefficient_pairs(cos, sin, sequence):
+    """Flatten a supported coefficient layout to one ``[S, rd/2]`` row per position.
+
+    ``partial_rope`` accepts what ``inplace_rope`` accepts: the documented
+    ``[S, rd/2]`` rows and the canonical ``[1, S, 1, rd/2]`` broadcast the ``rope``
+    wrapper builds from them. The fused operators index coefficients by position,
+    so any other broadcastable layout returns None and the caller falls back to
+    the reference, which broadcasts on its own.
+    """
+    if cos.ndim == 2:
+        pairs = cos, sin
+    elif cos.ndim == 4 and cos.shape[0] == 1 and cos.shape[2] == 1:
+        pairs = cos.reshape(cos.shape[1], cos.shape[-1]), sin.reshape(sin.shape[1], sin.shape[-1])
+    else:
+        return None
+    positions = pairs[0].shape[0]
+    if positions == sequence:
+        return pairs
+    if positions == 1:
+        return None
+    raise ValueError(f"cos/sin cover {positions} positions but x has {sequence}.")
+
+
+@register_op("partial_rope", "npu")
+def partial_rope_npu(x, cos, sin, *, inverse=False):
+    """In-place RoPE over the trailing block of q/o, best backend first.
+
+    Order: CANN ``inplace_partial_rotary_mul`` (fused backward, fixed workspace),
+    then RotaryMul, then the Triton inplace kernel, then the eager reference.
+    Kept separate from ``inplace_rope`` on purpose: reordering that one would move
+    every kv/latent/indexer/context-parallel caller with it.  The fused kernels
+    take one ``[S, rd/2]`` coefficient row per position, so a layout they cannot
+    index by position (see ``_partial_coefficient_pairs``) skips them and is
+    broadcast by the reference instead.
+    """
+    rotary_dim = 2 * cos.shape[-1]
+    rope_x = x[..., -rotary_dim:]
+    pairs = _partial_coefficient_pairs(cos, sin, rope_x.shape[1])
+
+    if pairs is not None and IS_CANN_OPS_TRANSFORMER_AVAILABLE and x.is_contiguous():
+        r1, r2 = _pack_partial_coefficients(*pairs, inverse=inverse, dtype=x.dtype)
+        return cann_partial_rotary(x, r1, r2, rotary_dim)
+
+    if torch_npu is not None and hasattr(torch_npu, "npu_rotary_mul"):
+        coeff_cos, coeff_sin = _broadcast_coefficients(cos, sin, rope_x)
+        x[..., -rotary_dim:] = rope_npu(rope_x, coeff_cos, coeff_sin, interleaved=True, inverse=inverse)
+        return x
+
+    if pairs is not None and triton_inplace_rope is not None and x.is_contiguous():
+        rows_cos, rows_sin = pairs
+        if inverse:
+            rows_sin = -rows_sin
+        x4 = x if x.ndim == 4 else x.unsqueeze(-2)
+        cos4 = rows_cos.expand(x4.size(0), x4.size(1), rows_cos.size(-1)).contiguous()
+        sin4 = rows_sin.expand(x4.size(0), x4.size(1), rows_sin.size(-1)).contiguous()
+        rotated = triton_inplace_rope(x4, cos4, sin4)
+        return rotated if x.ndim == 4 else rotated.squeeze(-2)
+
+    coeff_cos, coeff_sin = _broadcast_coefficients(cos, sin, rope_x)
+    x[..., -rotary_dim:] = rope_torch(rope_x, coeff_cos, coeff_sin, interleaved=True, inverse=inverse)
+    return x
 
 
 @register_op("inplace_rope", "npu")

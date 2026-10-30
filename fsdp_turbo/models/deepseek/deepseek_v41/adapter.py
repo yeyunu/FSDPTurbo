@@ -346,6 +346,7 @@ def build_deepseek_v41_model(
     use_fused_clipped_swiglu: bool = False,
     use_triton_inplace_rope: bool = False,
     use_fused_vision_flash_attn: bool = False,
+    use_fused_partial_rotary: bool = False,
     use_fused_engram: bool = False,
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
     chunk_loss: bool = False,
@@ -371,6 +372,7 @@ def build_deepseek_v41_model(
         use_fused_clipped_swiglu=use_fused_clipped_swiglu,
         use_triton_inplace_rope=use_triton_inplace_rope,
         use_fused_vision_flash_attn=use_fused_vision_flash_attn,
+        use_fused_partial_rotary=use_fused_partial_rotary,
         use_fused_engram=use_fused_engram,
     )
     return _build_deepseek_v41_model(

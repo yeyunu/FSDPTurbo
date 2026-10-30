@@ -48,6 +48,8 @@ class ModelConfig:
     # over the trailing rotary block on NPU.
     use_triton_inplace_rope: bool = False
     use_fused_vision_flash_attn: bool = False
+    # Use CANN InplacePartialRotaryMul/Grad for the large per-layer q/o RoPE.
+    use_fused_partial_rotary: bool = False
     # Fuse the Engram n-gram memory gating via the PyPTO-Pro kernels on Ascend950DT.
     use_fused_engram: bool = False
     # DeepSeek-V4.1 head projection precision; cross entropy remains FP32.
@@ -470,6 +472,8 @@ class FSDPTurboConfig:
             raise ValueError("model.use_fused_clipped_swiglu must be a boolean.")
         if not isinstance(self.model.use_triton_inplace_rope, bool):
             raise ValueError("model.use_triton_inplace_rope must be a boolean.")
+        if not isinstance(self.model.use_fused_partial_rotary, bool):
+            raise ValueError("model.use_fused_partial_rotary must be a boolean.")
         if self.model.head_compute_dtype not in ("fp32", "bf16", "hf32"):
             raise ValueError("model.head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
         if not isinstance(self.model.attn_implementation, str) or not self.model.attn_implementation:
@@ -670,6 +674,7 @@ class FSDPTurboConfig:
                     self.model.use_fused_clipped_swiglu,
                     self.model.use_triton_inplace_rope,
                     self.model.use_fused_vision_flash_attn,
+                    self.model.use_fused_partial_rotary,
                 )
             ):
                 raise ValueError("DeepSeek-V4.1 CP requires all fused flags and Triton RoPE disabled.")

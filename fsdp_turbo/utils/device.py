@@ -34,6 +34,15 @@ if IS_TRITON_AVAILABLE:
         IS_TRITON_ASCEND_KERNELS_AVAILABLE = False
 
 
+IS_CANN_OPS_TRANSFORMER_AVAILABLE = False
+try:
+    from cann_ops_transformer import ops as _cann_ops
+
+    IS_CANN_OPS_TRANSFORMER_AVAILABLE = hasattr(_cann_ops, "inplace_partial_rotary_mul")
+except Exception:
+    IS_CANN_OPS_TRANSFORMER_AVAILABLE = False
+
+
 IS_MINDSPEED_OPS_AVAILABLE = False
 try:
     import mindspeed_ops  # noqa: F401

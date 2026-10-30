@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Configuration fields for the DeepSeek-V4.1 reference architecture."""
 
 from dataclasses import dataclass
@@ -72,6 +73,8 @@ class ModelArgs:
     use_triton_inplace_rope: bool = False
     # Use CANN FlashAttentionScore/FlashAttentionScoreGrad in the vision tower.
     use_fused_vision_flash_attn: bool = False
+    # Use CANN InplacePartialRotaryMul/Grad for the large per-layer q/o RoPE.
+    use_fused_partial_rotary: bool = False
     # Run the Engram wkv gating through the fused PyPTO-Pro kernels (NPU).
     use_fused_engram: bool = False
     lightning_indexer_page_size: int = 128

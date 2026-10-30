@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Differentiable PyTorch RoPE reference; also usable on accelerators."""
 
 import torch
@@ -49,3 +50,15 @@ def inplace_rope_cpu(
     out = x.clone()
     out[..., -rotary_dim:] = rotated
     return out
+
+
+@register_op("partial_rope", "cpu")
+def partial_rope_cpu(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Device-agnostic fallback for ``partial_rope``; the reference semantics."""
+    return inplace_rope_cpu(x, cos, sin, interleaved=True, inverse=inverse, inplace=True)

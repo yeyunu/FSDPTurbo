@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 from __future__ import annotations
 
 import argparse
@@ -139,6 +140,7 @@ class DeepseekV41Trainer(BaseTrainer):
             use_fused_clipped_swiglu=self.config.model.use_fused_clipped_swiglu,
             use_triton_inplace_rope=self.config.model.use_triton_inplace_rope,
             use_fused_vision_flash_attn=(self.config.model.use_fused_vision_flash_attn),
+            use_fused_partial_rotary=self.config.model.use_fused_partial_rotary,
             use_fused_engram=self.config.model.use_fused_engram,
             head_compute_dtype=self.config.model.head_compute_dtype,
             chunk_loss=self.config.memory.chunk_loss,

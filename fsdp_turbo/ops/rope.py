@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Device-dispatched RoPE over an explicitly selected rotary subspace."""
 
 import torch
@@ -109,4 +110,22 @@ def inplace_rope(
     )
 
 
-__all__ = ["rope", "inplace_rope"]
+def partial_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Rotate the trailing rope block of q/o in place, on the best backend available.
+
+    Equivalent to ``inplace_rope(x, cos, sin, interleaved=True, inverse=inverse,
+    inplace=True)`` but with its own backend order, so tuning q/o cannot move the
+    path taken by kv/latent/indexer/context-parallel callers. NPU tries the CANN
+    operator, then RotaryMul, the Triton inplace kernel and the eager reference;
+    other devices use ``ops/cpu/rope.py``.
+    """
+    return dispatch_op("partial_rope", x, cos, sin, inverse=inverse)
+
+
+__all__ = ["rope", "inplace_rope", "partial_rope"]

@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 # ============================================================
 # DeepSeek-V4.1-Flash Text Training Configuration
 # ============================================================
@@ -26,6 +27,10 @@ model:
   use_triton_inplace_rope: true
   # Use CANN FlashAttn/FlashAttnGrad for full bidirectional vision attention.
   use_fused_vision_flash_attn: true
+  # Use CANN InplacePartialRotaryMul/Grad for the large per-layer q/o RoPE.
+  # cos/sin become bf16 (the operator needs the input dtype), ~0.6% relative
+  # change against the fp32 complex path -- A/B the loss curve before enabling.
+  use_fused_partial_rotary: false
   # Fuse the Engram n-gram memory gating via the PyPTO-Pro kernels (Ascend950DT);
   # falls back to eager torch when pypto_pro is unavailable.
   use_fused_engram: false

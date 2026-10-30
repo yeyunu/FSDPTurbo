@@ -1,3 +1,4 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Sliding-window and compressed sparse attention for DeepSeek-V4.1."""
 
 from functools import lru_cache
@@ -6,6 +7,8 @@ import torch
 from torch import nn
 
 from fsdp_turbo.ops.sparse_attention import indexed_sparse_attention
+from fsdp_turbo.ops.rope import partial_rope
+from fsdp_turbo.utils.device import IS_CANN_OPS_TRANSFORMER_AVAILABLE
 
 from .compressor import Compressor
 from .context_parallel import compute_context_parallel_attention
@@ -56,6 +59,9 @@ class Attention(nn.Module):
         self.head_dim = args.head_dim
         self.rope_head_dim = args.rope_head_dim
         self.use_triton_inplace_rope = args.use_triton_inplace_rope
+        # Only fuse when the operator is importable, so a config that enables it
+        # on a machine without cann_ops_transformer degrades to the reference path.
+        self.use_fused_partial_rotary = args.use_fused_partial_rotary and IS_CANN_OPS_TRANSFORMER_AVAILABLE
         self.nope_head_dim = args.head_dim - args.rope_head_dim
         self.n_groups = args.o_groups
         self.n_local_groups = self.n_groups
@@ -201,6 +207,18 @@ class Attention(nn.Module):
         # read after the write, so this does not depend on the slice aliasing the cache
         return shared_attn.compress_kv[:bsz, :compress_len], idxs
 
+    def _rope_q_o(self, x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False):
+        """RoPE for the large per-layer q/o tensors.
+
+        These two calls dominate: at the V4.1-Flash shapes they carry 128 MiB of
+        fp32/complex temporaries each, and their backward costs 5x the fused
+        kernel. The operator locates the trailing rotary block itself, so the
+        whole tensor is passed, exactly like the reference `apply_rotary_emb`.
+        """
+        if self.use_fused_partial_rotary:
+            return partial_rope(x, freqs_cis.real, freqs_cis.imag, inverse=inverse)
+        return apply_rotary_emb(x, freqs_cis, inverse, use_triton_inplace_rope=self.use_triton_inplace_rope)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -226,7 +244,7 @@ class Attention(nn.Module):
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q = apply_rotary_emb(q, freqs_cis, use_triton_inplace_rope=self.use_triton_inplace_rope)
+        q = self._rope_q_o(q, freqs_cis)
 
         kv, topk_idxs = self._window_kv(x, freqs_cis, start_pos)
         compress_kv = None
@@ -275,7 +293,7 @@ class Attention(nn.Module):
                 q, kv, self.attn_sink, topk_idxs, self.softmax_scale, attention_mask=attention_mask
             )
         o = o.clone()
-        o = apply_rotary_emb(o, freqs_cis, True, use_triton_inplace_rope=self.use_triton_inplace_rope)
+        o = self._rope_q_o(o, freqs_cis, True)
 
         # wo_a is block-diagonal over groups (each projects only its own heads), hence einsum not
         # Linear. convert.py dequantizes it to bf16; an fp8 grouped GEMM would halve the memory.
