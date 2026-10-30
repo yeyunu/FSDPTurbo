@@ -169,7 +169,7 @@ class Glm5NextTextConfig(PreTrainedConfig):
                 for layer_idx in range(self.num_hidden_layers)
             ]
         self.layer_types = [
-            "deepseek_sparse_attention" if layer_type == "full_attention" else layer_type
+            "deepseek_sparse_attention" if layer_type in ("full_attention", "indexed_attention") else layer_type
             for layer_type in self.layer_types
         ]
 

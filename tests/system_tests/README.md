@@ -20,12 +20,15 @@ tests/system_tests/
 │   ├── kimi_k3/                        # Kimi-K3 减层冒烟用例
 │   │   ├── run_test_kimi_k3.sh
 │   │   └── test_kimi_k3.py
-│   └── deepseekv4/                     # DeepSeekV4 CI 基线（5 个可共存特性同时开启）
-│       ├── run_test_deepseekv4.sh      # 启动脚本（torchrun）
-│       ├── test_deepseekv4.py          # 训练循环（含 SwapActivation / SwapOptimizer / ChunkLoss）
-│       ├── config.yaml                 # 合并所有可共存特性的配置
-│       ├── modeling_deepseek_v4.py     # 自定义模型
-│       └── tokenizer -> ...            # 分词器（软链接到 examples）
+│   ├── deepseekv4/                     # DeepSeekV4 CI 基线（5 个可共存特性同时开启）
+│   │    ├── run_test_deepseekv4.sh      # 启动脚本（torchrun）
+│   │    ├── test_deepseekv4.py          # 训练循环（含 SwapActivation / SwapOptimizer / ChunkLoss）
+│   │    ├── config.yaml                 # 合并所有可共存特性的配置
+│   │    ├── modeling_deepseek_v4.py     # 自定义模型
+│   │    └── tokenizer -> ...            # 分词器（软链接到 examples）
+│   ├── glm5.3_flash/                   # GLM-5.3-Flash 减层冒烟用例
+│        ├── run_test_glm5_3_flash.sh
+│        └── test_glm5_3_flash.py
 ├── test_tools/                        # 看护工具
 │   ├── acquire_json.py                # 日志 → JSON 解析器（可命令行直接用）
 │   └── compare_baseline.py            # 解析日志 + 与基线比对（CI 调用）
@@ -34,7 +37,8 @@ tests/system_tests/
     ├── run_test_qwen3_5.json
     ├── run_test_qwen3_5_moe.json
     ├── run_test_kimi_k3.json
-    └── run_test_deepseekv4.json
+    ├── run_test_deepseekv4.json
+    └── run_test_glm5_3_flash.json
 ```
 
 ST 编排逻辑内联在 `ci/MindSpeed_FSDPTurbo_ut.sh` 的 `run_testcase` 函数里（扫描 `model/**/run_test_*.sh`，逐个跑训练 → 有基线则解析+比对，无基线则只测功能跳过比对）。
@@ -105,6 +109,9 @@ ST 编排逻辑内联在 `ci/MindSpeed_FSDPTurbo_ut.sh` 的 `run_testcase` 函�
 | Qwen3.5-MoE | `qwen3.5_moe/run_test_qwen3_5_moe.sh` / `test_qwen3_5_moe.py` | Qwen3.5-35B-A3B | 4 | FSP=4, TP=1, ULYSSES=2, EP=8, EFP=1 | 10 |
 | Kimi-K3 | `kimi_k3/run_test_kimi_k3.sh` / `test_kimi_k3.py` | Kimi-K3 | 4 | FSP=8, TP=1, EP=8, EFP=1 | 10 |
 | DeepSeekV4 | `deepseekv4/run_test_deepseekv4.sh` / `test_deepseekv4.py` | DeepSeekV4-4L | 4 | FSP=8, TP=1, EP=1 | 10 |
+| GLM-5.3-Flash | `glm5.3_flash/run_test_glm5_3_flash.sh` / `test_glm5_3_flash.py` | GLM-5.3-Flash | 4 | FSP=8, TP=1, EP=8 | 10 |
+
+
 
 ### DeepSeekV4 CI 基线用例
 

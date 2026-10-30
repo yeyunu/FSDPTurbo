@@ -85,7 +85,7 @@ pip install triton-ascend==3.2.2 --extra-index-url=https://mirrors.huaweicloud.c
 
 KDA 算子实现依赖 `triton-ascend-kernels` 算子库（`modeling_glm5_next.py` 中的 `chunk_kda` 来自该包），安装步骤如下：
 
-Atlas A2&A3 训练产品安装步骤：
+Atlas A3 训练产品安装步骤：
 
 ```shell
 # 拉取 triton-ascend-kernels 代码仓
@@ -97,16 +97,6 @@ git checkout kda_a3
 pip install -e . --no-build-isolation --no-deps
 cd ..
 ```
-
-950 A5 系列产品安装步骤：
-
-```shell
-# 拉取 triton-ascend-kernels 代码仓
-git clone https://gitcode.com/shenzhaofeng/triton-ascend-kernels.git
-cd triton-ascend-kernels
-
-# 拉取配套分支
-git checkout kda_a5
 
 # 安装
 pip install -e . --no-build-isolation --no-deps
@@ -144,6 +134,14 @@ cd ..
 ```bash
 pip list | grep fla
 ```
+
+
+### 4. 安装 cann-ops-transformer
+git clone https://atomgit.com/cann/ops-transformer.git && cd ops-transformer
+
+bash build.sh --pkg --soc=ascend910_93 -j16  # 全部算子编译
+./build_out/cann-ops-transformer-*linux*.run --install-path=/指定路径
+source指定路径下的set_env.sh
 
 ---
 

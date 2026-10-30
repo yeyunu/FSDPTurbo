@@ -29,7 +29,7 @@ distributed:
 |---|---|
 | `ulysses_parallel_size` | Ulysses上下文并行度 |
 | `kv_allgather_parallel_size` | KV AllGather上下文并行度 |
-| `ulysses_function_patches` | 注意力函数替换列表：`target_functions`指定被替换函数（全限定名），`type`指定替换类型（`full_attention`、`gated_delta_net`等，也支持Callable自定义注意力） |
+| `ulysses_function_patches` | 注意力函数替换列表：`target_functions`指定被替换函数（全限定名），`type`指定替换类型（`full_attention`、`gated_delta_net`等，也支持Callable自定义注意力）。显式设为`[]`表示模型自管理Ulysses forward（如GLM-5.3-Flash，无需替换）；未设置该键且`ulysses_parallel_size > 1`时配置校验报错 |
 | `kv_allgather_function_patches` | KV AllGather场景的函数替换 |
 | `loss_function_patches` | 损失函数替换（如`causal_lm_loss`），保证CP切分后loss正确同步 |
 

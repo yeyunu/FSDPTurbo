@@ -7,27 +7,13 @@ model:
   model_name_or_path: "zai-org/GLM-5.3-flash"
   tokenizer_name_or_path: "zai-org/GLM-5.3-flash"
   torch_dtype: "bf16"
-  # Fused lightning indexer (cann_ops_transformer): on-chip DSA scoring + pool
-  # top-k, replacing the eager [B, S, NH, P] fp32 score tensor (the 32k OOM
-  # source). NPU-only (hard ImportError without the CANN env); the eager path
-  # stays the default on CPU/GPU. INCOMPATIBLE with dsa_implementation: 'sfa'
-  # (the op cannot guarantee an all-valid pool selection, which SFA's packed
-  # indices require) -- use indexer_implementation: 'triton' there instead.
+
   use_fused_lightning_indexer: false
-  # Indexer scoring implementation. 'triton' (lightning_indexer_score) also
-  # avoids the eager [B, S, NH, P] score tensor AND applies the validity gate
-  # on-chip, keeping every packed row dense up to the span that
-  # npu_sparse_flash_attention's backward reads -- required for
-  # dsa_implementation: 'sfa'.
+
   indexer_implementation: "triton"
-  # DSA attention implementation. 'sfa' consumes the indexer's top-k indices
-  # with npu_sparse_flash_attention (no dense [B, S, kv_len] mask, which alone
-  # is 64 GiB at 128k and OOMs); 'dense' builds the mask. Works with Ulysses
-  # CP (the CP wrapper gathers the shared latent and shards only the query).
+
   dsa_implementation: "sfa"
-  # NPU fused-attention dispatch (MLA/DSA text attention and the vision
-  # tower): 1 routes through npu_fusion_attention (BNSD layout), 0 keeps the
-  # bit-exact eager path (loss / grad_norm alignment runs).
+
   npu_fused_attention: 1
 
 # --- Optimizer Configuration ---
@@ -99,7 +85,7 @@ distributed:
   # The Ulysses forwards are built into the modeling classes (Glm5NextModel /
   # Glm5NextTextAttention / Glm5NextTextLinearAttention), so no extra patches
   # are required.
-  ulysses_parallel_size: 1
+  ulysses_parallel_size: 16
   # KCP is disabled by default. To enable it, set this value above 1 and
   # set ulysses_parallel_size to 1 because KCP and Ulysses are mutually exclusive.
   kcp_parallel_size: 1
@@ -149,6 +135,9 @@ distributed:
     # so no attention-side function patches are needed here; only the CP-aware
     # loss (global shift, per-shard logits, global token-count normalisation)
     # is patched.
+    # The explicit empty list is required: config validation rejects Ulysses
+    # without patches unless the model opts out through this key.
+    ulysses_function_patches: []
     loss_function_patches:
       - target_functions:
           - transformers.loss.loss_utils.ForCausalLMLoss

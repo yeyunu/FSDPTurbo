@@ -212,9 +212,10 @@ class TPPlanConfig:
 
 @dataclass
 class CPPlanConfig:
-    """Configure function wrappers; native KV-AllGather models need no patch plan."""
-
-    ulysses_function_patches: List[Dict[str, Any]] = field(default_factory=list)
+    # None means the key is not provided; an explicit empty list opts out of
+    # patching for models whose Ulysses forwards are built into the modeling
+    # classes (validate_cp_config keeps the two cases apart).
+    ulysses_function_patches: Optional[List[Dict[str, Any]]] = None
     kcp_function_patches: List[Dict[str, Any]] = field(default_factory=list)
     kv_allgather_function_patches: List[Dict[str, Any]] = field(default_factory=list)
     loss_function_patches: List[Dict[str, Any]] = field(default_factory=list)
@@ -599,6 +600,10 @@ class FSDPTurboConfig:
                 raise ValueError(f"distributed.{field_name} must be a positive integer; got {size!r}.")
 
         self.distributed.cp_plan = CPPlanConfig() if self.distributed.cp_plan is None else self.distributed.cp_plan
+        # Snapshot before normalization erases the unset/explicit-empty distinction:
+        # an explicit empty ulysses_function_patches opts out for models whose
+        # Ulysses forwards are built into the modeling classes.
+        ulysses_patches_specified = self.distributed.cp_plan.ulysses_function_patches is not None
         for field_name in (
             "ulysses_function_patches",
             "kcp_function_patches",
@@ -703,8 +708,12 @@ class FSDPTurboConfig:
                     "KDA state context parallelism requires micro batch size 1 "
                     f"(data.batch_size == 1); got {self.data.batch_size}."
                 )
-        if ulysses_parallel_size > 1 and not self.distributed.cp_plan.ulysses_function_patches:
-            raise ValueError("distributed.cp_plan.ulysses_function_patches must be set when Ulysses is enabled.")
+        ulysses_patches = self.distributed.cp_plan.ulysses_function_patches
+        if ulysses_parallel_size > 1 and not ulysses_patches and not ulysses_patches_specified:
+            raise ValueError(
+                "distributed.cp_plan.ulysses_function_patches must be set when Ulysses is enabled; "
+                "set it to [] only when the model's Ulysses forwards are built into the modeling classes."
+            )
 
     def validate_ep_config(self) -> None:
         """expert parallelize plan
