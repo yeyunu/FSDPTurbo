@@ -30,6 +30,11 @@ from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as hf
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig, Qwen3_5MoeVisionConfig
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
+from transformers.vision_utils import (
+    get_vision_attention_seqlens,
+    get_vision_interpolation_indices_and_weights,
+    get_vision_position_ids,
+)
 
 from fsdp_turbo.distributed.context_parallel.batch import (
     cal_split_sizes,
@@ -347,7 +352,7 @@ class Qwen3_5MoeExperts(hf.Qwen3_5MoeExperts):
 
 
 class Qwen3_5MoeSparseMoeBlock(hf.Qwen3_5MoeSparseMoeBlock):
-    """Evaluate routed experts before the shared expert, matching MM gradient accumulation."""
+    """Evaluate routed experts before the shared expert."""
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply routed and shared experts and return their combined output."""
@@ -398,7 +403,6 @@ class Qwen3_5MoeVisionAttention(hf.Qwen3_5MoeVisionAttention):
         )
         attention_interface = partial(raw_interface, self)
 
-        # Native HF FA2 expects BHSD rather than MM's custom 1TND layout.
         query_states = query_states.transpose(0, 1).unsqueeze(0)
         key_states = key_states.transpose(0, 1).unsqueeze(0)
         value_states = value_states.transpose(0, 1).unsqueeze(0)
@@ -542,7 +546,7 @@ class Qwen3_5MoeVisionPatchMerger(hf.Qwen3_5MoeVisionPatchMerger):
         if self.cp_group is None:
             return super().forward(x)
         gather_sizes = cal_split_sizes(sequence_length, dist.get_world_size(self.cp_group))
-        # Keep MM's two normalization branches and operation order.
+
         if self.use_postshuffle_norm:
             x = gather_forward_split_backward(x, self.cp_group, dim=0, gather_sizes=gather_sizes)
             x = x.view(-1, self.hidden_size)
@@ -562,8 +566,6 @@ class Qwen3_5MoeVisionPatchMerger(hf.Qwen3_5MoeVisionPatchMerger):
 
 
 class Qwen3_5MoeVisionModel(hf.Qwen3_5MoeVisionModel):
-    """Vision model using the MM bilinear position interpolation convention."""
-
     config: Qwen3_5MoeVisionConfig
 
     def __init__(self, config: Qwen3_5MoeVisionConfig) -> None:
@@ -571,110 +573,46 @@ class Qwen3_5MoeVisionModel(hf.Qwen3_5MoeVisionModel):
         self._rotary_takes_hidden_states = len(inspect.signature(self.rotary_pos_emb.forward).parameters) == 2
         self.cp_group = None
         self.merger = Qwen3_5MoeVisionPatchMerger(config, use_postshuffle_norm=False)
+        self.cp_group = None
 
-    def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Interpolate learned positions for image and video grids.
-
-        Args:
-            grid_thw: Tensor of ``(frames, height, width)`` for each image or video.
-
-        Returns:
-            Position embeddings in merged-patch order and the embedding weight dtype.
-        """
-        grids = grid_thw.tolist()
-        indices = [[] for _ in range(4)]
-        weights = [[] for _ in range(4)]
-        for _, height, width in grids:
-            rows = torch.linspace(0, self.num_grid_per_side - 1, height)
-            columns = torch.linspace(0, self.num_grid_per_side - 1, width)
-            row_floor, column_floor = rows.int(), columns.int()
-            row_ceil = (row_floor + 1).clamp(max=self.num_grid_per_side - 1)
-            column_ceil = (column_floor + 1).clamp(max=self.num_grid_per_side - 1)
-            row_delta, column_delta = rows - row_floor, columns - column_floor
-            row_base = row_floor * self.num_grid_per_side
-            row_ceil_base = row_ceil * self.num_grid_per_side
-            corners = (
-                row_base[:, None] + column_floor[None],
-                row_base[:, None] + column_ceil[None],
-                row_ceil_base[:, None] + column_floor[None],
-                row_ceil_base[:, None] + column_ceil[None],
-            )
-            corner_weights = (
-                (1 - row_delta)[:, None] * (1 - column_delta)[None],
-                (1 - row_delta)[:, None] * column_delta[None],
-                row_delta[:, None] * (1 - column_delta)[None],
-                row_delta[:, None] * column_delta[None],
-            )
-            for corner in range(4):
-                indices[corner].extend(corners[corner].flatten().tolist())
-                weights[corner].extend(corner_weights[corner].flatten().tolist())
-
-        device = self.pos_embed.weight.device
-        index_tensor = torch.tensor(indices, dtype=torch.long, device=device)
-        weight_tensor = torch.tensor(weights, dtype=self.pos_embed.weight.dtype, device=device)
-        positions = self.pos_embed(index_tensor) * weight_tensor[:, :, None]
-        positions = positions[0] + positions[1] + positions[2] + positions[3]
-        positions = positions.split([height * width for _, height, width in grids])
-        merge_size = self.config.spatial_merge_size
-        return torch.cat(
-            [
-                position.repeat(frames, 1)
-                .view(frames, height // merge_size, merge_size, width // merge_size, merge_size, -1)
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
-                for position, (frames, height, width) in zip(positions, grids)
-            ]
+    def forward(self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs) -> hf.BaseModelOutputWithPooling:
+        """Encode patches with upstream vision positions before CP sharding."""
+        if self.cp_group is None:
+            return super().forward(hidden_states, grid_thw, **kwargs)
+        interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+            grid_thw,
+            num_grid_per_side=self.num_grid_per_side,
+            mode=self.interpolation_mode,
+            align_corners=self.interpolation_align_corners,
+            spatial_merge_size=self.spatial_merge_size,
+            kwargs=kwargs,
         )
-
-    @hf.merge_with_config_defaults
-    @hf.capture_outputs
-    def forward(
-        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs: Unpack[TransformersKwargs]
-    ) -> hf.BaseModelOutputWithPooling:
-        """Run the HF vision blocks with MM-compatible interpolated positions.
-
-        Args:
-            hidden_states: Flattened input patches.
-            grid_thw: Tensor of ``(frames, height, width)`` for each image or video.
-            **kwargs: Additional arguments forwarded to the HF vision blocks.
-
-        Returns:
-            Unmerged and spatially merged vision features.
-        """
-        position_ids = hf.get_vision_position_ids(grid_thw, self.spatial_merge_size, kwargs=kwargs)
-        cu_seqlens, max_seqlen = hf.get_vision_attention_seqlens(grid_thw, self.config, kwargs=kwargs)
+        position_ids = get_vision_position_ids(grid_thw, self.spatial_merge_size, kwargs=kwargs)
+        cu_seqlens, max_seqlen = get_vision_attention_seqlens(grid_thw, self.config, kwargs=kwargs)
         hidden_states = self.patch_embed(hidden_states)
-        hidden_states = hidden_states + self.fast_pos_embed_interpolate(grid_thw)
-        seq_length = hidden_states.shape[0]
-        hidden_states = hidden_states.reshape(seq_length, -1)
-        if self._rotary_takes_hidden_states:
-            position_embeddings = self.rotary_pos_emb(hidden_states, position_ids)
-        else:
-            rotary_pos_emb = self.rotary_pos_emb(position_ids).reshape(seq_length, -1)
-            rotary_pos_emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-            position_embeddings = (rotary_pos_emb.cos(), rotary_pos_emb.sin())
-        if self.cp_group is not None:
-            split_sizes = cal_split_sizes(seq_length, dist.get_world_size(self.cp_group))
-            hidden_states = split_forward_gather_backward(hidden_states, self.cp_group, dim=0, split_sizes=split_sizes)
-            position_embeddings = tuple(
-                split_tensor_to_group(value, self.cp_group, dim=0) for value in position_embeddings
-            )
-        for block in self.blocks:
-            hidden_states = block(
+        pos_embeds = (self.pos_embed(interp_indices) * interp_weights[:, :, None]).sum(1)
+        hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype)
+        position_embeddings = self.rotary_pos_emb(hidden_states, position_ids)
+
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(seq_len, -1)
+
+        position_embeddings = tuple(
+            split_tensor_to_group(embedding, self.cp_group, dim=0) for embedding in position_embeddings
+        )
+        split_sizes = cal_split_sizes(seq_len, dist.get_world_size(self.cp_group))
+        hidden_states = split_forward_gather_backward(hidden_states, self.cp_group, dim=0, split_sizes=split_sizes)
+        for blk in self.blocks:
+            hidden_states = blk(
                 hidden_states,
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-        if self.cp_group is None:
-            merged = self.merger(hidden_states)
-        else:
-            merged = self.merger(hidden_states, sequence_length=seq_length)
-            gather_sizes = cal_split_sizes(seq_length // self.spatial_merge_size**2, dist.get_world_size(self.cp_group))
-            merged = gather_forward_split_backward(
-                merged, self.cp_group, dim=0, grad_scale="up", gather_sizes=gather_sizes
-            )
+        merged = self.merger(hidden_states, sequence_length=seq_len)
+        gather_sizes = cal_split_sizes(seq_len // self.spatial_merge_size**2, dist.get_world_size(self.cp_group))
+        merged = gather_forward_split_backward(merged, self.cp_group, dim=0, grad_scale="up", gather_sizes=gather_sizes)
         return hf.BaseModelOutputWithPooling(last_hidden_state=hidden_states, pooler_output=merged)
 
 
@@ -832,8 +770,8 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
     ) -> tuple | hf.Qwen3_5MoeCausalLMOutputWithPast:
         """Compute multimodal outputs and the configured LM and router losses."""
         if self.cp_group is not None:
-            if getattr(self, "enable_chunk_loss", False) or kwargs.get("output_router_logits", False):
-                raise NotImplementedError("Qwen3.5 CP with chunk loss or router auxiliary loss is not supported.")
+            if kwargs.get("output_router_logits", False):
+                raise NotImplementedError("Qwen3.5 CP with router auxiliary loss is not supported.")
             if not isinstance(logits_to_keep, int) or logits_to_keep != 0:
                 raise NotImplementedError("Qwen3.5 CP requires all local logits (logits_to_keep=0).")
             if past_key_values is not None or cache_position is not None or kwargs.get("use_cache", False):
@@ -857,7 +795,10 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
 
         loss = None
         logits = None
-        if getattr(self, "enable_chunk_loss", False):
+        chunk_loss_enabled = getattr(self, "enable_chunk_loss", False) or getattr(
+            self, "enable_dynamic_chunk_loss", False
+        )
+        if chunk_loss_enabled:
             # Training injects either legacy chunk loss or CCE through loss_function.
             # Both consume the full sequence; logits_to_keep only selects returned logits.
             loss = self.lm_head(hidden_states, self.loss_function, labels)
