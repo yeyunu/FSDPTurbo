@@ -3,6 +3,7 @@ import logging
 
 from fsdp_turbo.ops.npu.cce_loss import cce_loss_npu
 from fsdp_turbo.ops.npu.attn_res import attn_res_npu
+from fsdp_turbo.ops.npu.attention_projection import attention_output_projection_npu
 from fsdp_turbo.ops.npu.clipped_swiglu import clipped_swiglu_npu
 from fsdp_turbo.utils.log import log_warning_once
 
@@ -75,6 +76,7 @@ except ImportError:  # depends on the torch_npu wheel exposing the SFA op
     sparse_flash_attention_npu = None
 
 __all__ = [
+    'attention_output_projection_npu',
     'cce_loss_npu',
     'attn_res_npu',
     'clipped_swiglu_npu',

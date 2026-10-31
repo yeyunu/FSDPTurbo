@@ -198,6 +198,7 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 | MhcPreSinkhornPremix/MhcPost 融合算子 | 可选；设置 `model.use_fused_mhc: true` |
 | Clipped SwiGLU 前反向融合 | 可选；设置 `model.use_fused_clipped_swiglu: true`，模型的 `swiglu_limit` 必须大于 0 |
 | Inplace-RoPE Triton算子 | 可选；设置 `model.use_triton_inplace_rope: true` |
+| DeepGEMM attention 输出投影 | 可选；设置 `model.use_deepgemm_wo_a: true`，仅优化 BF16 NPU 的 `wo_a` |
 | 视觉 FlashAttentionScore/Grad 融合算子 | 可选；设置 `model.use_fused_vision_flash_attn: true`；仅支持 BF16 |
 | CSA2 activation recompute | eager CP 路径支持；普通共享缓存路径暂不支持 |
 | Engram BF16 训练、哈希表常驻行切分 | 支持（CPU 两进程已验证） |
@@ -272,6 +273,20 @@ Clipped SwiGLU 融合开关开启后，`swiglu_limit > 0` 的共享专家和路�
 SwiGLU 实现；`swiglu_limit <= 0` 时保留各 dispatcher 的原激活路径。
 MC2 遇到任一源 rank 无输入时，所有 rank 统一回退通用 AllToAll。当前融合路径仅支持 eager
 autograd 一阶梯度，不包含 TorchAir 图模式或高阶梯度。
+
+DeepGEMM 输出投影通过训练 YAML 的 `model` 配置开启：
+
+```yaml
+model:
+  use_deepgemm_wo_a: true
+```
+
+该开关默认为 `false`，关闭时使用原 `torch.einsum`；开启后仅替换 BF16 NPU 的
+`wo_a` 前向和一阶反向，`wo_b` 保持原实现。需要环境中已有兼容的 DeepGEMM Ascend；
+显式开启但未安装 `deep_gemm` 时，在 rank 0 告警一次，并回退到原 `torch.einsum`，
+前反向仍在输入原设备执行。依赖探测结果按进程缓存；首次调用及变长输入可能触发 JIT 编译。
+已安装但依赖损坏、接口不兼容、非 BF16、JIT 或设备执行失败仍报错，不会被回退掩盖。
+该选项不能与当前原生 KV-AllGather CP 同时开启，配置初始化会拒绝该组合。
 
 默认 8 卡拓扑为 `FSDP=4, TP=2, EP=4, expert DP=2`。注意力包含 attention
 sink 与 indexed sparse-attention 的特殊头布局，因此当前保持复制，不能直接套用通用

@@ -374,6 +374,7 @@ def build_deepseek_v41_model(
     use_fused_mhc: bool = False,
     use_fused_clipped_swiglu: bool = False,
     use_triton_inplace_rope: bool = False,
+    use_deepgemm_wo_a: bool = False,
     use_fused_vision_flash_attn: bool = False,
     use_fused_partial_rotary: bool = False,
     use_fused_engram: bool = False,
@@ -386,6 +387,8 @@ def build_deepseek_v41_model(
     Host Engram tables start on meta storage. FSDPTurbo later shards and
     initializes them without allocating their full storage. chunk_loss enables
     the public chunk-loss head, using this adapter's loss_function.
+    ``use_deepgemm_wo_a`` selects the optional BF16 NPU output projection;
+    its DeepGEMM dependency is loaded on the first projection call.
     """
     if model_args is None:
         model_args = build_deepseek_v41_model_args(config_path=config_path, model_name_or_path=model_name_or_path)
@@ -400,6 +403,7 @@ def build_deepseek_v41_model(
         use_fused_mhc=use_fused_mhc,
         use_fused_clipped_swiglu=use_fused_clipped_swiglu,
         use_triton_inplace_rope=use_triton_inplace_rope,
+        use_deepgemm_wo_a=use_deepgemm_wo_a,
         use_fused_vision_flash_attn=use_fused_vision_flash_attn,
         use_fused_partial_rotary=use_fused_partial_rotary,
         use_fused_engram=use_fused_engram,

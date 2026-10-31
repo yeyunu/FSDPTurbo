@@ -6,6 +6,7 @@ from functools import lru_cache
 import torch
 from torch import nn
 
+from fsdp_turbo.ops.attention_projection import attention_output_projection
 from fsdp_turbo.ops.sparse_attention import indexed_sparse_attention
 from fsdp_turbo.ops.rope import partial_rope
 from fsdp_turbo.utils.device import IS_CANN_OPS_TRANSFORMER_AVAILABLE
@@ -68,6 +69,7 @@ class Attention(nn.Module):
         self.window_size = args.window_size
         self.compress_ratio = args.compress_ratios[layer_id]
         self.use_sparse_flash_attn = args.use_sparse_flash_attn
+        self.use_deepgemm_wo_a = args.use_deepgemm_wo_a
         self.eps = args.norm_eps
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
@@ -304,6 +306,6 @@ class Attention(nn.Module):
         # Linear. convert.py dequantizes it to bf16; an fp8 grouped GEMM would halve the memory.
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        o = attention_output_projection(o, wo_a, use_deepgemm=self.use_deepgemm_wo_a)
         x = self.wo_b(o.flatten(2))
         return x

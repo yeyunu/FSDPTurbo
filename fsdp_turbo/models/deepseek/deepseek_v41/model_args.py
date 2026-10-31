@@ -71,6 +71,7 @@ class ModelArgs:
     use_fused_mhc: bool = False
     use_fused_clipped_swiglu: bool = False
     use_triton_inplace_rope: bool = False
+    use_deepgemm_wo_a: bool = False
     # Use CANN FlashAttentionScore/FlashAttentionScoreGrad in the vision tower.
     use_fused_vision_flash_attn: bool = False
     # Use CANN InplacePartialRotaryMul/Grad for the large per-layer q/o RoPE.

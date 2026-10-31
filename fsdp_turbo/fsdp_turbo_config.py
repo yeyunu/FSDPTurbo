@@ -47,6 +47,7 @@ class ModelConfig:
     # Use the triton in-place RoPE kernel (mindspeed_ops.api.triton.inplace_rope)
     # over the trailing rotary block on NPU.
     use_triton_inplace_rope: bool = False
+    use_deepgemm_wo_a: bool = False
     use_fused_vision_flash_attn: bool = False
     # Use CANN InplacePartialRotaryMul/Grad for the large per-layer q/o RoPE.
     use_fused_partial_rotary: bool = False
@@ -477,6 +478,8 @@ class FSDPTurboConfig:
             raise ValueError("model.use_fused_clipped_swiglu must be a boolean.")
         if not isinstance(self.model.use_triton_inplace_rope, bool):
             raise ValueError("model.use_triton_inplace_rope must be a boolean.")
+        if not isinstance(self.model.use_deepgemm_wo_a, bool):
+            raise ValueError("model.use_deepgemm_wo_a must be a boolean.")
         if not isinstance(self.model.use_fused_partial_rotary, bool):
             raise ValueError("model.use_fused_partial_rotary must be a boolean.")
         if self.model.head_compute_dtype not in ("fp32", "bf16", "hf32"):
@@ -682,6 +685,7 @@ class FSDPTurboConfig:
                     self.model.use_fused_mhc,
                     self.model.use_fused_clipped_swiglu,
                     self.model.use_triton_inplace_rope,
+                    self.model.use_deepgemm_wo_a,
                     self.model.use_fused_vision_flash_attn,
                     self.model.use_fused_partial_rotary,
                 )

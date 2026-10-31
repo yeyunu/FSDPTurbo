@@ -22,6 +22,7 @@ CI 门禁用例看护仓库重点模型和基础特性，覆盖冒烟测试场�
 | UT | training | dataloader / trainer | [test_dataloader.py](unit_tests/training/test_dataloader.py) [test_trainer.py](unit_tests/training/test_trainer.py) | Y | | |
 | UT | utils | module patch | [test_patch.py](unit_tests/utils/test_patch.py) | Y | | |
 | UT | ops | Clipped SwiGLU 参考实现、梯度、边界与接口约束；可选真实 NPU 前反向 | [test_clipped_swiglu.py](unit_tests/ops/test_clipped_swiglu.py) | Y | | |
+| UT | ops | DeepGEMM wo_a 可选后端、参考梯度、非连续输入、重算及配置校验；可选真实 NPU 前反向 | [test_attention_projection.py](unit_tests/ops/test_attention_projection.py) | Y | | |
 
 Clipped SwiGLU 用例使用合成张量，无权重或数据集依赖。默认执行 CPU 用例；真实 NPU
 用例需在空闲设备和兼容 CANN 环境中显式设置 `RUN_NPU_TESTS=1`，不属于 CPU UT
@@ -30,6 +31,16 @@ Clipped SwiGLU 用例使用合成张量，无权重或数据集依赖。默认�
 ```bash
 python -m pytest tests/unit_tests/ops/test_clipped_swiglu.py -q
 RUN_NPU_TESTS=1 python -m pytest tests/unit_tests/ops/test_clipped_swiglu.py -q
+```
+
+DeepSeek V4.1 `wo_a` 的参考梯度、空输入、配置校验、三路适配器、非连续输入/梯度、重算及连续更新
+由 UT [test_attention_projection.py](unit_tests/ops/test_attention_projection.py) 看护。
+默认 CPU 执行，并检查开关两种取值均不导入可选后端，以及缺包时告警一次并回退参考实现；
+同时检查损坏的依赖和执行错误仍会传播。
+真实 NPU 三路对照需显式设置 `RUN_NPU_TESTS=1` 并通过全机资源门禁。
+
+```bash
+python -m pytest tests/unit_tests/ops/test_attention_projection.py -q
 ```
 
 ## 开发流程

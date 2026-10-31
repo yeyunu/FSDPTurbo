@@ -1,6 +1,7 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 from fsdp_turbo.ops.cpu.cce_loss import cce_loss_cpu
 from fsdp_turbo.ops.cpu.attn_res import attn_res_cpu
+from fsdp_turbo.ops.cpu.attention_projection import attention_output_projection_cpu
 from fsdp_turbo.ops.cpu.clipped_swiglu import clipped_swiglu_cpu
 from fsdp_turbo.ops.cpu.causal_conv1d import causal_conv1d_cpu, causal_conv1d_update_cpu
 from fsdp_turbo.ops.cpu.gdn import chunk_gdn_cpu, recurrent_gdn_cpu
@@ -29,6 +30,7 @@ from fsdp_turbo.ops.cpu.flash_attn import flash_attention_cpu
 from fsdp_turbo.ops.cpu.rotary_mul import rotary_mul_cpu
 
 __all__ = [
+    'attention_output_projection_cpu',
     'cce_loss_cpu',
     'attn_res_cpu',
     'clipped_swiglu_cpu',

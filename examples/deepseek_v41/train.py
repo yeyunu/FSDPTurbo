@@ -139,6 +139,7 @@ class DeepseekV41Trainer(BaseTrainer):
             use_fused_mhc=self.config.model.use_fused_mhc,
             use_fused_clipped_swiglu=self.config.model.use_fused_clipped_swiglu,
             use_triton_inplace_rope=self.config.model.use_triton_inplace_rope,
+            use_deepgemm_wo_a=self.config.model.use_deepgemm_wo_a,
             use_fused_vision_flash_attn=(self.config.model.use_fused_vision_flash_attn),
             use_fused_partial_rotary=self.config.model.use_fused_partial_rotary,
             use_fused_engram=self.config.model.use_fused_engram,
