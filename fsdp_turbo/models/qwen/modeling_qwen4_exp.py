@@ -39,7 +39,7 @@ Overrides, by concern:
     ``qsa_selected_token_mask`` operator (fsdp_turbo.ops.qsa)
   - Qwen4ExpTextGatedDeltaNet: causal_conv1d + GDN kernels dispatched to
     the fsdp_turbo.ops registry, steered by causal_conv1d_implementation /
-    gdn_implementation / skip_gdn_recompute config knobs
+    gdn_implementation config knobs
   - Qwen4ExpTextNGramEmbeddingCpu: PLE n-gram table CPU offload
   - Qwen4ExpModel: post-fusion Ulysses CP forward (image tokens expand
     the sequence, so sharding happens *after* multimodal fusion)
@@ -102,7 +102,7 @@ from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.ops.rope import rope
 from fsdp_turbo.utils.device import get_accelerator_name
 from fsdp_turbo.utils.log import print_rank
-from fsdp_turbo.utils.model import register_model
+from ..utils import register_model
 
 from fsdp_turbo.modules.mtp import MultiTokenPredictionBlock
 
@@ -328,9 +328,9 @@ class Qwen4ExpTextAttention(HFQwen4ExpTextAttention):
 class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
     """GatedDeltaNet dispatching causal-conv1d and GDN kernels to fsdp_turbo.ops.
 
-    ``causal_conv1d_implementation`` / ``gdn_implementation`` /
-    ``skip_gdn_recompute`` (set by the training entry point) select the
+    ``causal_conv1d_implementation`` / ``gdn_implementation`` select the
     accelerated path; 'eager' keeps the stock computation.
+    The GDN interface does not support ``skip_gdn_recompute=True``.
     """
 
     def __init__(self, config: Qwen4ExpTextConfig, layer_idx: int):
@@ -351,10 +351,9 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
             self.gdn_implementation = "eager"
         if self.causal_conv1d_implementation in ("ascendc",):
             self.causal_conv1d_implementation = "eager"
-        if self.gdn_implementation == "eager" and self.skip_gdn_recompute:
+        if self.skip_gdn_recompute:
             raise NotImplementedError(
-                "gdn_implementation='eager' does not support skip_gdn_recompute; "
-                "use gdn_implementation='triton' or disable skip_gdn_recompute."
+                "The GDN interface does not support skip_gdn_recompute; disable skip_gdn_recompute."
             )
         print_rank(
             logger.info,
@@ -503,10 +502,9 @@ class Qwen4ExpTextGatedDeltaNet(HFQwen4ExpTextGatedDeltaNet):
                 initial_state=recurrent_state,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
-                skip_recompute=self.skip_gdn_recompute,
             )
         else:
-            # eager fallback: same call as triton but without skip_recompute semantics
+            # eager fallback
             core_attn_out, last_recurrent_state = _ft_chunk_gdr(
                 query,
                 key,

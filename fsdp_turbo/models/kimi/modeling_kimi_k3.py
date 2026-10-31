@@ -77,7 +77,7 @@ else:
     flash_attn_varlen_func = None
 from fsdp_turbo.memory.chunk_loss.chunk_loss import calculate_lm_loss, chunk_loss
 from fsdp_turbo.utils.device import get_accelerator_name
-from fsdp_turbo.utils.model import register_model
+from ..utils import register_model
 
 if get_accelerator_name() == "npu":
     import torch_npu

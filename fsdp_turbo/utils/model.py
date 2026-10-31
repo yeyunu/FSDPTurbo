@@ -10,26 +10,6 @@ from fsdp_turbo.utils.log import print_rank
 
 logger = logging.getLogger(__name__)
 
-_MODEL_CLASSES = {}
-
-
-def register_model(model_name):
-    """Class decorator that registers a model class under ``model_name``.
-
-    The class registers itself as soon as its modeling module is imported.
-    """
-
-    def decorator(cls):
-        _MODEL_CLASSES[model_name] = cls
-        return cls
-
-    return decorator
-
-
-def get_model_by_name(name):
-    """Return the model class registered under ``name``, or ``None``."""
-    return _MODEL_CLASSES.get(name)
-
 
 def set_attn_implementation(model_config, attn_implementation: str) -> None:
     """Stamp ``attn_implementation`` onto a (possibly nested) HF config.

@@ -2,6 +2,11 @@
 
 本文档说明如何将一个新的HuggingFace Transformers模型接入FSDPTurbo进行分布式训练。可参考`examples/`下的现有示例（如`qwen3_5`）。
 
+内置模型通过 `fsdp_turbo.models.utils.register_model(...)` 登记，并由 `models/__init__.py` 导入。
+导入 `fsdp_turbo.models.utils.get_model_by_name` 时，Python 会先初始化 `fsdp_turbo.models`，
+完成内置模型注册，因此可直接查询模型类，
+无需使用方先导入模型实现。具体名称与导入依赖见[内置模型自动注册](../features/model_registration.md)。
+
 ## 适配流程总览
 
 1. 准备示例目录：`config.yaml` + `train.py` + `run.sh`

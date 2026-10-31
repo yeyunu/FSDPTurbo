@@ -20,6 +20,7 @@
   - [量化特性]()
     - [量化训练](./features/quantization.md)
   - [其他]()
+    - [内置模型自动注册](./features/model_registration.md)
     - [显存快照](./features/memory_snapshot.md)
     - [环境变量](./features/environment_variable.md)
 - [性能调优](./training/tuning/performance_tuning.md)

@@ -54,7 +54,7 @@ from fsdp_turbo.ops.flash_attn import flash_attention_forward
 from fsdp_turbo.ops.moe import grouped_matmul, permute, swiglu, unpermute
 from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.ops.rotary_mul import rotary_mul
-from fsdp_turbo.utils.model import register_model
+from ...utils import register_model
 
 
 def _attention_interface(implementation: str) -> Callable:
