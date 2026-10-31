@@ -22,7 +22,12 @@ def indexed_sparse_attention_torch(
     layout: str = "BSND",
     cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compute indexed attention with an additional normalization sink."""
+    """Compute indexed attention with a sink and accumulate KV gradients by row.
+
+    Index the original ``[batch, kv_length, head_dim]`` storage directly so
+    backward never materializes a ``[batch, query_length, kv_length, head_dim]``
+    gradient. Repeated selected positions accumulate into the same KV row.
+    """
     del use_sparse_flash_attn, compress_ratio, window_size, cu_seqlens
     if layout.upper() != "BSND":
         raise NotImplementedError("The PyTorch indexed-attention fallback only supports BSND.")
@@ -36,16 +41,12 @@ def indexed_sparse_attention_torch(
         )
         topk_indices = torch.cat((topk_indices, compressed_topk_indices), dim=-1)
         key_value = torch.cat((key_value, compressed_key_value), dim=1)
-    batch_size, sequence_length, _, head_dim = query.shape
+    batch_size, sequence_length = query.shape[:2]
     topk_size = topk_indices.shape[-1]
     topk_indices = topk_indices.to(query.device)
     safe_indices = topk_indices.clamp_min(0).long()
-    expanded_key_value = key_value.unsqueeze(1).expand(-1, sequence_length, -1, -1)
-    selected_key_value = torch.gather(
-        expanded_key_value,
-        2,
-        safe_indices.unsqueeze(-1).expand(batch_size, sequence_length, topk_size, head_dim),
-    )
+    batch_indices = torch.arange(batch_size, device=key_value.device).view(batch_size, 1, 1)
+    selected_key_value = key_value[batch_indices, safe_indices]
     attention_scores = torch.einsum("bshd,bskd->bshk", query, selected_key_value).float() * softmax_scale
     attention_scores = attention_scores.masked_fill(topk_indices.unsqueeze(2) < 0, -torch.inf)
     if attention_mask is not None and key_value.size(1) == attention_mask.size(1):

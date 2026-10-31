@@ -8,7 +8,7 @@ from typing import Optional
 
 import torch
 from torch.distributed import ProcessGroup
-from torch.distributed.device_mesh import init_device_mesh, DeviceMesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.utils.log import print_rank
@@ -61,6 +61,7 @@ class ParallelState(metaclass=Singleton):
     vocab_data_parallel_size: int = 1
 
     device_mesh_map: dict[str, DeviceMesh] = None
+    split_com_groups: bool = False
 
     def __post_init__(self):
         from fsdp_turbo.utils.device import set_accelerator_compatible
@@ -270,42 +271,77 @@ class ParallelState(metaclass=Singleton):
         setattr(self, 'get_{}_rank'.format(mesh_name), types.MethodType(get_rank, self))
         setattr(self, 'get_{}_device_mesh'.format(mesh_name), types.MethodType(get_mesh, self))
 
-    def add_device_mesh_groups(self, mesh_dim_names, mesh_shape):
+    def add_device_mesh_groups(self, mesh_dim_names: tuple[str, ...], mesh_shape: tuple[int, ...]) -> None:
+        """Register a mesh, optionally creating independent groups for its dimensions.
+
+        With split_com_groups enabled, dimensions are created in the same order
+        on every rank. Groups within each dimension are disjoint, allowing
+        member-local initialization. Otherwise use the original DeviceMesh setup.
+        """
         if reduce(lambda a, b: a * b, mesh_shape) != torch.distributed.get_world_size():
             raise AssertionError(
                 f"Mesh groups {mesh_shape}({reduce(lambda a, b: a * b, mesh_shape)}) "
                 f"!= world size({torch.distributed.get_world_size()})"
             )
 
-        device_mesh = init_device_mesh(
-            device_type=get_accelerator_name(), mesh_shape=mesh_shape, mesh_dim_names=mesh_dim_names
-        )
+        device_type = get_accelerator_name()
+        if not self.split_com_groups:
+            device_mesh = init_device_mesh(
+                device_type=device_type, mesh_shape=mesh_shape, mesh_dim_names=mesh_dim_names
+            )
+        else:
+            rank = torch.distributed.get_rank()
+            rank_mesh = torch.arange(torch.distributed.get_world_size(), device='cpu').reshape(mesh_shape)
+            dimension_groups = []
+            for dimension, dimension_size in enumerate(mesh_shape):
+                rank_partitions = rank_mesh.movedim(dimension, -1).reshape(-1, dimension_size).tolist()
+                ranks = next(partition for partition in rank_partitions if rank in partition)
+                dimension_groups.append(
+                    torch.distributed.new_group(
+                        ranks=ranks,
+                        backend=torch.distributed.get_backend(),
+                        use_local_synchronization=True,
+                    )
+                )
+            device_mesh = DeviceMesh.from_group(
+                dimension_groups,
+                device_type=device_type,
+                mesh=rank_mesh,
+                mesh_dim_names=mesh_dim_names,
+            )
+            group_names = ', '.join(
+                f'{name}={group.group_name}' for name, group in zip(mesh_dim_names, dimension_groups)
+            )
+            print_rank(logger.info, f'Created independent mesh groups: {group_names}')
 
         for mesh_name in mesh_dim_names:
             self.device_mesh_map[mesh_name] = device_mesh
             self.add_method(mesh_name)
 
-    def add_sub_device_mesh(self, mesh_dim_names, new_mesh_name, flatten=True):
-        """Register a mesh extracted from an existing device mesh.
+    def add_sub_device_mesh(self, mesh_dim_names: tuple[str, ...], new_mesh_name: str, flatten: bool = True) -> None:
+        """Register a flattened mesh or a view, honoring split_com_groups.
 
         Args:
-            mesh_dim_names: Dimensions of the parent mesh to extract, e.g.
-                ('kvallgather', 'ulysses') or ('edp', 'efsdp').
-            new_mesh_name: Name to register the extracted mesh under.
-            flatten: If True (default), flatten the extracted sub-mesh into a
-                1D mesh and register it on the parent mesh, e.g. the 'cp'
-                all-reduce group. If False, register the sub-mesh as-is and
-                keep its dimensions, e.g. the 2D 'edp_efsdp' mesh for HSDP.
+            mesh_dim_names: Existing dimensions, in their intended rank order.
+            new_mesh_name: Name used to register and access the result.
+            flatten: If True, flatten to a 1D mesh. With split_com_groups enabled,
+                force a fresh process group while retaining the root topology.
+                Otherwise retain the original named dimensions and their groups
+                as a view of the parent topology.
         """
         device_mesh = self.device_mesh_map[mesh_dim_names[0]]
+        sub_mesh = device_mesh[tuple(mesh_dim_names)]
         if flatten:
-            # _flatten returns a new 1D DeviceMesh; it does not modify the
-            # parent mesh, so the returned mesh must be stored instead.
-            self.device_mesh_map[new_mesh_name] = device_mesh[tuple(mesh_dim_names)]._flatten(
-                mesh_dim_name=new_mesh_name
-            )
+            # Keep the root layout for FSDP to concatenate this mesh with EP/TP.
+            # An explicit backend bypasses DeviceMesh's default WORLD-group reuse.
+            flatten_options = {'backend_override': torch.distributed.get_backend()} if self.split_com_groups else {}
+            flattened_mesh = sub_mesh._flatten(mesh_dim_name=new_mesh_name, **flatten_options)
+            self.device_mesh_map[new_mesh_name] = flattened_mesh
+            if self.split_com_groups:
+                group = flattened_mesh.get_group()
+                print_rank(logger.info, f'Created independent flattened group: {new_mesh_name}={group.group_name}')
         else:
-            self.device_mesh_map[new_mesh_name] = device_mesh[tuple(mesh_dim_names)]
+            self.device_mesh_map[new_mesh_name] = sub_mesh
         self.add_method(new_mesh_name)
 
     def update_device_mesh_map(self, device_mesh_map: dict[str, DeviceMesh | ProcessGroup]):

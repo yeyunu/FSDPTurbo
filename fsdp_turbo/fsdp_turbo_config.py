@@ -333,6 +333,8 @@ class DistributedConfig:
     vocab_fully_shard_parallel_size: Optional[int] = None
     vocab_data_parallel_size: int = 1
     vp_plan: VPPlanConfig = None
+    # Give independent parallel dimensions separate communication groups.
+    split_com_groups: bool = False
 
 
 @dataclass
@@ -420,6 +422,8 @@ class FSDPTurboConfig:
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
 
     def __post_init__(self):
+        if not isinstance(self.distributed.split_com_groups, bool):
+            raise ValueError("distributed.split_com_groups must be a boolean.")
         self.validate_model_config()
         self.validate_data_config()
         self.validate_tp_config()
