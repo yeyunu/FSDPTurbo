@@ -2,14 +2,17 @@ import argparse
 import logging
 import os
 import torch
+from transformers import AutoConfig
 
 from fsdp_turbo.fsdp_turbo import FSDPTurbo
 from fsdp_turbo.fsdp_turbo_config import load_config_from_yaml
+from fsdp_turbo.models.qwen import Qwen3_5ForConditionalGeneration
 from fsdp_turbo.training.trainer import BaseTrainer
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.model import (
     convert_model_dtype,
     set_attn_implementation,
+    set_fused_overrides,
     set_num_hidden_layers,
 )
 
@@ -18,15 +21,14 @@ logger = logging.getLogger(__name__)
 
 class Qwen35Trainer(BaseTrainer):
     def build_model(self):
-        from transformers import AutoConfig, AutoModelForImageTextToText
-
         print_rank(logger.info, "> Building Qwen3.5 Model...")
 
         model_config = AutoConfig.from_pretrained(self.config.model.model_name_or_path)
         set_attn_implementation(model_config, self.config.model.attn_implementation)
         set_num_hidden_layers(model_config, self.config.model.num_hidden_layers)
+        set_fused_overrides(model_config, self.config)
 
-        model = AutoModelForImageTextToText.from_pretrained(
+        model = Qwen3_5ForConditionalGeneration.from_pretrained(
             self.config.model.model_name_or_path,
             config=model_config,
             torch_dtype=torch.bfloat16,

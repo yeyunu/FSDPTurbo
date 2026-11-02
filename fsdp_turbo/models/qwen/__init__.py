@@ -1,4 +1,5 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+from .qwen3_5 import Qwen3_5ForConditionalGeneration
 from .qwen3_5_moe import Qwen3_5MoeForConditionalGeneration
 
-__all__ = ['Qwen3_5MoeForConditionalGeneration']
+__all__ = ['Qwen3_5ForConditionalGeneration', 'Qwen3_5MoeForConditionalGeneration']

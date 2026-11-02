@@ -616,21 +616,36 @@ class Qwen3_5MoeVisionModel(hf.Qwen3_5MoeVisionModel):
         return hf.BaseModelOutputWithPooling(last_hidden_state=hidden_states, pooler_output=merged)
 
 
-class Qwen3_5MoeTextModel(hf.Qwen3_5MoeTextModel):
-    """Assemble training components and initialize GDN without replacing parameters."""
+class Qwen3_5MoeDecoderLayer(hf.Qwen3_5MoeDecoderLayer):
+    """Decoder layer that assembles FSDPTurbo attention / GDN / MoE / norm sublayers."""
 
-    def __init__(self, config: Qwen3_5MoeTextConfig) -> None:
-        super().__init__(config)
-        for index, layer in enumerate(self.layers):
-            if config.layer_types[index] == "linear_attention":
-                layer.linear_attn = Qwen3_5MoeGatedDeltaNet(config, index)
-            else:
-                layer.self_attn = Qwen3_5MoeAttention(config, index)
-            layer.mlp = Qwen3_5MoeSparseMoeBlock(config)
-            layer.mlp.experts = Qwen3_5MoeExperts(config)
-            layer.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            layer.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    def __init__(self, config, layer_idx):
+        hf.GradientCheckpointingLayer.__init__(self)
+        self.hidden_size = config.hidden_size
+        self.layer_type = config.layer_types[layer_idx]
+        self.block_type = self.layer_type
+        if self.layer_type == "linear_attention":
+            self.linear_attn = Qwen3_5MoeGatedDeltaNet(config, layer_idx)
+        elif self.layer_type == "full_attention":
+            self.self_attn = Qwen3_5MoeAttention(config, layer_idx)
+        self.mlp = Qwen3_5MoeSparseMoeBlock(config)
+        self.mlp.experts = Qwen3_5MoeExperts(config)
+        self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+
+class Qwen3_5MoeTextModel(hf.Qwen3_5MoeTextModel):
+    """Text model that rebuilds decoder layers and final norm with FSDPTurbo subclasses."""
+
+    def __init__(self, config):
+        hf.Qwen3_5MoePreTrainedModel.__init__(self, config)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
+        self.layers = nn.ModuleList(
+            [Qwen3_5MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = hf.Qwen3_5MoeTextRotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
         self.cp_group = None
         self.post_init()
 

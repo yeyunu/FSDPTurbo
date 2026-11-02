@@ -7,6 +7,9 @@ model:
   model_name_or_path: "Qwen/Qwen3.5-27B"
   tokenizer_name_or_path: "Qwen/Qwen3.5-27B"
   torch_dtype: "bf16"
+  attn_implementation: "flash_attention_2"
+  use_fused_causal_conv1d: true
+  use_fused_gdn: true
 
 # --- Optimizer Configuration ---
 optimizer:
@@ -78,9 +81,9 @@ data:
 
 # --- Distributed Configuration ---
 distributed:
-  fully_shard_parallel_size: 8
+  fully_shard_parallel_size: 16
   tensor_parallel_size: 1
-  ulysses_parallel_size: 2
+  ulysses_parallel_size: 1
 
   # --- FSDP Plan ---
   fsdp_plan:

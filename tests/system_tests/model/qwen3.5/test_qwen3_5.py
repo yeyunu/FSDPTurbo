@@ -28,7 +28,12 @@ from fsdp_turbo.models.qwen.qwen3_5_moe.qwen3_5 import qwen3_5_model_forward
 from fsdp_turbo.training.clip_grads import compute_grad_norm
 from fsdp_turbo.utils.device import set_accelerator_compatible
 from fsdp_turbo.utils.log import print_rank, set_log_level
-from fsdp_turbo.utils.model import init_submodule_weights, set_num_hidden_layers
+from fsdp_turbo.utils.model import (
+    init_submodule_weights,
+    set_attn_implementation,
+    set_fused_overrides,
+    set_num_hidden_layers,
+)
 from fsdp_turbo.utils.random import set_seed
 
 
@@ -81,17 +86,18 @@ def initialization():
 def get_model_tokenizer(config):
     """Build a reduced-layer, randomly-initialized Qwen3.5 model (CI mode).
 
-    Mirrors examples/qwen3_5/train.py ``build_model``: the architecture is taken
-    from ``config.model.model_name_or_path`` (config.json + tokenizer/processor
-    only, no weights), the language decoder is reduced via
+    Mirrors examples/qwen3_5/train.py ``build_model``: the architecture is
+    taken from ``config.model.model_name_or_path`` (config.json +
+    tokenizer/processor only, no weights), the language decoder is reduced via
     ``config.model.num_hidden_layers``, and the model is built on the ``meta``
     device. trainer_with_config then materializes it via ``to_empty`` and
     randomly initializes it via ``_init_weights`` BEFORE FSDPTurbo wrapping.
     The processor is loaded for multimodal data (images + conversations).
     """
     model_config = AutoConfig.from_pretrained(config.model.model_name_or_path)
-    model_config._attn_implementation = "eager"
+    set_attn_implementation(model_config, config.model.attn_implementation)
     set_num_hidden_layers(model_config, config.model.num_hidden_layers)
+    set_fused_overrides(model_config, config)
 
     with torch.device('meta'):
         model = AutoModelForImageTextToText.from_config(model_config, torch_dtype=torch.bfloat16)
@@ -145,6 +151,9 @@ def get_complete_custom_config():
             tokenizer_name_or_path=MODEL_PATH,
             torch_dtype=torch.bfloat16,
             num_hidden_layers=NUM_HIDDEN_LAYERS,
+            attn_implementation="eager",
+            use_fused_causal_conv1d=True,
+            use_fused_gdn=True,
         ),
         distributed=DistributedConfig(
             fully_shard_parallel_size=FULLY_SHARD_PARALLEL_SIZE,
