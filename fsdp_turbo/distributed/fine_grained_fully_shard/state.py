@@ -5,7 +5,7 @@ import functools
 from typing import Any, Optional, NamedTuple
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch.distributed._composable_state import _insert_module_state
 from torch.distributed.device_mesh import _get_device_handle
 from torch.distributed.fsdp._fully_shard._fsdp_common import (
@@ -48,7 +48,7 @@ class FSDPState(PyTorchFSDPState):
     - comm_ctx_index: Supports multiple communication context indices
     - global_comm_ctx: Global communication context list
     """
-    
+
     def init(
         self,
         modules: tuple[nn.Module, ...],
@@ -79,9 +79,7 @@ class FSDPState(PyTorchFSDPState):
             self._pre_forward_hook_handle = hook_module.register_forward_pre_hook(
                 self._pre_forward, prepend=True, with_kwargs=True
             )
-            self._post_forward_hook_handle = hook_module.register_forward_hook(
-                self._post_forward, prepend=False
-            )
+            self._post_forward_hook_handle = hook_module.register_forward_hook(self._post_forward, prepend=False)
             self.hook_module = weakref.ref(hook_module)
         else:
             # Fallback to default behavior if no hook_module is specified
@@ -89,9 +87,7 @@ class FSDPState(PyTorchFSDPState):
                 self._pre_forward_hook_handle = modules[0].register_forward_pre_hook(
                     self._pre_forward, prepend=True, with_kwargs=True
                 )
-                self._post_forward_hook_handle = modules[0].register_forward_hook(
-                    self._post_forward, prepend=False
-                )
+                self._post_forward_hook_handle = modules[0].register_forward_hook(self._post_forward, prepend=False)
             else:
                 hook_handle = _register_group_forward_hooks(
                     modules,
@@ -102,7 +98,7 @@ class FSDPState(PyTorchFSDPState):
                 self._pre_forward_hook_handle = hook_handle
                 self._post_forward_hook_handle = hook_handle
             self.hook_module = weakref.ref(modules[0])
-    
+
     def _init_shared_state(self) -> None:
         """
         Initializes shared state across all FSDP states in the context.
@@ -125,6 +121,9 @@ class FSDPState(PyTorchFSDPState):
                 new_comm_ctx = copy_fsdp_comm_ctx(new_comm_ctx, self._comm_ctx)
                 self.global_comm_ctx.append(new_comm_ctx)
 
+        for comm_ctx in self.global_comm_ctx:
+            comm_ctx.all_reduce_state = None
+
         # Assign the correct comm_ctx to each state based on its index
         for state in self._state_ctx.all_states:
             state._state_ctx = self._state_ctx
@@ -139,9 +138,9 @@ class FSDPState(PyTorchFSDPState):
                 fsdp_param_group.comm_ctx = _comm_ctx
                 setattr(fsdp_param_group, "hook_module", state.hook_module)
                 setattr(fsdp_param_group, "global_comm_ctx", self.global_comm_ctx)
-    
+
     @disable_if_config_true
-    def _post_forward(self, module: nn.Module, input: Any, output: Any) -> Any:
+    def _post_forward(self, module: nn.Module, inputs: Any, output: Any) -> Any:
         """
         Custom post-forward hook.
 
@@ -153,7 +152,7 @@ class FSDPState(PyTorchFSDPState):
         if self._training_state == TrainingState.PRE_BACKWARD:
             return output
         if self._fsdp_param_group:
-            output = self._fsdp_param_group.post_forward(module, input, output)
+            output = self._fsdp_param_group.post_forward(module, inputs, output)
         output = self._register_pre_backward_hook(output)
         self._training_state = TrainingState.IDLE
         # Wait and free ALL-Gather states for ALL global communication contexts
@@ -175,7 +174,7 @@ class FSDPState(PyTorchFSDPState):
                     output,
                 )
         return output
-    
+
     def _root_post_backward_final_callback(self) -> None:
         """
         Custom callback executed after the final backward pass.
@@ -190,10 +189,7 @@ class FSDPState(PyTorchFSDPState):
         with torch.profiler.record_function("FSDP::root_post_backward_callback"):
             for state in self._state_ctx.all_states:
                 fsdp_param_group = state._fsdp_param_group
-                if (
-                    fsdp_param_group
-                    and fsdp_param_group._training_state != TrainingState.POST_BACKWARD
-                ):
+                if fsdp_param_group and fsdp_param_group._training_state != TrainingState.POST_BACKWARD:
                     # Run post-backward in case forward inputs did not require
                     # gradient so the autograd backward did not run
                     fsdp_param_group.post_backward()
@@ -205,9 +201,7 @@ class FSDPState(PyTorchFSDPState):
             if self._state_ctx.is_last_backward:
                 self._comm_ctx.post_forward_order.clear()
                 if self._comm_ctx.reduce_scatter_state is not None:
-                    self._device_handle.current_stream().wait_event(
-                        self._comm_ctx.reduce_scatter_state.event
-                    )
+                    self._device_handle.current_stream().wait_event(self._comm_ctx.reduce_scatter_state.event)
                     self._comm_ctx.reduce_scatter_state = None
 
                 # WAIT FOR ALL GLOBAL COMM CONTEXTS
@@ -216,9 +210,11 @@ class FSDPState(PyTorchFSDPState):
                     for _comm_ctx in self.global_comm_ctx:
                         _comm_ctx.post_forward_order.clear()
                         if _comm_ctx.reduce_scatter_state is not None:
-                            self._device_handle.current_stream().wait_event(
-                                _comm_ctx.reduce_scatter_state.event
-                            )
+                            self._device_handle.current_stream().wait_event(_comm_ctx.reduce_scatter_state.event)
                         _comm_ctx.reduce_scatter_state = None
+                        if _comm_ctx.all_reduce_state is not None:
+                            self._device_handle.current_stream().wait_event(_comm_ctx.all_reduce_state.event)
+                            _comm_ctx.reduce_scatter_stream.wait_event(_comm_ctx.all_reduce_state.event)
+                            _comm_ctx.all_reduce_state = None
 
             self._state_ctx.post_backward_final_callback_queued = False

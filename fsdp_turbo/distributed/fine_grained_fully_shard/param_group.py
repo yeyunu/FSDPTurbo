@@ -153,13 +153,14 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
             self._wait_all_gather_streams_on_event(all_gather_copy_out_event)
         self._all_gather_result = None  # free unless saved in `all_gather_state`
 
-    def post_backward(self, *unused: Any):
+    def post_backward(self, *unused: Any) -> None:
         """
         Custom post-backward logic for gradient reduction and resharding.
 
         Ensures that the current stream waits for Reduce-Scatter events from
         OTHER communication contexts (different hook_modules) before starting
-        its own reduction. This maintains correctness in multi-stream setups.
+        its own reduction. Each communication context retains only its latest
+        AllReduce buffer, with reuse ordered after post-reduction processing.
         """
 
         if not compiled_autograd_enabled():
@@ -197,6 +198,13 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
         if len(fsdp_params_with_grad) == 0:
             return
         with record_function(self._with_fqn("FSDP::post_backward_reduce")):
+            if self.comm_ctx.all_reduce_state is not None:
+                # The buffer is allocated on the RS stream and consumed on the
+                # AllReduce stream. Wait through division/dtype conversion
+                # before returning it to the RS stream's allocator pool.
+                self.comm_ctx.reduce_scatter_stream.wait_event(self.comm_ctx.all_reduce_state.event)
+                self.comm_ctx.all_reduce_state = None
+
             # Wait for local context reduce-scatter
             if self.comm_ctx.reduce_scatter_state is not None:
                 self.device_handle.current_stream().wait_event(self.comm_ctx.reduce_scatter_state.event)
@@ -209,7 +217,7 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
                     comm_ctx.reduce_scatter_state = None
 
             all_reduce_pg = self._all_reduce_process_group if self._is_hsdp else None
-            all_reduce_stream: torch.cuda.Stream
+            all_reduce_stream: torch.Stream
             _all_reduce_hook_stream = getattr(self, "_all_reduce_hook_stream", None)
             if all_reduce_pg is None and _all_reduce_hook_stream is not None:
                 # this means the native HSDP is not enabled,
@@ -276,4 +284,6 @@ class FSDPParamGroup(PyTorchFSDPParamGroup):
             if all_reduce_input is not None:
                 if all_reduce_event is None:
                     raise AssertionError("all_reduce_event cannot be None.")
-                self._all_reduce_state = AllReduceState(all_reduce_input, all_reduce_event)
+                # A per-param-group reference would keep every layer's FP32
+                # buffer alive until finalize_backward. Share one slot instead.
+                self.comm_ctx.all_reduce_state = AllReduceState(all_reduce_input, self._post_reduce_event)

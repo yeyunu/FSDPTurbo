@@ -164,7 +164,14 @@ class DeepseekV41Trainer(BaseTrainer):
             )
         else:
             print_rank(logger.info, "> Initializing local DeepSeek-V4.1 parameter shards...")
-            initialize_deepseek_v41_model(parallel_model.model)
+            initialize_deepseek_v41_model(
+                parallel_model.model,
+                device=(
+                    torch.device("cpu")
+                    if self.config.distributed.fsdp_plan.cpu_offload
+                    else torch.accelerator.current_accelerator()
+                ),
+            )
         return parallel_model
 
     def build_optimizer(self):

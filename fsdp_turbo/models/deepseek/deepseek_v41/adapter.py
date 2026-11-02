@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Literal
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from fsdp_turbo.memory.chunk_loss.chunkloss_lm_head import apply_chunkloss_module
 from fsdp_turbo.memory.chunk_loss.chunk_loss import (
@@ -435,103 +437,163 @@ def _depth_std(layer_id: int, base_std: float) -> float:
     return base_std / math.sqrt(2.0 * (layer_id + 1))
 
 
-def initialize_deepseek_v41_model(model: nn.Module, standard_deviation: float = 0.02) -> None:
-    """Initialize materialized parameters, including DTensor local shards.
+def _materialize_parameters(model: nn.Module, device: torch.device) -> None:
+    """Allocate only meta parameter shards, preserving aliases and all buffers."""
+    materialized_parameters: dict[int, nn.Parameter] = {}
+    for module in model.modules():
+        if isinstance(module, HostOffloadEngram):
+            continue
+        for name, parameter in module.named_parameters(recurse=False, remove_duplicate=False):
+            if not parameter.is_meta:
+                continue
+            parameter_id = id(parameter)
+            if parameter_id not in materialized_parameters:
+                materialized_parameters[parameter_id] = nn.Parameter(
+                    torch.empty_like(parameter, device=device), requires_grad=parameter.requires_grad
+                )
+            module.register_parameter(name, materialized_parameters[parameter_id])
 
-    Deferred host tables initialize themselves when their EP shard is materialized.
+
+@torch.no_grad()
+def _init_weights(
+    module: nn.Module,
+    *,
+    module_name: str,
+    layer_ids: dict[int, int],
+    standard_deviation: float,
+) -> None:
+    """Initialize one module's direct parameters using DeepSeek's sampling rules.
+
+    Module path and owning Block depths select vision/shared-expert rules.
+    Meta parameters and Host Engram storage are left to their allocation owners.
     """
+    if isinstance(module, HostOffloadEngram):
+        # This table owns its row-wise initialization. After parallelism
+        # it may already be materialized on the host, so never overwrite
+        # it through the generic rules below.
+        return
+
+    is_vision_linear = isinstance(module, nn.Linear) and (
+        ".vision." in f".{module_name}." or ".aligner." in f".{module_name}."
+    )
+    is_norm = "norm" in type(module).__name__.lower()
+    for local_name, parameter in module.named_parameters(recurse=False):
+        if parameter.is_meta:
+            continue
+
+        if is_vision_linear:
+            if local_name == "weight":
+                nn.init.kaiming_uniform_(parameter, a=math.sqrt(5))
+            else:
+                bound = 1.0 / math.sqrt(module.in_features)
+                nn.init.uniform_(parameter, -bound, bound)
+        elif local_name in _IMAGE_MARKERS:
+            nn.init.normal_(parameter, mean=0.0, std=1.0)
+        elif is_norm:
+            if local_name == "weight":
+                nn.init.ones_(parameter)
+            else:
+                nn.init.zeros_(parameter)
+        elif local_name in {"q_weight", "k_weight"}:
+            nn.init.ones_(parameter)
+        elif local_name in _MHC_PARAMETERS or local_name == "attn_sink":
+            nn.init.normal_(parameter, mean=0.0, std=standard_deviation)
+        elif isinstance(module, reference_model.ParallelEmbedding):
+            nn.init.normal_(parameter, mean=0.0, std=1.0)
+        elif isinstance(module, reference_model.ParallelHead):
+            output_std = module.dim**-0.5
+            nn.init.trunc_normal_(
+                parameter,
+                mean=0.0,
+                std=output_std,
+                a=-3.0 * output_std,
+                b=3.0 * output_std,
+            )
+        elif isinstance(module, reference_model.DeepSeekV41Experts):
+            depth_std = _depth_std(layer_ids[id(module)], standard_deviation)
+            if local_name == "gate_up_proj":
+                nn.init.normal_(parameter, mean=0.0, std=standard_deviation)
+                if standard_deviation != 0:
+                    local_parameter = parameter
+                    global_row_offset = 0
+                    if isinstance(parameter, DTensor):
+                        local_parameter = parameter.to_local()
+                        _, global_offset = compute_local_shape_and_global_offset(
+                            parameter.shape, parameter.device_mesh, parameter.placements
+                        )
+                        global_row_offset = global_offset[1]
+                    # Scale only the local intersection with the global up half.
+                    global_up_start = parameter.shape[1] // 2
+                    local_up_start = max(global_up_start - global_row_offset, 0)
+                    local_parameter[:, local_up_start:].mul_(depth_std / standard_deviation)
+            else:
+                nn.init.normal_(parameter, mean=0.0, std=depth_std)
+        elif (f"{module_name}.{local_name}" if module_name else local_name).endswith(
+            (".ffn.gate.weight", ".ffn.shared_experts.w2.weight", ".ffn.shared_experts.w3.weight")
+        ):
+            nn.init.normal_(parameter, mean=0.0, std=_depth_std(layer_ids[id(module)], standard_deviation))
+        elif local_name == "weight" or parameter.ndim > 1:
+            nn.init.normal_(parameter, mean=0.0, std=standard_deviation)
+        else:
+            nn.init.zeros_(parameter)
+
+
+def initialize_deepseek_v41_model(
+    model: nn.Module,
+    standard_deviation: float = 0.02,
+    *,
+    device: torch.device | None = None,
+) -> None:
+    """Materialize local parameter shards, then initialize each module's weights.
+
+    After EP/FSDP sharding, pass ``device`` to allocate meta parameters on the
+    compute device, or CPU with CPU Offload. Omit it for an already materialized
+    model. Real buffers and shared parameter aliases are preserved; Host Engram
+    tables own their initialization. Parent-before-child traversal preserves
+    the existing random sampling order for a fixed seed and parallel topology.
+    """
+    if device is not None:
+        _materialize_parameters(model, device)
+
     layer_ids = {
         id(module): layer.layer_id
         for layer in model.modules()
         if isinstance(layer, reference_model.Block)
         for module in layer.modules()
     }
-    with torch.no_grad():
-        for module_name, module in model.named_modules():
-            if isinstance(module, HostOffloadEngram):
-                # This table owns its row-wise initialization. After parallelism
-                # it may already be materialized on the host, so never overwrite
-                # it through the generic rules below.
-                continue
-
-            for local_name, parameter in module.named_parameters(recurse=False):
-                if parameter.is_meta:
-                    continue
-
-                name = f"{module_name}.{local_name}" if module_name else local_name
-                is_vision_linear = isinstance(module, nn.Linear) and (
-                    ".vision." in f".{module_name}." or ".aligner." in f".{module_name}."
-                )
-
-                if is_vision_linear:
-                    if local_name == "weight":
-                        nn.init.kaiming_uniform_(parameter, a=math.sqrt(5))
-                    else:
-                        bound = 1.0 / math.sqrt(module.in_features)
-                        nn.init.uniform_(parameter, -bound, bound)
-                elif local_name in _IMAGE_MARKERS:
-                    nn.init.normal_(parameter, mean=0.0, std=1.0)
-                elif "norm" in type(module).__name__.lower():
-                    if local_name == "weight":
-                        nn.init.ones_(parameter)
-                    else:
-                        nn.init.zeros_(parameter)
-                elif local_name in {"q_weight", "k_weight"}:
-                    nn.init.ones_(parameter)
-                elif local_name in _MHC_PARAMETERS or local_name == "attn_sink":
-                    nn.init.normal_(parameter, mean=0.0, std=standard_deviation)
-                elif isinstance(module, reference_model.ParallelEmbedding):
-                    nn.init.normal_(parameter, mean=0.0, std=1.0)
-                elif isinstance(module, reference_model.ParallelHead):
-                    output_std = module.dim**-0.5
-                    nn.init.trunc_normal_(
-                        parameter,
-                        mean=0.0,
-                        std=output_std,
-                        a=-3.0 * output_std,
-                        b=3.0 * output_std,
-                    )
-                elif isinstance(module, reference_model.DeepSeekV41Experts):
-                    depth_std = _depth_std(layer_ids[id(module)], standard_deviation)
-                    if local_name == "gate_up_proj":
-                        # Initialize the packed, contiguous storage in one pass.  The
-                        # two dim-1 chunks are non-contiguous across experts, making
-                        # separate random fills disproportionately expensive.
-                        nn.init.normal_(parameter, mean=0.0, std=standard_deviation)
-                        if standard_deviation:
-                            _, up = parameter.chunk(2, dim=1)
-                            up.mul_(depth_std / standard_deviation)
-                    else:
-                        nn.init.normal_(parameter, mean=0.0, std=depth_std)
-                elif name.endswith(".ffn.gate.weight") or name.endswith(
-                    (".ffn.shared_experts.w2.weight", ".ffn.shared_experts.w3.weight")
-                ):
-                    nn.init.normal_(parameter, mean=0.0, std=_depth_std(layer_ids[id(module)], standard_deviation))
-                elif local_name == "weight" or parameter.ndim > 1:
-                    nn.init.normal_(parameter, mean=0.0, std=standard_deviation)
-                else:
-                    nn.init.zeros_(parameter)
+    for module_name, module in model.named_modules():
+        _init_weights(
+            module,
+            module_name=module_name,
+            layer_ids=layer_ids,
+            standard_deviation=standard_deviation,
+        )
 
 
-def prepare_deepseek_v41_model_for_fsdp(model: nn.Module, *, device, parameter_dtype: torch.dtype) -> nn.Module:
-    """Materialize a uniform parameter dtype before applying native FSDP.
+def prepare_deepseek_v41_model_for_fsdp(
+    model: nn.Module, *, device: torch.device, parameter_dtype: torch.dtype
+) -> nn.Module:
+    """Defer parameter storage until EP/FSDP has selected each rank's shards.
 
-    The reference architecture intentionally creates a mixture of BF16 and FP32
-    parameters. Native FSDP requires every managed parameter group to have one
-    original dtype, so normalize floating-point parameters here. Buffers are only
-    moved to the accelerator: casting them would corrupt complex RoPE frequencies.
-    FP32-sensitive forward paths cast their operands locally when computing.
+    Call before parallelism and before loading or initializing weights: existing
+    parameter values are discarded. Buffers retain their values and dtypes on
+    ``device``; deferred Host Engram tables keep their own allocation lifecycle.
     """
-    with torch.no_grad():
-        for parameter in model.parameters():
-            if parameter.is_floating_point():
-                parameter.data = parameter.data.to(dtype=parameter_dtype)
-    # Keep deferred Engram tables on meta until FSDPTurbo has its data mesh.
-    # Move each module's own tensors so parent .to() cannot materialize them.
+    meta_parameters: dict[int, nn.Parameter] = {}
     for module in model.modules():
-        if isinstance(module, HostOffloadEngram) and module.weight.is_meta:
+        if isinstance(module, HostOffloadEngram):
             continue
-        module._apply(lambda tensor: tensor.to(device=device), recurse=False)
+        for name, parameter in module.named_parameters(recurse=False, remove_duplicate=False):
+            parameter_id = id(parameter)
+            if parameter_id not in meta_parameters:
+                meta_parameters[parameter_id] = nn.Parameter(
+                    torch.empty_like(parameter, device="meta", dtype=parameter_dtype),
+                    requires_grad=parameter.requires_grad,
+                )
+            module.register_parameter(name, meta_parameters[parameter_id])
+        # Only buffers move to the accelerator. In particular, do not cast
+        # complex RoPE frequencies or discard integer Engram hash constants.
+        module._apply(lambda tensor: tensor if tensor.is_meta else tensor.to(device=device), recurse=False)
     return model
 
 
