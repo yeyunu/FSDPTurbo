@@ -53,7 +53,14 @@ def split_tensor_to_group(tensor, group, dim: int = 1):
     """Return the current rank's contiguous shard from a divisible tensor."""
     dim %= tensor.dim()
     start, end = sequence_parallel_range(tensor.size(dim), group)
-    return tensor.narrow(dim, start, end - start).contiguous()
+    shard = tensor.narrow(dim, start, end - start)
+    if shard.is_contiguous():
+        # A contiguous narrow (e.g. batch=1 split along the sequence dim) is
+        # still a view that pins the complete tensor's storage -- ~15 GiB of
+        # inputs_embeds per rank at 1M tokens with CP=16. Clone to release
+        # the source; non-contiguous narrows keep the contiguous() copy path.
+        return shard.clone()
+    return shard.contiguous()
 
 
 def split_sequence_batch(

@@ -2,12 +2,16 @@
 # Copyright (c) 2025-2026 The Moonshot AI Team DeepSeek-AI and HuggingFace Inc. team. All rights reserved.
 """Post-fusion context-parallel forward for the remote-code Kimi K3 model."""
 
+import functools
+
 import torch
 from transformers.models.llava.modeling_llava import LlavaCausalLMOutputWithPast
 
 from fsdp_turbo.distributed.context_parallel.batch import shard_fused_sequence_inputs
+from fsdp_turbo.distributed.context_parallel.loss import cp_chunk_lm_loss
 from fsdp_turbo.distributed.context_parallel.ulysses.utils import get_ulysses_context
 from fsdp_turbo.distributed.parallel_state import get_parallel_state
+from fsdp_turbo.memory.chunk_loss.chunk_loss import chunk_lm_loss
 
 
 def _get_kimi_k3_cp_context():
@@ -42,6 +46,36 @@ def _mask_labels(labels, attention_mask, ignore_index):
     return labels.masked_fill(attention_mask.to(device=labels.device) == 0, ignore_index)
 
 
+def _cp_chunk_loss_fn(
+    hidden_states: torch.Tensor,
+    head_weight: torch.Tensor,
+    _head_bias: torch.Tensor | None,
+    labels: torch.Tensor,
+    *,
+    group,
+    num_items_in_batch: torch.Tensor | int | None,
+    ignore_index: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Chunked CP loss callable for the FSDP-managed ``lm_head`` forward.
+
+    ``chunkloss_lm_head`` invokes it as ``loss_func(hidden, weight, bias,
+    labels)`` from inside the head's module call, so ``head_weight`` is the
+    FSDP-unsharded parameter and the head gradient goes through FSDP's
+    reduce-scatter hooks instead of being reconstructed locally.
+    """
+    return cp_chunk_lm_loss(
+        hidden_states=hidden_states,
+        labels=labels,
+        head_weight=head_weight,
+        group=group,
+        num_items_in_batch=num_items_in_batch,
+        ignore_index=ignore_index,
+        chunk_size=chunk_size,
+        chunk_loss_fn=chunk_lm_loss,
+    )
+
+
 def kimi_k3_model_forward(
     self,
     input_ids: torch.LongTensor | None = None,
@@ -67,8 +101,6 @@ def kimi_k3_model_forward(
     if cp_size > 1:
         if past_key_values is not None or cache_position is not None or use_cache is True:
             raise ValueError("Post-fusion context parallelism for Kimi K3 does not support cache inputs.")
-        if getattr(self, "enable_chunk_loss", False):
-            raise ValueError("Kimi K3 chunk loss is not supported together with context parallelism.")
         use_cache = False
 
     output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -127,17 +159,39 @@ def kimi_k3_model_forward(
         **kwargs,
     )
     hidden_states = outputs.hidden_states
-    logits = self.language_model.lm_head(hidden_states).float()
 
-    loss = None
-    if complete_labels is not None:
-        loss = self.loss_function(
-            logits=logits,
-            labels=complete_labels,
-            vocab_size=self.config.text_config.vocab_size,
-            num_items_in_batch=num_items_in_batch,
-            ignore_index=self.config.ignore_index,
-        )
+    if getattr(self, "enable_chunk_loss", False):
+        # Chunk loss streams [chunk_size, vocab] logits through grad_and_value
+        # and never materializes the full [local_seq, vocab] matrix (~200 GiB
+        # per rank at 1M tokens with CP=8). The head is called as a module (the
+        # example installs its chunk-loss forward before FSDP wrapping) so
+        # lm_head.weight goes through FSDP's unshard/reduce-scatter hooks.
+        logits = None
+        loss = None
+        if complete_labels is not None:
+            loss = self.language_model.lm_head(
+                hidden_states,
+                functools.partial(
+                    _cp_chunk_loss_fn,
+                    group=cp_group,
+                    num_items_in_batch=num_items_in_batch,
+                    ignore_index=self.config.ignore_index,
+                    chunk_size=getattr(self, "chunk_size", None) or 1024,
+                ),
+                complete_labels,
+            )
+    else:
+        logits = self.language_model.lm_head(hidden_states).float()
+
+        loss = None
+        if complete_labels is not None:
+            loss = self.loss_function(
+                logits=logits,
+                labels=complete_labels,
+                vocab_size=self.config.text_config.vocab_size,
+                num_items_in_batch=num_items_in_batch,
+                ignore_index=self.config.ignore_index,
+            )
 
     if not return_dict:
         output = (logits, outputs.past_key_values, outputs.hidden_states, outputs.attentions)

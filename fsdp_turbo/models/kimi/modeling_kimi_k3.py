@@ -76,6 +76,7 @@ if is_flash_attn_2_available():
 else:
     flash_attn_varlen_func = None
 from fsdp_turbo.memory.chunk_loss.chunk_loss import calculate_lm_loss, chunk_loss
+from .kimi_flash_attention import context_parallel_active
 from fsdp_turbo.utils.device import get_accelerator_name
 from ..utils import register_model
 
@@ -119,7 +120,6 @@ def multihead_attention(
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     deterministic: bool = False,
-    skip_recompute: bool = False,
 ):
     """Multi-head attention using flash attention 2.
 
@@ -136,46 +136,19 @@ def multihead_attention(
             where dim = num_heads * head_dim
     """
     if get_accelerator_name() == "npu":
-        # Modification start
-        if skip_recompute:
-            # Skip recomputing this kernel during gradient checkpointing replay:
-            # the forward pass offloads (attn_out, softmax_max, softmax_sum) to host
-            # and the backward-stage replay restores them, bit-identical to recompute.
-            from fsdp_turbo.ops.flash_attn.skip_recompute_flash_attn import (
-                skip_recompute_flash_attention,
-            )
-
-            attn_out = skip_recompute_flash_attention(
-                q,
-                k,
-                v,
-                head_num=q.shape[1],
-                layout="TND",
-                pse=None,
-                padding_mask=None,
-                atten_mask=None,
-                actual_seq_qlen=q_cu_seqlens,
-                actual_seq_kvlen=k_cu_seqlens,
-                scale=1.0 / math.sqrt(q.shape[-1]),
-                keep_prob=1,
-                inner_precise=0,
-                sparse_mode=0,
-            )
-        else:
-            attn_out = torch_npu.npu_fusion_attention(
-                q,
-                k,
-                v,
-                head_num=q.shape[1],
-                pse=None,
-                atten_mask=None,
-                scale=1.0 / math.sqrt(q.shape[-1]),
-                keep_prob=1,
-                input_layout="TND",
-                actual_seq_qlen=q_cu_seqlens,
-                actual_seq_kvlen=k_cu_seqlens,
-            )[0]
-        # Modification end
+        attn_out = torch_npu.npu_fusion_attention(
+            q,
+            k,
+            v,
+            head_num=q.shape[1],
+            pse=None,
+            atten_mask=None,
+            scale=1.0 / math.sqrt(q.shape[-1]),
+            keep_prob=1,
+            input_layout="TND",
+            actual_seq_qlen=q_cu_seqlens,
+            actual_seq_kvlen=k_cu_seqlens,
+        )[0]
     else:
         attn_out = flash_attn_varlen_func(
             q,
@@ -543,7 +516,6 @@ class MoonViTEncoderLayer(nn.Module):
         attn_bias: bool = False,
         linear_bias: bool = True,
         use_deterministic_attn: bool = False,
-        skip_flash_attn_recompute: bool = False,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -552,7 +524,6 @@ class MoonViTEncoderLayer(nn.Module):
         self.hidden_size_per_attention_head = self.qkv_hidden_size // self.num_heads
         self.attn_implementation = attn_implementation
         self.use_deterministic_attn = use_deterministic_attn
-        self.skip_flash_attn_recompute = skip_flash_attn_recompute
 
         if norm_type == "layernorm":
             self.norm0 = nn.LayerNorm(hidden_dim)
@@ -596,7 +567,12 @@ class MoonViTEncoderLayer(nn.Module):
 
         xq, xk = apply_rope(xq, xk, rope_freqs_cis)
 
-        attn_func = VL_VISION_ATTENTION_FUNCTIONS[self.attn_implementation]
+        # CP runs need the fused NPU kernel; single-rank runs keep the
+        # upstream config-driven implementation.
+        if context_parallel_active():
+            attn_func = multihead_attention
+        else:
+            attn_func = VL_VISION_ATTENTION_FUNCTIONS[self.attn_implementation]
         attn_out = attn_func(
             xq,
             xk,
@@ -606,7 +582,6 @@ class MoonViTEncoderLayer(nn.Module):
             max_seqlen_k=max_seqlen,
             max_seqlen_q=max_seqlen,
             deterministic=self.use_deterministic_attn,
-            skip_recompute=self.skip_flash_attn_recompute,
         )
 
         attn_out = self.wo(attn_out)
@@ -753,7 +728,6 @@ class MoonViT3dPretrainedModel(PreTrainedModel):
                 'attn_bias': getattr(config, 'attn_bias', True),
                 'linear_bias': getattr(config, 'linear_bias', True),
                 'attn_implementation': config._attn_implementation,
-                'skip_flash_attn_recompute': getattr(config, 'skip_flash_attn_recompute', False),
             },
             use_deterministic_attn=getattr(self, 'use_deterministic_attn', False),
         )
@@ -1128,7 +1102,23 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
         attention_mask = attention_mask.to(target_device)
 
         # 4. Fill the embeddings based on the mask.
-        final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
+        # The single-shot RHS read materializes a full copy of every text
+        # embedding (14 GiB at 1M tokens, hidden 7168 bf16), so long multimodal
+        # runs raise memory.mm_merge_chunk_tokens, which the training entry
+        # stamps onto the model config before load. 0 (absent) keeps the
+        # upstream path; a positive value moves the text embeddings that many
+        # tokens at a time. Pure per-row data movement with no arithmetic, so
+        # the batched writes are bitwise identical to the single-shot
+        # assignment.
+        mm_merge_chunk = getattr(self.config, "mm_merge_chunk_tokens", 0)
+        if mm_merge_chunk > 0:
+            for start in range(0, batch_indices.shape[0], mm_merge_chunk):
+                stop = start + mm_merge_chunk
+                final_embedding[batch_indices[start:stop], text_to_overwrite[start:stop]] = inputs_embeds[
+                    batch_indices[start:stop], non_image_indices[start:stop]
+                ]
+        else:
+            final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
         final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]
         if labels is not None:
             final_labels[batch_indices, text_to_overwrite] = labels[batch_indices, non_image_indices]
@@ -1288,7 +1278,7 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
 
         # Modification start: chunk loss adaptation, following Kimi-K2.5 FSDP.
         # The language model returns hidden_states; the VLM top-level applies
-        # lm_head so that MindSpeed-MM's chunk loss patch can be used.
+        # lm_head so that the chunk loss path can be used.
         hidden_states = outputs.hidden_states
 
         if enable_chunk_loss:

@@ -9,6 +9,8 @@ from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_attention import (
 )
 
 _KCP_FUNCTION_PATCH_TYPES = {
+    # MLA on the KCP group runs the same Ulysses all-to-all wrapper the
+    # Ulysses mode installs, just on the KCP group.
     "full_attention": get_ulysses_attention_fn,
     "compressor_full_attention": get_ulysses_compressor_attention_fn,
     "compressor_full_attention_transposed": get_ulysses_transposed_compressor_attention_fn,

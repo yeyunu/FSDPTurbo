@@ -76,7 +76,7 @@ class ChunkLoss(torch.autograd.Function):
             hidden_states_chunks, grad_inputs_chunks, loss_kwargs_chunks
         ):
             # Compute both gradients and loss value for this chunk
-            (chunk_grad_input, chunk_grad_weight), (per_chunk_loss, _) = torch.func.grad_and_value(
+            (chunk_grad_input, chunk_grad_weight), (per_chunk_loss, chunk_aux) = torch.func.grad_and_value(
                 loss_forward, argnums=(0, 1), has_aux=True
             )(hidden_states_chunk, head_weight, None, **loss_kwargs)
 
@@ -84,6 +84,12 @@ class ChunkLoss(torch.autograd.Function):
             accumulated_loss.add_(per_chunk_loss)
             grad_inputs_chunk.copy_(chunk_grad_input)
             grad_weight.add_(chunk_grad_weight)
+            # Release the chunk's buffers before the next iteration: the loop
+            # variables would otherwise keep chunk_grad_weight (the [vocab,
+            # hidden] grad, independent of chunk_size) and chunk_aux (the
+            # [chunk, vocab] fp32 logits) alive while the next chunk's
+            # grad_and_value runs its internal backward, doubling the peak.
+            del chunk_grad_input, chunk_grad_weight, chunk_aux
 
         # Convert gradient back to DTensor with the original placement so that
         # head_weight.grad matches the parameter type expected by the optimizer.
@@ -285,3 +291,13 @@ def chunk_loss(hidden_states, head_weight, head_bias, loss_forward, loss_kwargs_
             ]
 
     return ChunkLoss.apply(hidden_states, head_weight, head_bias, loss_forward, loss_kwargs_chunks, chunk_size)
+
+
+def chunk_lm_loss(hidden_states, head_weight, loss_kwargs_chunks, chunk_size):
+    """Chunked LM loss kernel for callers that own the head projection.
+
+    Used as the injectable compute step of the CP loss helper: the caller
+    obtains ``head_weight`` from inside the FSDP-managed ``lm_head`` forward
+    and passes the pre-built per-chunk loss kwargs here.
+    """
+    return chunk_loss(hidden_states, head_weight, None, calculate_lm_loss, loss_kwargs_chunks, chunk_size)

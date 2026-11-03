@@ -43,6 +43,11 @@ else:
         "AscendC and Triton Ascend KDA implementations are unavailable; falling back to the eager implementation.",
     )
 
+# This module executes at import time, before BaseTrainer._init_distributed
+# configures logging, so a logger record would be dropped; print straight to
+# stdout via print_rank (rank-0 only) so the marker shows in every launch mode.
+print_rank(print, f"[chunk_kda] backend={_CHUNK_KDA_BACKEND}")
+
 
 @register_op('chunk_kda', 'npu')
 def chunk_kda_npu(q, k, v, g, beta, *args, **kwargs):

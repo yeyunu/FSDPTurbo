@@ -50,11 +50,11 @@ def _mask_to_bool(attention_mask):
     return mask
 
 
-def _npu_fa_bnsd(query, key, value, head_num, scaling, dropout, atten_mask, sparse_mode):
-    """Single NPU ``npu_fusion_attention`` call in BNSD, returns BSHD ``[B, S, H, D]``."""
+def _npu_fa_bnsd_raw(query, key, value, head_num, scaling, dropout, atten_mask, sparse_mode):
+    """Single NPU ``npu_fusion_attention`` call in BNSD, keeps the BNSD layout."""
     import torch_npu
 
-    out = torch_npu.npu_fusion_attention(
+    return torch_npu.npu_fusion_attention(
         query,
         key,
         value,
@@ -70,7 +70,27 @@ def _npu_fa_bnsd(query, key, value, head_num, scaling, dropout, atten_mask, spar
         inner_precise=0,
         sparse_mode=sparse_mode,
     )[0]
-    return out.transpose(1, 2)
+
+
+def _npu_fa_bnsd(query, key, value, head_num, scaling, dropout, atten_mask, sparse_mode):
+    """Single NPU ``npu_fusion_attention`` call in BNSD, returns BSHD ``[B, S, H, D]``."""
+    return _npu_fa_bnsd_raw(query, key, value, head_num, scaling, dropout, atten_mask, sparse_mode).transpose(1, 2)
+
+
+@register_op("causal_flash_attention", "npu")
+def causal_flash_attention_npu(query, key, value, *, scaling=None, dropout=0.0, is_causal=True):
+    """NPU ``npu_fusion_attention`` with the kernel's native causal mode.
+
+    ``sparse_mode=3`` is the kernel's bottom-right causal mode, so a query
+    block against a longer K/V prefix stays correctly aligned without a dense
+    mask. The mask content is ignored under ``sparse_mode=3``, so the cached
+    2048x2048 bool placeholder keeps mask cost independent of the sequence
+    length. Returns the output in BNSD layout.
+    """
+    if scaling is None:
+        scaling = query.shape[-1] ** -0.5
+    atten_mask = _get_attn_mask(query.device) if is_causal else None
+    return _npu_fa_bnsd_raw(query, key, value, query.shape[1], scaling, dropout, atten_mask, 3 if is_causal else 0)
 
 
 @register_op("flash_attention", "npu")

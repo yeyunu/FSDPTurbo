@@ -33,6 +33,7 @@ NOOPs = "NOOPs"
 typ = "typ"
 nin_shortcut = "nin_shortcut"
 UperNetDecoder = "UperNetDecoder"
+ConstantPadNd = "ConstantPadNd"
 subtile = "subtile"
 SFOuput = "SFOuput"
 # huggingface transformers repo uses these words

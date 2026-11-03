@@ -47,3 +47,43 @@ def flash_attention_cpu(
     attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value)
     return attn_output.transpose(1, 2).contiguous(), None
+
+
+def _bottom_right_causal_mask(q_len, kv_len, device):
+    """Bool mask (True = attend) for bottom-right aligned causality.
+
+    Query row ``i`` attends key ``j <= i + (kv_len - q_len)``: the query block
+    sits at the tail of the K/V prefix. With ``q_len == kv_len`` this is the
+    plain causal mask.
+    """
+    return torch.ones(q_len, kv_len, dtype=torch.bool, device=device).tril(diagonal=kv_len - q_len)
+
+
+@register_op("causal_flash_attention", "cpu")
+def causal_flash_attention_cpu(query, key, value, *, scaling=None, dropout=0.0, is_causal=True):
+    """SDPA reference implementation of native-causal flash attention.
+
+    Returns the output in BNSD layout. SDPA's ``is_causal`` is top-left
+    aligned, so a query block shorter than the K/V prefix uses an explicit
+    bottom-right bool mask instead.
+    """
+    if scaling is None:
+        scaling = query.shape[-1] ** -0.5
+    if is_causal and query.shape[-2] != key.shape[-2]:
+        return F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=_bottom_right_causal_mask(query.shape[-2], key.shape[-2], query.device),
+            dropout_p=dropout,
+            scale=scaling,
+        )
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=dropout,
+        scale=scaling,
+        is_causal=is_causal,
+    )

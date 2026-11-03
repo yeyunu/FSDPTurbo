@@ -24,6 +24,10 @@ except ImportError:
     )
 else:
     _ATTN_RES_BACKEND = 'ascendc'
+    # This module executes at import time, before BaseTrainer._init_distributed
+    # configures logging, so a logger record would be dropped; print straight to
+    # stdout via print_rank (rank-0 only) so the marker shows in every launch mode.
+    print_rank(print, "[attn_res] backend=ascendc -> fused cann_ops_transformer.block_attention_residuals")
 
 
 @register_op('attn_res', 'npu')

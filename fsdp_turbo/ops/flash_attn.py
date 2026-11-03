@@ -17,7 +17,28 @@ from fsdp_turbo.utils.log import log_warning_once
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["flash_attention_forward", "register_flash_attention"]
+__all__ = ["causal_flash_attention", "flash_attention_forward", "register_flash_attention"]
+
+
+def causal_flash_attention(query, key, value, *, scaling=None, dropout=0.0, is_causal=True):
+    """Native-causal flash attention for BNSD tensors, dispatched by device.
+
+    Causality comes from the kernel itself -- NPU ``npu_fusion_attention`` with
+    ``sparse_mode=3``, SDPA ``is_causal`` on CPU/CUDA -- so no dense
+    ``[B, 1, S, S]`` mask is ever materialized. When the query block is shorter
+    than the K/V prefix, causality stays bottom-right aligned (row ``i``
+    attends ``K[0, i + kv_len - q_len)``). Inputs must already have matching
+    head counts and head dims. Returns the output in BNSD layout.
+    """
+    return dispatch_op(
+        "causal_flash_attention",
+        query,
+        key,
+        value,
+        scaling=scaling,
+        dropout=dropout,
+        is_causal=is_causal,
+    )
 
 
 def flash_attention_forward(

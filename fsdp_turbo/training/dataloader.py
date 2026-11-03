@@ -66,7 +66,13 @@ def build_dataloader(data_cfg, tokenizer=None, processor=None):
             data_cfg=data_cfg,
         )
     else:
-        dataset = load_dataset(data_cfg.dataset_path, data_cfg.dataset_config, split=data_cfg.split)
+        if os.path.isfile(data_cfg.dataset_path):
+            # datasets >= 5 rejects a bare local file path as a builder name
+            # ("Couldn't find any data file at ..."); route it through the json
+            # loader exactly like the multimodal branch.
+            dataset = load_dataset("json", data_files=data_cfg.dataset_path, split=data_cfg.split)
+        else:
+            dataset = load_dataset(data_cfg.dataset_path, data_cfg.dataset_config, split=data_cfg.split)
         dataset = _process_text_dataset(dataset, data_cfg, tokenizer) if tokenizer is not None else dataset
         collate_fn = None
 
@@ -294,9 +300,17 @@ class _MultimodalCollator:
         # When a batch has no images, create a dummy image and append fake image
         # tokens so that every rank calls the vision encoder forward. Without this,
         # ranks with text-only samples skip self.visual(...) entirely, causing the
-        # FSDP all-gather for the vision encoder to hang (HCCL timeout).
+        # FSDP all-gather for the vision encoder to hang (HCCL timeout). The fake
+        # span is delimited by vision_start_token_id; processors that do not expose
+        # it cannot mask the span afterwards, so they keep the pre-existing
+        # behavior of not appending anything.
+        vision_start_token_id = getattr(self.processor.tokenizer, "vision_start_token_id", None)
         fake_image_appended = False
-        if not images and not getattr(self.processor, "supports_empty_image_batch", False):
+        if (
+            not images
+            and vision_start_token_id is not None
+            and not getattr(self.processor, "supports_empty_image_batch", False)
+        ):
             dummy_image = Image.new("RGB", (64, 64), (255, 255, 255))
             images = [dummy_image]
             fake_messages = [{"role": "user", "content": [{"type": "image"}]}]
@@ -342,13 +356,11 @@ class _MultimodalCollator:
         # affect attention or loss. The original text had no vision tokens, so the
         # first vision_start_token_id marks the beginning of the fake text.
         if fake_image_appended:
-            vision_start_token_id = getattr(self.processor.tokenizer, "vision_start_token_id", None)
-            if vision_start_token_id is not None:
-                vs_positions = (batch["input_ids"][0] == vision_start_token_id).nonzero(as_tuple=True)[0]
-                if len(vs_positions) > 0:
-                    fake_start = vs_positions[0].item()
-                    batch["attention_mask"][0, fake_start:] = 0
-                    labels[0, fake_start:] = -100
+            vs_positions = (batch["input_ids"][0] == vision_start_token_id).nonzero(as_tuple=True)[0]
+            if len(vs_positions) > 0:
+                fake_start = vs_positions[0].item()
+                batch["attention_mask"][0, fake_start:] = 0
+                labels[0, fake_start:] = -100
 
         batch["labels"] = labels
         return batch

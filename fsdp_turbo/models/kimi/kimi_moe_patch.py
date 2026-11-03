@@ -1,4 +1,4 @@
-"""MindSpeed-MM FSDP MoE patch for Kimi-K3.
+"""FSDP MoE patch for Kimi-K3.
 
 This module provides an alternative implementation of Kimi's sparse MoE block
 that keeps the original routing logic, latent-MoE projection and shared-expert
@@ -7,7 +7,7 @@ as Qwen3.5-MoE) so that it can be used with:
 
 * non-EP and EP execution paths,
 * NPU grouped GEMM / token permute / token unpermute kernels,
-* the existing MindSpeed-MM FSDP2/EP tooling.
+* the existing FSDP2/EP tooling.
 
 The patch is applied by ``apply_kimi_k3_moe_patch()`` which monkey-patches the
 class reference in ``modeling_kimi``; the original source classes are left
@@ -49,8 +49,17 @@ logger = logging.getLogger(__name__)
 
 def grouped_matmul(inputs, weights, group_sizes, fused=True):
     """Dispatch Kimi's input-major expert weights through the shared MoE op."""
-    linear_weights = weights.transpose(1, 2).contiguous()
-    return dispatch_grouped_matmul(inputs, group_sizes, linear_weights, use_eager=not fused)
+    # The expert weights are stored input-major ([G, K, N]); state that layout
+    # explicitly so square projections cannot be misread as linear. Transposing
+    # here would only add a full-size copy that autograd keeps alive for
+    # backward, so the op transposes internally instead.
+    return dispatch_grouped_matmul(
+        inputs,
+        group_sizes,
+        weights,
+        use_eager=not fused,
+        weights_layout="input_major",
+    )
 
 
 def permute(tokens, indices, fused=True):

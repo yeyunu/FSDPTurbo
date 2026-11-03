@@ -6,7 +6,7 @@ from unittest import mock
 
 import torch
 
-from fsdp_turbo.distributed.context_parallel.batch import split_sequence_batch
+from fsdp_turbo.distributed.context_parallel.batch import pad_tensor_to_group, split_sequence_batch
 from fsdp_turbo.distributed.context_parallel.patch import (
     CP_PATCHES_ATTR,
     apply_cp_loss_patches,
@@ -68,7 +68,9 @@ class ContextParallelConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ulysses_function_patches"):
             FSDPTurboConfig(distributed=DistributedConfig(ulysses_parallel_size=2))
         config = FSDPTurboConfig(distributed=DistributedConfig(kv_allgather_parallel_size=2))
-        self.assertEqual(config.distributed.cp_plan, CPPlanConfig())
+        # validate_cp_config normalizes the unset Ulysses plan to an empty list;
+        # the None/[] distinction only matters while checking Ulysses sizes.
+        self.assertEqual(config.distributed.cp_plan, CPPlanConfig(ulysses_function_patches=[]))
         checkpointed = FSDPTurboConfig(
             distributed=DistributedConfig(kv_allgather_parallel_size=2),
             memory=MemoryConfig(recompute=True, recompute_plan=["model.layers.{*}"]),
@@ -99,6 +101,38 @@ class ContextParallelBatchTests(unittest.TestCase):
         torch.testing.assert_close(output["input_ids"], torch.tensor([[4, 5]]))
         torch.testing.assert_close(output["position_ids"], torch.tensor([[4, 5]]))
         torch.testing.assert_close(output["labels"], batch["labels"])
+
+
+class ContextParallelPadTests(unittest.TestCase):
+    @mock.patch("torch.distributed.get_world_size", return_value=4)
+    def test_aligned_tensor_is_returned_unchanged(self, _world_size):
+        tensor = torch.randn(2, 8, 3)
+        self.assertIs(tensor, pad_tensor_to_group(tensor, object(), dim=1))
+
+    @mock.patch("torch.distributed.get_world_size", return_value=4)
+    def test_small_tensor_matches_fpad(self, _world_size):
+        tensor = torch.arange(14, dtype=torch.float).view(1, 14)
+        padded = pad_tensor_to_group(tensor, object(), dim=1, pad_value=0.0)
+        self.assertEqual((1, 16), padded.shape)
+        torch.testing.assert_close(padded, torch.nn.functional.pad(tensor, (0, 2), value=0.0))
+
+    @mock.patch("torch.distributed.get_world_size", return_value=4)
+    def test_padded_copy_matches_fpad(self, _world_size):
+        # The NPU-safe pad assembles the result from a constant tail plus
+        # chunked strided copies (ConstantPadNd overflows int32 offsets beyond
+        # 2**31 elements); the result must stay bit-identical to F.pad,
+        # including a negative pad value and dim=-1.
+        tensor = torch.randn(1, 13, 5)
+        padded = pad_tensor_to_group(tensor, object(), dim=1, pad_value=-1.0)
+        expected = torch.nn.functional.pad(tensor, (0, 0, 0, 3, 0, 0), value=-1.0)
+        self.assertEqual((1, 16, 5), padded.shape)
+        torch.testing.assert_close(padded, expected)
+        self.assertTrue(padded[0, 13:].eq(-1.0).all())
+
+        tail = torch.full((6,), 7.0)
+        padded = pad_tensor_to_group(tail, object(), dim=-1, pad_value=7.0)
+        self.assertEqual((8,), padded.shape)
+        torch.testing.assert_close(padded, torch.full((8,), 7.0))
 
 
 class ContextParallelPatchTests(unittest.TestCase):

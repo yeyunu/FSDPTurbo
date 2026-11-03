@@ -46,7 +46,7 @@ class _GroupedMatmulCPU(torch.autograd.Function):
 
 
 @register_op('grouped_matmul', 'cpu')
-def grouped_matmul_cpu(inputs, m_split, weights):
+def grouped_matmul_cpu(inputs, m_split, weights, weights_layout="linear"):
     """
     Grouped matrix multiplication.
 
@@ -54,6 +54,9 @@ def grouped_matmul_cpu(inputs, m_split, weights):
     (i.e. [out_features, in_features] per expert). They are always transposed to
     [num_groups, input_dim, output_dim] before the matmul. This avoids the
     unreliable shape-based detection that breaks when input_dim == output_dim.
+    ``weights_layout="input_major"`` accepts [num_groups, input_dim, output_dim]
+    and transposes it to the linear convention first; the returned weight
+    gradient keeps the caller's layout through autograd.
 
     Forward and first-order backward write into preallocated buffers without
     building per-expert CopySlices backward chains. Empty groups have zero
@@ -63,10 +66,13 @@ def grouped_matmul_cpu(inputs, m_split, weights):
         inputs: Tensor of shape [batch_size, input_dim]
         m_split: Tensor of group sizes that sum to batch_size
         weights: Weight tensor of shape [num_groups, output_dim, input_dim]
+        weights_layout: "linear" (default) or "input_major"
 
     Returns:
         Tensor of shape [batch_size, output_dim]
     """
+    if weights_layout == "input_major":
+        weights = weights.transpose(1, 2)
     return _GroupedMatmulCPU.apply(inputs, m_split, weights)
 
 

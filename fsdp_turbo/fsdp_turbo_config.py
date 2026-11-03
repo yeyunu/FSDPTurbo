@@ -398,6 +398,11 @@ class MemoryConfig:
     chunk_batch_plan: Optional[ChunkBatchPlanConfig] = None
     chunk_loss: bool = False
     chunk_loss_size: int = 512
+    # Multimodal image-text merge: move the text embeddings in blocks of this
+    # many tokens instead of one full-sequence advanced-index read; 0 keeps the
+    # single assignment. Takes effect only where an example wires the attribute
+    # onto the model config.
+    mm_merge_chunk_tokens: int = 0
     swap_activation: bool = False
     swap_activation_plan: Optional[SwapActivationPlanConfig] = None
 
@@ -429,6 +434,7 @@ class FSDPTurboConfig:
         self.validate_data_config()
         self.validate_tp_config()
         self.validate_chunk_loss_config()
+        self.validate_mm_merge_chunk_tokens_config()
         self.validate_cp_config()
         self.validate_module_patches()
         self.validate_ep_config()
@@ -449,15 +455,10 @@ class FSDPTurboConfig:
             raise ValueError("memory.chunk_loss_size must be a positive integer.")
         if not self.memory.chunk_loss:
             return
-        if any(
-            size > 1
-            for size in (
-                self.distributed.ulysses_parallel_size,
-                self.distributed.kv_allgather_parallel_size,
-                self.distributed.kcp_parallel_size,
-            )
-        ):
-            raise ValueError("memory.chunk_loss does not support context parallelism.")
+        # Context parallelism is supported: Kimi K3 routes the chunked loss
+        # through cp_chunk_lm_loss (global label shift + cross-rank
+        # normalization). A model whose chunk-loss path cannot run under CP must
+        # reject the combination in its own wiring.
         recompute_patterns = (self.memory.recompute_plan or []) if self.memory.recompute else []
         swap_plan = self.memory.swap_activation_plan
         swap_patterns = (swap_plan.apply_modules or []) if self.memory.swap_activation and swap_plan else []
@@ -467,6 +468,15 @@ class FSDPTurboConfig:
             for name in ("", "model.head")
         ):
             raise ValueError("memory.chunk_loss cannot wrap the head or root in recompute/swap_activation hooks.")
+
+    def validate_mm_merge_chunk_tokens_config(self):
+        mm_merge_chunk_tokens = self.memory.mm_merge_chunk_tokens
+        if (
+            isinstance(mm_merge_chunk_tokens, bool)
+            or not isinstance(mm_merge_chunk_tokens, int)
+            or mm_merge_chunk_tokens < 0
+        ):
+            raise ValueError("memory.mm_merge_chunk_tokens must be a non-negative integer.")
 
     def validate_model_config(self):
         """Validate model loading configuration."""
@@ -721,6 +731,17 @@ class FSDPTurboConfig:
             raise ValueError(
                 "distributed.cp_plan.ulysses_function_patches must be set when Ulysses is enabled; "
                 "set it to [] only when the model's Ulysses forwards are built into the modeling classes."
+            )
+
+        context_parallel_active = (
+            kcp_parallel_size > 1 or ulysses_parallel_size > 1 or self.distributed.kv_allgather_parallel_size > 1
+        )
+        if context_parallel_active and self.memory.chunk_batch:
+            raise ValueError(
+                "memory.chunk_batch cannot be combined with context parallelism "
+                "(kcp_parallel_size/ulysses_parallel_size/kv_allgather_parallel_size > 1): "
+                "both features take over module forwards on the same sequence and the "
+                "combination is undefined."
             )
 
     def validate_ep_config(self) -> None:

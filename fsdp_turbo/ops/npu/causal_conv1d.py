@@ -43,6 +43,11 @@ else:
         "falling back to the eager implementation.",
     )
 
+# This module executes at import time, before BaseTrainer._init_distributed
+# configures logging, so a logger record would be dropped; print straight to
+# stdout via print_rank (rank-0 only) so the marker shows in every launch mode.
+print_rank(print, f"[causal_conv1d] backend={_CAUSAL_CONV1D_BACKEND}")
+
 
 @register_op('causal_conv1d', 'npu')
 def causal_conv1d_npu(

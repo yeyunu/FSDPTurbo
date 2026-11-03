@@ -12,6 +12,7 @@ from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.model import (
     convert_model_dtype,
     set_attn_implementation,
+    set_num_hidden_layers,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,16 @@ class KimiK3Trainer(BaseTrainer):
 
         print_rank(logger.info, "> Building KimiK3 Model...")
         model_config = AutoConfig.from_pretrained(self.config.model.model_name_or_path, trust_remote_code=False)
+        # Layer reduction must happen before from_pretrained so the model is
+        # built shallow; the checkpoint then fills the first-N layer weights
+        # (remaining keys are reported as unexpected, which is expected).
+        set_num_hidden_layers(model_config, self.config.model.num_hidden_layers)
         set_attn_implementation(model_config, self.config.model.attn_implementation)
+        # The multimodal image-text merge reads this off its own config (see
+        # fsdp_turbo/models/kimi/modeling_kimi_k3.py); stamp it before load so
+        # every merge call sees it. 0 keeps the single-shot assignment.
+        if self.config.memory.mm_merge_chunk_tokens > 0:
+            model_config.mm_merge_chunk_tokens = self.config.memory.mm_merge_chunk_tokens
         model = AutoModel.from_pretrained(
             self.config.model.model_name_or_path,
             config=model_config,
@@ -55,6 +65,18 @@ class KimiK3Trainer(BaseTrainer):
             trust_remote_code=False,
         )
         convert_model_dtype(model, self.config.model.torch_dtype)
+        if self.config.memory.chunk_loss:
+            # The CP-aware forward reads these attributes off the top-level model
+            # (see fsdp_turbo/models/kimi/kimi_k3_cp.py); the switches live in
+            # config.yaml under ``memory``.
+            # The chunked loss runs inside the head's module call, so lm_head's
+            # gradient goes through FSDP's reduce-scatter like any other sharded
+            # unit. Install the forward before FSDPTurbo wraps the model.
+            from fsdp_turbo.memory.chunk_loss.chunkloss_lm_head import apply_chunkloss_module
+
+            apply_chunkloss_module(model.language_model.lm_head)
+            model.enable_chunk_loss = True
+            model.chunk_size = self.config.memory.chunk_loss_size
 
         print_rank(logger.info, "> Applying FSDPTurbo parallelism...")
         model = FSDPTurbo(self.config, model)
@@ -85,11 +107,9 @@ class KimiK3Trainer(BaseTrainer):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Qwen3.5 MoE Training with Ulysses Context Parallel")
+    parser = argparse.ArgumentParser(description="Kimi K3 MoE Training with Ulysses Context Parallel")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to YAML config file")
-    parser.add_argument("--model-name", type=str, default=None, help="Override model name or path")
     parser.add_argument("--num-hidden-layers", type=int, default=None, help="Override language model layer count")
-    parser.add_argument("--ulysses-size", type=int, default=None, help="Override Ulysses parallel size")
     return parser.parse_args()
 
 
@@ -99,10 +119,8 @@ def main():
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.config)
     config = load_config_from_yaml(config_path)
 
-    if args.model_name:
-        config.model.model_name_or_path = args.model_name
-    if args.ulysses_size:
-        config.distributed.ulysses_parallel_size = args.ulysses_size
+    if args.num_hidden_layers is not None:
+        config.model.num_hidden_layers = args.num_hidden_layers
 
     trainer = KimiK3Trainer(config=config)
     trainer.setup()

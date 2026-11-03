@@ -45,5 +45,7 @@ class GroupedMatmulCUDA(torch.autograd.Function):
 
 
 @register_op('grouped_matmul', 'cuda')
-def grouped_matmul_cuda(inputs, m_split, weights):
+def grouped_matmul_cuda(inputs, m_split, weights, weights_layout="linear"):
+    if weights_layout == "input_major":
+        weights = weights.transpose(-2, -1)
     return GroupedMatmulCUDA.apply(inputs, weights, m_split)

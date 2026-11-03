@@ -9,7 +9,7 @@ except ImportError:
 
 class GroupedMatmul(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, input_tensor: torch.Tensor, weights, weights_bias, m_split, group_list_type) -> torch.Tensor:
+    def forward(ctx, input_tensor: torch.Tensor, weights, weights_bias, m_split, group_list_type, weights_layout):
         # Due to ascend gmm kernel k split limitations, we need a tensor m_split, not a tensor List.
         if not isinstance(m_split, torch.Tensor):
             ctx.group_list = torch.tensor(m_split, device='npu', dtype=torch.int64)
@@ -17,23 +17,21 @@ class GroupedMatmul(torch.autograd.Function):
             ctx.group_list = m_split
 
         ctx.group_list_type = group_list_type
-
-        # Get weight chunks
-        weight_chunks = [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
-
-        # Weights follow the linear-layer convention [output_dim, input_dim] per expert.
-        # Transpose to [input_dim, output_dim] so that input [M, K] @ weight.T [K, N] = output [M, N].
-        # Always transpose rather than guessing from shape, since shape-based detection is
-        # unreliable when input_dim == output_dim (square weight matrices).
-        # With one x/weight/y, split-M selects the packed-weight API:
-        # its sole weight must keep the expert axis [1, K, N].
-        weights_for_matmul = [weights.transpose(1, 2)] if weights.shape[0] == 1 else [w.T for w in weight_chunks]
-
+        ctx.weights_layout = weights_layout
+        ctx.weight_shape = weights.shape
+        if weights.dim() == 4:
+            weights = weights.reshape(weights.shape[0], weights.shape[2], weights.shape[3])
+        if weights.dim() != 3:
+            raise ValueError(f"grouped_matmul expects 3-D/4-D expert weights, got shape {tuple(weights.shape)}")
+        # The op consumes one stacked input-major [G, K, N] weight. The linear
+        # convention is transposed as a view; the layout is explicit because
+        # square weights cannot be told apart by shape.
+        weights_kn = weights if weights_layout == "input_major" else weights.transpose(1, 2)
         ctx.save_for_backward(input_tensor, weights)
 
         fwd_output = torch_npu.npu_grouped_matmul(
             [input_tensor],
-            weights_for_matmul,
+            [weights_kn],
             bias=weights_bias,
             group_list=ctx.group_list,
             split_item=2,
@@ -48,14 +46,12 @@ class GroupedMatmul(torch.autograd.Function):
         inp, weights = ctx.saved_tensors
         group_list_type = ctx.group_list_type
 
-        # Get weight chunks (original [output_dim, input_dim] format)
-        weight_chunks = [weights] if weights.shape[0] == 1 else [w[0] for w in weights.chunk(weights.shape[0], dim=0)]
-
-        # Calculate input gradient: grad_output [M, N] @ weight [N, K] = grad_input [M, K].
-        # Forward used transposed weights, so the original weights are used directly here.
+        # dX = grad_output @ W: the op wants W in [G, N, K] layout. Linear
+        # weights already are [G, N, K]; input-major weights need a view.
+        dx_weight = weights.transpose(1, 2) if ctx.weights_layout == "input_major" else weights
         grad = torch_npu.npu_grouped_matmul(
             [grad_output],
-            weight_chunks,
+            [dx_weight],
             bias=None,
             group_list=group_list,
             split_item=2,
@@ -63,7 +59,8 @@ class GroupedMatmul(torch.autograd.Function):
             group_list_type=group_list_type,
         )[0]
 
-        # Calculate weight gradient (K split gmm): grad_weight = inp^T @ grad_output = [K, N]
+        # dW = inp^T @ grad_output is produced input-major [G, K, N]; transpose
+        # it back when the caller passed linear-convention weights.
         grad_weight = torch_npu.npu_grouped_matmul(
             [inp.T],
             [grad_output],
@@ -73,16 +70,16 @@ class GroupedMatmul(torch.autograd.Function):
             group_type=2,
             group_list_type=group_list_type,
         )[0]
-
-        # Preserve the GEMM and reduction order, but return the [E,N,K] view.
-        # AccumulateGrad/FSDP can copy it into its destination layout directly;
-        # eagerly stacking per-expert transposes adds a separate materialization.
-        return grad, grad_weight.transpose(-1, -2), None, None, None
+        if ctx.weights_layout == "linear":
+            grad_weight = grad_weight.transpose(1, 2)
+        if grad_weight.shape != ctx.weight_shape:
+            grad_weight = grad_weight.reshape(ctx.weight_shape)
+        return grad, grad_weight, None, None, None, None
 
 
 @register_op('grouped_matmul', 'npu')
-def grouped_matmul_npu(inputs, m_split, weights):
-    return GroupedMatmul.apply(inputs, weights, None, m_split, 1)
+def grouped_matmul_npu(inputs, m_split, weights, weights_layout="linear"):
+    return GroupedMatmul.apply(inputs, weights, None, m_split, 1, weights_layout)
 
 
 @register_op('w4a16_grouped_matmul', 'npu')

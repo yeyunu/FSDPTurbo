@@ -3,7 +3,7 @@ import torch
 from fsdp_turbo.ops import dispatch_op
 
 
-def grouped_matmul(inputs, m_split, weights, use_eager=False):
+def grouped_matmul(inputs, m_split, weights, use_eager=False, weights_layout="linear"):
     """
     Grouped matrix multiplication with automatic device dispatch.
 
@@ -13,12 +13,26 @@ def grouped_matmul(inputs, m_split, weights, use_eager=False):
         weights: Weight tensor
         use_eager: If False, use fused (optimized) implementation for current device.
                    If True, use CPU implementation.
+        weights_layout: ``"linear"`` (default) expects ``[num_groups, out_dim,
+                   in_dim]``; ``"input_major"`` expects ``[num_groups, in_dim,
+                   out_dim]`` (the NPU fused layout). The layout is explicit
+                   because shape-based detection is ambiguous for square
+                   expert weights.
 
     Returns:
         Result of grouped matrix multiplication
     """
+    if weights_layout not in ("linear", "input_major"):
+        raise ValueError(f"weights_layout must be 'linear' or 'input_major'; got {weights_layout!r}.")
     device_type = 'cpu' if use_eager else None  # Use CPU implementation if not fused
-    return dispatch_op('grouped_matmul', inputs, m_split, weights, device_type=device_type)
+    return dispatch_op(
+        'grouped_matmul',
+        inputs,
+        m_split,
+        weights,
+        weights_layout=weights_layout,
+        device_type=device_type,
+    )
 
 
 def all2all_grouped_matmul(

@@ -86,6 +86,11 @@ except ImportError:
 
 from fsdp_turbo.modules.short_conv import ShortConvolution
 from fsdp_turbo.ops.attn_res import attn_res
+from .kimi_flash_attention import (
+    FLASH_CAUSAL_MARKER,
+    context_parallel_active,
+    kimi_flash_attention_forward,
+)
 from fsdp_turbo.ops.kda import chunk_kda
 from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.ops.triton.utils import tensor_cache
@@ -420,6 +425,46 @@ def eager_attention_forward(
     return out, probs
 
 
+def dispatch_attention(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    """Run attention with the flash kernel on the context-parallel path.
+
+    ``KimiMLAAttention.forward`` calls this surface only when context
+    parallelism is active (see ``context_parallel_active``); single-rank runs
+    keep the upstream config-driven interface untouched. Once the sequence is
+    split across ranks the dense mask and eager score matrix are infeasible for
+    long contexts, so causality comes from the kernel itself.
+
+    The CP wrappers are installed over this function (see
+    ``cp_plan.<mode>_function_patches``), so the all-to-all / KV-AllGather
+    exchange runs before the kernel. Calling it without that exchange fails
+    fast in ``kimi_flash_attention_forward``.
+    """
+    return kimi_flash_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask=attention_mask,
+        scaling=scaling,
+        dropout=dropout,
+        **kwargs,
+    )
+
+
+# The CP wrappers only run when context parallelism is active, and the
+# dispatcher always selects the flash kernel in that case.
+dispatch_attention.__dict__[FLASH_CAUSAL_MARKER] = True
+
+
 class KimiMLAAttention(nn.Module):
     """
     Multi-Latent Attention adapted from deepseek-v3
@@ -527,12 +572,22 @@ class KimiMLAAttention(nn.Module):
         if past_key_values is not None:
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        if self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim:
+        cp_active = context_parallel_active()
+
+        # Upstream single-rank path, left unchanged: the attention interface and
+        # the FA2 value padding are config-driven. Under CP the flash kernel owns
+        # causality and its own V-pad/slice, so neither applies.
+        if not cp_active and (
+            self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim
+        ):
             value_states = F.pad(value_states, [0, self.q_head_dim - self.v_head_dim])
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        if cp_active:
+            attention_interface: Callable = dispatch_attention
+        else:
+            attention_interface = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, _ = attention_interface(
             self,
@@ -546,7 +601,9 @@ class KimiMLAAttention(nn.Module):
             **kwargs,
         )
 
-        if self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim:
+        if not cp_active and (
+            self.config._attn_implementation == "flash_attention_2" and self.q_head_dim != self.v_head_dim
+        ):
             attn_output = attn_output[:, :, :, : self.v_head_dim]
 
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
@@ -1206,16 +1263,11 @@ class KimiLinearModel(KimiPreTrainedModel):
             self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
             self.attn_res_fn = attn_res
 
-        if getattr(config, "_attn_implementation", None) is not None:
-            # if config._attn_implementation != "flash_attention_2":
-            #     logger.warning_once(f"Ignoring the provided attention implementation {config._attn_implementation}")
-            #     logger.warning_once("Using flash_attention_2 backend instead.")
-            #     config._attn_implementation = "flash_attention_2"
-            logger.warning_once("Using {config._attn_implementation} backend.")
-        else:
+        # Upstream default when no implementation was requested (only the
+        # single-rank path reads this value).
+        if getattr(config, "_attn_implementation", None) is None:
             config._attn_implementation = "flash_attention_2"
 
-        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
@@ -1268,13 +1320,19 @@ class KimiLinearModel(KimiPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
+        if context_parallel_active() and not (isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4):
+            # The flash kernel carries causality natively; materializing the
+            # [batch, 1, S, S] mask here would cost S^2 memory (a real 4-D mask
+            # passed by the caller is still honored verbatim).
+            causal_mask = None
+        else:
+            causal_mask = create_causal_mask(
+                config=self.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+            )
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
 
         hidden_states = inputs_embeds

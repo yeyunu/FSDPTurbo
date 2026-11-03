@@ -8,28 +8,29 @@
 
 ## 配置方法
 
-当前Chunk Loss通过模型属性`enable_chunk_loss`控制开启，尚未纳入`config.yaml`统一配置。开启方式：
+Chunk Loss通过`config.yaml`的`memory`段开启。开关是否生效取决于所用训练入口的
+接线（各示例接法不同，以对应示例的README为准）；完成接线的入口会按配置自动设置
+模型属性`enable_chunk_loss` / `chunk_size`，无需手工改模型：
 
-```python
-# 在模型定义中设置
-model.enable_chunk_loss = True
+```yaml
+memory:
+  chunk_loss: true
+  chunk_loss_size: 1024   #每块处理的token数；默认512
 ```
 
-开启后，模型forward内部会强制`output_hidden_states=True`，并将最后一层hidden states、`lm_head`权重、损失计算函数与`chunk_size`传入`chunk_loss()`完成分块计算。
+字段校验在`FSDPTurboConfig.__post_init__`的`validate_chunk_loss_config`；chunk loss
+不能与head/root的recompute/swap_activation钩子叠加（启动时报错）。开启后模型前向
+按块计算lm_head与交叉熵，`logits=None`。
 
 ## 与上下文并行（CP）的关系
 
-Chunk Loss与CP**不兼容，不能同时开启**。开启Ulysses CP后若同时设置`enable_chunk_loss`，模型会直接报错（见`fsdp_turbo/models/kimi/kimi_k3_cp.py`）：
+Kimi K3上Chunk Loss与CP**兼容，且超长序列（100k+）下推荐同时开启**。CP前向（`fsdp_turbo/models/kimi/kimi_k3_cp.py`）检测到
+`memory.chunk_loss`后走`cp_chunk_lm_loss`（`fsdp_turbo/distributed/context_parallel/loss.py`）：
 
-```text
-ValueError: Kimi K3 chunk loss is not supported together with Ulysses CP.
-```
-
-两者虽然都在大词表 / 长序列场景下缓解显存压力，但路径相互冲突：
-
-- CP的`loss_function_patches`负责全局label shift对齐与跨rank loss规约，仍会在本rank物化完整的local logits。
-- Chunk Loss通过逐块计算规避全量logits物化，需要接管完整的hidden states → lm_head → loss计算流程。
-- 二者接管损失计算的入口互斥，当前实现不支持组合使用。
+- 标签仍按**完整序列**全局移位后切分到本rank（与CP感知损失同一套`_shift_and_shard_labels`），跨rank边界样本不丢失；
+- hidden states按`chunk_size`分块，逐块通过`torch.func.grad_and_value`计算logits与梯度，任意时刻只物化一个`[chunk_size, vocab]`块；
+- 跨rank归一化沿用CP损失机制：loss和在forward内all-reduce（反向乘`world_size`补偿FSDP平均），分母为全局有效token数；
+- 输出`logits=None`（训练器只消费`loss`）。
 
 ## 适用场景
 

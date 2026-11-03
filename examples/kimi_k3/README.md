@@ -36,7 +36,7 @@ cp "${HF_PATH}/configuration_kimi_k3.py" "${TURBO_PATH}/fsdp_turbo/models/kimi/"
 `KimiK3Processor`，保留对列表文本输入的适配。其 tokenizer 和图像处理器
 继续通过 `trust_remote_code=True` 从模型目录加载。
 
-此方式对应 MindSpeed-MM 的“导入本地模型包、注册类、加载权重”流程，
+此方式对应“导入本地模型包、注册类、加载权重”的流程，
 通过 Transformers 注册表接入，无需修改模型目录中的 modeling 文件。
 
 ## 开启 Ulysses CP
@@ -50,9 +50,10 @@ distributed:
 
   cp_plan:
     ulysses_function_patches:
-      # Kimi MLA 全注意力：在 sequence/head 维度执行 all-to-all。
+      # Kimi MLA 全注意力：模型按「CP 是否开启」自行选择内核（CP→flash，否则 eager），
+      # CP 包装统一安装在 modeling_kimi_linear.dispatch_attention 上。
       - target_functions:
-          - modeling_kimi_linear.eager_attention_forward
+          - modeling_kimi_linear.dispatch_attention
         type: full_attention
 
       # Kimi Delta Attention（KDA）：使用支持 Ulysses 的 forward。
@@ -76,15 +77,18 @@ module_patches:
 
 - `ulysses_parallel_size`：设置 Ulysses CP 并行度；值大于 1 才会应用
   `ulysses_function_patches` 和 CP loss patch。
-- `full_attention`：为 Kimi 的 MLA 全注意力安装 Ulysses all-to-all 包装。
+- `full_attention`：为Kimi的MLA全注意力安装Ulysses all-to-all包装；包装目标是
+  `modeling_kimi_linear.dispatch_attention`，具体内核（eager/flash）由模型按CP状态自行选择。
 - `kda`：替换每个 `KimiDeltaAttention` 实例的 `forward`，使 KDA 支持序列切分。
 - `causal_lm_loss`：labels 保持完整序列，由 CP-aware loss 做全局 shift、切分和归一化。
 - `module_patches`：Kimi K3 是多模态模型，图像 token 会改变序列长度，因此必须先融合
   图文 embedding，再按 CP rank 切分；不能在 dataloader 输出处提前切分。
 
-`train.py` 已将主配置、文本配置和视觉配置的 attention implementation 设为
-`eager`。`full_attention` 的目标是 `eager_attention_forward`，使用其他 attention
-implementation 时该 patch 不会覆盖实际执行路径。
+CP 路径的内核选择由 CP 状态驱动：`KimiMLAAttention.forward` 检测到 CP 开启时改走
+`modeling_kimi_linear.dispatch_attention`（flash 内核），视觉塔在 forward 时用同一信号
+改用融合实现。非 CP（单 rank）路径保持上游逻辑不变：内核与 mask 仍由
+`model.attn_implementation` / transformers 的 `_attn_implementation` 决定
+（示例 config.yaml 为 `flash_attention_2`）；需要 eager 数值参考时把它设为 `eager`。
 
 ## 使用 fla_npu AscendC 算子
 
@@ -183,11 +187,11 @@ cd examples/kimi_k3
 GPUS_PER_NODE=16 LOG_PATH=./kimi_k3.log bash run.sh
 ```
 
-也可以通过命令行临时覆盖 CP 并行度：
+也可以直接用torchrun启动（并行度、模型路径等全部由`config.yaml`决定）：
 
 ```bash
 cd examples/kimi_k3
-torchrun --nproc_per_node=16 train.py --config config.yaml --ulysses-size 2
+torchrun --nproc_per_node=16 train.py --config config.yaml
 ```
 
 ## 当前限制
@@ -195,12 +199,60 @@ torchrun --nproc_per_node=16 train.py --config config.yaml --ulysses-size 2
 Kimi K3 的 Ulysses CP 当前面向完整序列训练，不支持以下用法：
 
 - generation/cache 输入（`past_key_values`、`cache_position` 或 `use_cache=True`）；
-- Kimi K3 chunk loss；
 - KDA 的预打包 `cu_seqlens` 输入。
+
+Chunk loss 已支持与 CP 同时开启（见下文"长序列（100k+/1M）训练"），且是超长序列的
+必选项。
 
 示例的 `train_step` 已设置 `use_cache=False`。如果使用自定义训练入口，也需要保持该
 设置。若模型 remote-code 中的模块路径发生变化，还需要同步修改 `target_functions`
 和 `module_patches.target`，否则配置校验或 patch 匹配会直接报错。
+
+## 长序列（100k+/1M）训练
+
+超长序列有三个硬性显存瓶颈，各有对应开关（第三个仅多模态）：
+
+1. **注意力中间量**：eager 的 `[batch, 1, S, S]` mask 与 scores/probs 在 1M 下直接 OOM；
+   开启 CP 后模型自动改走 flash 内核（因果由 kernel 原生表达，显存随 S 线性）。
+2. **lm_head/logits**：`[local_seq, vocab]` 全量物化约 200 GiB/rank（1M、CP=8、vocab≈160k）；
+   开启 chunk loss 后分块计算，峰值降至约 2 GiB（chunk 1024）。
+3. **图文合并临时拷贝**：单次赋值物化全量文本 embedding（1M 约 14 GiB，CP 切分前每 rank
+   全量执行）；`memory.mm_merge_chunk_tokens` 设为正整数后按块搬运，结果与单次赋值
+   逐位一致（1M 多模态建议 `65536`，`0` 关闭）。
+
+推荐组合（以 Ulysses 为例，KCP 同理）：
+
+```bash
+NUM_HIDDEN_LAYERS=4 GPUS_PER_NODE=16 LOG_PATH=./kimi_k3_1m.log bash run.sh
+```
+
+```yaml
+memory:
+  chunk_loss: true
+  chunk_loss_size: 1024
+  mm_merge_chunk_tokens: 65536  # 多模态 1M 建议开启；纯文本路径无影响
+  recompute: true
+  recompute_plan:
+    - language_model.model.layers.{*}
+```
+
+`run.sh` 支持的环境变量：`NUM_HIDDEN_LAYERS`（减层调试）。chunk loss 与图文合并分块的
+开关都在 `config.yaml` 的 `memory` 段（`chunk_loss` / `chunk_loss_size` /
+`mm_merge_chunk_tokens`）；用 torchrun 直启时对应 `train.py --config config.yaml`。
+
+CP 路径不需要手工选择内核：任何 CP 配置（ulysses/kcp/kv_allgather 任一 >1）都会让
+模型走 flash 内核。非 CP（单 rank）运行沿用上游 `model.attn_implementation` 的选择
+（示例 config.yaml 默认 `flash_attention_2`），需要 eager 数值参考时把它设为 `eager`。
+
+其它注意事项：
+
+- `data.batch_size` 保持 1（KCP 模式强制）；序列长度会被自动右 padding 到 CP 度的
+  整数倍，无需手工对齐。
+- KDA 的 `skip_kda_recompute` 保持默认 False（kernel 内部反向重算换显存；1M 下开启
+  需要多存每层 GB 级的 h 张量）。
+- flash 与 eager 存在 kernel 级数值差异，切换后需重新生成精度基线。
+- 若 CP 开启但 flash patch 未生效（例如自行裁剪了 patch 列表），flash 前向会显式
+  报错而不是静默算错。
 
 ## 开启 KCP
 
@@ -215,9 +267,9 @@ distributed:
 
   cp_plan:
     kcp_function_patches:
-      # MLA 在 KCP 通信组上复用 Ulysses sequence/head all-to-all。
+      # MLA 走 Ulysses all-to-all（1M 推荐）。
       - target_functions:
-          - modeling_kimi_linear.eager_attention_forward
+          - modeling_kimi_linear.dispatch_attention
         type: full_attention
 
       # KDA 使用状态 Context Parallel。
@@ -232,8 +284,12 @@ distributed:
 ```
 
 KCP 和 Ulysses 是互斥模式，`kcp_parallel_size` 与 `ulysses_parallel_size` 不能同时
-大于 1。KCP 模式仍在同一个 CP 通信组上为 MLA 执行 Ulysses all-to-all，但 KDA
-改为按 rank 顺序传递递推状态，避免为 KDA 在每个 rank 重建完整序列。
+大于 1。KCP 在同一个 CP 通信组上为两类层分别选择策略：
+
+- **MLA（全注意力）**：`full_attention`（Ulysses all-to-all，与 Ulysses 模式同一
+  实现，仅通信组不同）。Kimi K3 有 96 个 head，a2a 每 rank 的 KV 随 cp 缩小，是
+  1M 的唯一可行解。
+- **KDA（线性注意力）**：按 rank 顺序传递递推状态，不为 KDA 在每个 rank 重建完整序列。
 
 KCP 的 world size 约束为：
 
@@ -247,6 +303,6 @@ world_size % (kcp_parallel_size * tensor_parallel_size) == 0
 - `kv_allgather_parallel_size` 必须为 1（未配置时默认值为 1）。
 - `data.batch_size` 和实际 forward batch size 必须为 1。
 - 仅支持三维 BSH 输入，不支持 TND/packed 输入或预打包 `cu_seqlens`。
-- 不支持 generation/cache 输入和 Kimi K3 chunk loss。
+- 不支持 generation/cache 输入（chunk loss 已支持，见上文）。
 - KDA key head dimension 不能超过 256；启用 safe gate 时，`lower_bound` 必须位于
   `[-5, 0)`。

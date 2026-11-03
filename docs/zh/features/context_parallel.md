@@ -71,6 +71,7 @@ DeepSeek-V4.1的KV AllGather CP将序列切成连续等长分片，Q保持本地
 
 - **序列长度对齐**：`max_seq_length`应能被`ulysses_parallel_size`整除，避免序列切分时出现不等长片段。
 - **数据加载**：CP不改变数据加载方式，仍由各DP rank加载完整样本，序列切分在模型forward内完成。
-- **与Chunk Loss互斥**：开启Ulysses CP后不能同时设置`enable_chunk_loss`，模型会直接报错，详见[分块损失计算](./chunk_loss.md)。
-- **与微批次切分互斥**：开启CP后不能同时配置`memory.chunk_batch`，该组合无显式报错守护、行为未定义，详见[微批次切分](./chunk_batch.md)。
+- **Kimi K3的Chunk Loss与CP兼容（推荐长序列开启）**：CP下可同时设置`memory.chunk_loss: true`，此时损失走`cp_chunk_lm_loss`分块路径，不物化`[local_seq, vocab]`全量logits（1M序列、CP=8、vocab≈160k时约200 GiB/rank，分块后降至~2 GiB），详见[分块损失计算](./chunk_loss.md)。
+- **与微批次切分互斥**：开启CP后不能同时配置`memory.chunk_batch`，启动时会显式报错拒绝该组合，详见[微批次切分](./chunk_batch.md)。
 - **典型长序列配置**：对于32k+ 长序列训练，建议`ulysses_parallel_size=2~4`，配合重计算与FSDP2使用。
+- **KCP**：`kcp_parallel_size>1`启用（与Ulysses互斥）；MLA走Ulysses all-to-all，KDA跨rank传递递推状态，详见Kimi K3示例README。

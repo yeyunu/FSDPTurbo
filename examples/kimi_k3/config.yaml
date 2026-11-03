@@ -7,6 +7,8 @@ model:
   model_name_or_path: "moonshotai/Kimi-K3"
   tokenizer_name_or_path: "moonshotai/Kimi-K3"
   torch_dtype: "bf16"
+  # Non-CP runs use this interface (upstream behavior); CP runs switch to the
+  # flash kernel from the CP state.
   attn_implementation: "flash_attention_2"
 
 # --- Optimizer Configuration ---
@@ -135,16 +137,22 @@ distributed:
   # --- Context Parallel Plan ---
   cp_plan:
     # Only the patch set whose parallel size is greater than 1 is applied.
+    # CP runs switch to the flash kernel inside the model; single-rank runs keep
+    # the upstream model.attn_implementation path untouched. Every CP kernel
+    # call goes through modeling_kimi_linear.dispatch_attention, so the wrapper
+    # only needs to wrap that single surface.
     ulysses_function_patches:
       - target_functions:
-          - modeling_kimi_linear.eager_attention_forward
+          - modeling_kimi_linear.dispatch_attention
         type: full_attention
       - target_functions:
           - modeling_kimi_linear.KimiDeltaAttention.forward
         type: kda
     kcp_function_patches:
+      # KCP 的 MLA 走 Ulysses all-to-all(1M 推荐:96 个 head 支持到很大 cp,
+      # 每 rank 的 KV 随 cp 缩小;a2a 不物化全序列 KV)。
       - target_functions:
-          - modeling_kimi_linear.eager_attention_forward
+          - modeling_kimi_linear.dispatch_attention
         type: full_attention
       - target_functions:
           - modeling_kimi_linear.KimiDeltaAttention.forward
@@ -161,6 +169,16 @@ module_patches:
 
 # --- Memory Configuration ---
 memory:
+  # Chunked cross-entropy: streams [chunk_loss_size, vocab] logits instead of
+  # materializing [local_seq, vocab]; required at 1M scale. Supported together
+  # with context parallelism (labels are globally shifted and normalized across
+  # the CP group).
+  chunk_loss: false
+  chunk_loss_size: 1024
+  # Multimodal image-text merge: move the text embeddings this many tokens at a
+  # time so the merge does not materialize a full-sequence copy (~14 GiB at 1M
+  # tokens); 0 keeps the single-shot assignment.
+  mm_merge_chunk_tokens: 0
   recompute: false
   recompute_plan:
     - language_model.model.layers.{*}
