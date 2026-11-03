@@ -63,4 +63,6 @@ def unpermute_cpu(
         return unpermuted_tokens
     unpermuted_tokens = unpermuted_tokens.reshape(-1, topk, permuted_tokens.size(-1))
     unpermuted_tokens *= probs.unsqueeze(-1)
-    return unpermuted_tokens.sum(dim=1)
+    # Under NPU autocast, sum(dim=1) promotes bf16 to fp32; the fused kernel
+    # preserves the input dtype, so restore it for the eager path.
+    return unpermuted_tokens.sum(dim=1).to(permuted_tokens.dtype)

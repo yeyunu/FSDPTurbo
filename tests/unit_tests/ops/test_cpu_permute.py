@@ -127,3 +127,35 @@ def test_permute_unpermute_round_trip_matches_weighted_tokens_and_gradients(topk
     expected.backward(upstream)
     torch.testing.assert_close(tokens.grad, reference_tokens.grad)
     torch.testing.assert_close(probs.grad, reference_probs.grad)
+
+
+@pytest.mark.parametrize("num_tokens", [0, 3])
+def test_unpermute_with_probs_preserves_input_dtype_when_reduction_promotes(monkeypatch, num_tokens):
+    """NPU autocast promotes bf16 sum(dim=1) to fp32; eager unpermute must cast back.
+
+    The fusion-free path runs on the zero-token rank during MoE combine.  Returning
+    fp32 there pollutes the residual stream and makes the next layer's all-to-all
+    mix dtypes.  CPU autocast does not promote bf16 reductions, so emulate the NPU
+    behavior here to keep the regression covered on CPU CI.  The weights use
+    the activation dtype to isolate the reduction promotion; fp32 router
+    weights take the same final sum path.
+    """
+    topk = 2
+    dtype = torch.bfloat16
+    activations = torch.arange(num_tokens * topk * 4, dtype=torch.float32).reshape(-1, 4).to(dtype)
+    probs = torch.full((num_tokens, topk), 0.25, dtype=dtype)
+    sorted_indices = torch.arange(num_tokens * topk - 1, -1, -1)
+    expected = _reference_unpermute(activations, sorted_indices, probs)
+
+    original_sum = torch.Tensor.sum
+
+    def promoted_sum(self, *args, **kwargs):
+        result = original_sum(self, *args, **kwargs)
+        return result.float() if self.dtype == torch.bfloat16 else result
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(torch.Tensor, "sum", promoted_sum)
+        output = cpu_permute.unpermute_cpu(activations, sorted_indices, probs)
+
+    assert output.dtype == dtype, f"unpermute returned {output.dtype}, expected {dtype}"
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
