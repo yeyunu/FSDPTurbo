@@ -344,7 +344,10 @@ class Qwen3_5MoeExperts(hf.Qwen3_5MoeExperts):
             return super().forward(hidden_states, top_k_index, top_k_weights)
         use_eager = hidden_states.device.type != "npu"
         permuted, row_ids = permute(hidden_states, top_k_index.to(torch.int32), use_eager=use_eager)
-        counts = torch.bincount(top_k_index.reshape(-1), minlength=self.num_experts).to(torch.int64)
+        if use_eager:
+            counts = torch.bincount(top_k_index.reshape(-1), minlength=self.num_experts)
+        else:
+            counts = torch.histc(top_k_index, bins=self.num_experts, min=0, max=self.num_experts)
         projected = grouped_matmul(permuted, counts, self.gate_up_proj, use_eager=use_eager)
         activated = swiglu(projected, fused=not use_eager)
         projected = grouped_matmul(activated, counts, self.down_proj, use_eager=use_eager)
