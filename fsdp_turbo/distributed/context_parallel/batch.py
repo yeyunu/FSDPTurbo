@@ -24,29 +24,29 @@ def sequence_parallel_range(seq_len: int, group):
     return start, start + sizes[rank]
 
 
-def pad_tensor_to_group(tensor, group, dim: int, pad_value=0):
-    """Right-pad ``tensor`` so ``dim`` is divisible by the group size.
-
-    torch_npu's F.pad copy kernel computes element offsets in int32 and faults
-    with an "MTE invalid GM address" aicore error once the tensor exceeds
-    2^31 elements. Pad via torch.empty + chunked narrow copies instead.
-    """
+def pad_tensor_to_multiple(tensor, multiple: int, dim: int, pad_value=0):
+    """Right-pad ``tensor`` so ``dim`` is divisible by ``multiple``."""
+    if multiple <= 1:
+        return tensor
     dim %= tensor.dim()
-    world_size = dist.get_world_size(group)
-    pad_size = (world_size - tensor.size(dim) % world_size) % world_size
+    pad_size = (multiple - tensor.size(dim) % multiple) % multiple
     if pad_size == 0:
         return tensor
     shape = list(tensor.shape)
     shape[dim] += pad_size
     out = torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
     out.narrow(dim, tensor.size(dim), pad_size).fill_(pad_value)
-    # Chunk the copies so each narrow().copy_() stays well below 2^31 elements.
     per_row = max(1, tensor.numel() // tensor.size(dim))
     chunk = max(1, (1 << 29) // per_row)
-    for s in range(0, tensor.size(dim), chunk):
-        e = min(s + chunk, tensor.size(dim))
-        out.narrow(dim, s, e - s).copy_(tensor.narrow(dim, s, e - s))
+    for start in range(0, tensor.size(dim), chunk):
+        end = min(start + chunk, tensor.size(dim))
+        out.narrow(dim, start, end - start).copy_(tensor.narrow(dim, start, end - start))
     return out
+
+
+def pad_tensor_to_group(tensor, group, dim: int, pad_value=0):
+    """Right-pad ``tensor`` so ``dim`` is divisible by the group size."""
+    return pad_tensor_to_multiple(tensor, dist.get_world_size(group), dim, pad_value)
 
 
 def split_tensor_to_group(tensor, group, dim: int = 1):

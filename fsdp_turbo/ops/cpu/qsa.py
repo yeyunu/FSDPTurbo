@@ -129,11 +129,11 @@ def qsa_reference_mask(
 @register_op("qsa_selected_token_mask", "cpu")
 def qsa_selected_token_mask_cpu(
     index_queries: torch.Tensor,
-    raw_keys: torch.Tensor,
-    full_cos: torch.Tensor,
-    full_sin: torch.Tensor,
+    raw_keys: torch.Tensor | None,
+    full_cos: torch.Tensor | None,
+    full_sin: torch.Tensor | None,
     attention_mask: torch.Tensor,
-    k_norm_weight: torch.Tensor,
+    k_norm_weight: torch.Tensor | None,
     *,
     rms_norm_eps: float,
     token_budget: int,
@@ -141,12 +141,24 @@ def qsa_selected_token_mask_cpu(
     query_chunk_size: int | None = None,
     validate_prefix_mask: bool = True,
     return_token_ids: bool = False,
+    block_keys: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """CPU backend of ``qsa_selected_token_mask``: the exact eager reference.
 
     ``query_chunk_size`` and ``validate_prefix_mask`` only steer the Triton
     fast path and are accepted for signature compatibility, then ignored.
     """
+    if (raw_keys is None) == (block_keys is None):
+        raise ValueError("exactly one of raw_keys or block_keys must be provided")
+    if block_keys is not None:
+        return qsa_reference_block_mask(
+            index_queries,
+            block_keys,
+            attention_mask,
+            token_budget=token_budget,
+            compress_ratio=compress_ratio,
+            return_token_ids=return_token_ids,
+        )
     return qsa_reference_mask(
         index_queries,
         raw_keys,
@@ -161,4 +173,102 @@ def qsa_selected_token_mask_cpu(
     )
 
 
-__all__ = ["qsa_reference_mask", "qsa_selected_token_mask_cpu"]
+@torch.no_grad()
+def qsa_reference_block_mask(
+    index_queries: torch.Tensor,
+    block_keys: torch.Tensor,
+    attention_mask: torch.Tensor,
+    *,
+    token_budget: int,
+    compress_ratio: int,
+    return_token_ids: bool = False,
+) -> torch.Tensor:
+    """Eager QSA selection over pre-pooled, pre-RoPE'd block keys.
+
+    Companion of :func:`qsa_reference_mask` for the context-parallel path,
+    where block keys are pooled locally per rank and gathered before scoring.
+    Requires a causal-prefix attention mask (the CP forward guarantees this
+    and validates it), so block ``b`` covers tokens
+    ``[b * compress_ratio, (b + 1) * compress_ratio)``.
+    """
+    visible = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
+    counts = visible[:, 0].sum(dim=-1)
+
+    batch_size, query_length, num_heads, head_dim = index_queries.shape
+    num_blocks = block_keys.shape[1]
+    kv_length = num_blocks * compress_ratio
+    block_budget = token_budget // compress_ratio
+    output_width = token_budget + compress_ratio - 1
+    selected = torch.full(
+        (batch_size, query_length, output_width),
+        -1,
+        dtype=torch.int64,
+        device=index_queries.device,
+    )
+
+    lanes = torch.arange(compress_ratio, device=index_queries.device)
+    for batch_idx in range(batch_size):
+        for query_idx in range(query_length):
+            count = int(counts[batch_idx, query_idx])
+            num_complete = count // compress_ratio
+            if num_complete:
+                keys = block_keys[batch_idx, :num_complete]
+                scores = torch.matmul(index_queries[batch_idx, query_idx].float(), keys.float().T).T
+                scores = torch.relu(scores).sum(-1) / math.sqrt(head_dim)
+                top_blocks = scores.topk(min(block_budget, num_complete), dim=0).indices
+                tokens = (top_blocks[:, None] * compress_ratio + lanes[None, :]).reshape(-1)
+            else:
+                tokens = selected.new_empty((0,))
+            tail = torch.arange(num_complete * compress_ratio, count, device=index_queries.device)
+            tokens = torch.cat((tokens, tail))
+            selected[batch_idx, query_idx, : tokens.numel()] = tokens
+
+    if return_token_ids:
+        return selected.to(torch.int32)
+
+    bool_output = torch.zeros(
+        (batch_size, 1, query_length, kv_length + 1), dtype=torch.bool, device=attention_mask.device
+    )
+    scatter_ids = torch.where(selected >= 0, selected, kv_length).unsqueeze(1)
+    bool_output.scatter_(-1, scatter_ids, True)
+    bool_output = bool_output[..., :kv_length]
+    if attention_mask.dtype == torch.bool:
+        return bool_output
+
+    min_value = torch.finfo(attention_mask.dtype).min
+    return torch.where(bool_output, attention_mask.new_zeros(()), min_value)
+
+
+@register_op("qsa_compress_block_keys", "cpu")
+@torch.no_grad()
+def qsa_compress_block_keys_cpu(
+    raw_keys: torch.Tensor,
+    full_cos: torch.Tensor,
+    full_sin: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    *,
+    rms_norm_eps: float,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Pool, normalize and rotate keys locally before CP communication."""
+    if raw_keys.ndim != 3:
+        raise ValueError("raw_keys must be [B, T, D]")
+    batch_size, seq_length, head_dim = raw_keys.shape
+    if seq_length % compress_ratio:
+        raise ValueError(f"raw_keys length ({seq_length}) must be divisible by compress_ratio ({compress_ratio}).")
+    num_blocks = seq_length // compress_ratio
+    pooled = raw_keys.view(batch_size, num_blocks, compress_ratio, head_dim).float().mean(2)
+    compressed = _rms_norm(pooled.to(raw_keys.dtype), k_norm_weight, rms_norm_eps)
+    return _apply_rope(
+        compressed,
+        full_cos[:, : num_blocks * compress_ratio : compress_ratio],
+        full_sin[:, : num_blocks * compress_ratio : compress_ratio],
+    )
+
+
+__all__ = [
+    "qsa_reference_mask",
+    "qsa_reference_block_mask",
+    "qsa_selected_token_mask_cpu",
+    "qsa_compress_block_keys_cpu",
+]

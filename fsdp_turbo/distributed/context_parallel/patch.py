@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from fsdp_turbo.distributed.context_parallel.loss import get_cp_causal_lm_loss_fn
 from fsdp_turbo.utils.log import print_rank
-from fsdp_turbo.utils.patch import patch_namespace_members, resolve_callable
+from fsdp_turbo.utils.patch import patch_namespace_members, resolve_callable, resolve_class_member
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -30,6 +30,7 @@ CP_PATCHES_ATTR = "_fsdp_turbo_cp_patches"
 CAUSAL_LM_LOSS = "causal_lm_loss"
 GATED_DELTA_NET = "gated_delta_net"
 KDA_TYPE = "kda"
+QSA_TYPE = "qsa"
 
 
 def apply_function_patch_specs(
@@ -41,12 +42,15 @@ def apply_function_patch_specs(
 ) -> None:
     """Build and install direct replacements for configured CP patch specs.
 
-    ``type: gated_delta_net`` and ``type: kda`` specs are class-method patches deferred to
+    ``type: qsa``, ``type: gated_delta_net`` and ``type: kda`` specs are class-method patches deferred to
     architecture-aware helpers (they require ``model``); all other types are
     installed as module-level function wrappers via ``patch_types``.
     """
     for spec in specs:
         patch_type = spec["type"]
+        if patch_type == QSA_TYPE:
+            apply_qsa_patches(model, spec, group, label)
+            continue
         if patch_type == GATED_DELTA_NET:
             apply_gdn_patches(model, spec, label)
             continue
@@ -109,7 +113,7 @@ def apply_kda_patches(model: nn.Module, spec: FunctionPatchSpec, group: ProcessG
     if model is None:
         raise RuntimeError(f"[Context Parallel/{label}] KDA patches require a model.")
 
-    from fsdp_turbo.utils.patch import patch_model_members, resolve_class_member
+    from fsdp_turbo.utils.patch import patch_model_members
 
     if label == "Ulysses":
         from fsdp_turbo.modules.kda import get_ulysses_kda_forward
@@ -130,6 +134,28 @@ def apply_kda_patches(model: nn.Module, spec: FunctionPatchSpec, group: ProcessG
         if not matched:
             raise RuntimeError(f"[Context Parallel/{label}] KDA patch target did not match any module: {target!r}.")
         print_rank(logger.info, f"[Context Parallel/{label}] Patched kda: {target}")
+
+
+def apply_qsa_patches(model: nn.Module, spec: FunctionPatchSpec, group: ProcessGroup, label: str) -> None:
+    """Install the group-bound Qwen QSA attention forward on model instances."""
+    if model is None:
+        raise RuntimeError(f"[Context Parallel/{label}] QSA patches require a model.")
+    if label != "Ulysses":
+        raise ValueError(f"QSA patches are not supported in the {label!r} patch field.")
+
+    from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_attention import (
+        get_qwen4_exp_ulysses_forward,
+    )
+    from fsdp_turbo.utils.patch import patch_model_members
+
+    for target in spec["target_functions"]:
+        target_class, member_name = resolve_class_member(target)
+        original = getattr(target_class, member_name)
+        replacement = get_qwen4_exp_ulysses_forward(original, group)
+        matched = patch_model_members(model, target, replacement)
+        if not matched:
+            raise RuntimeError(f"[Context Parallel/{label}] QSA patch target did not match any module: {target!r}.")
+        print_rank(logger.info, f"[Context Parallel/{label}] Patched qsa: {target}")
 
 
 def _replace_transformers_registry_references(original_fn, wrapped_fn):

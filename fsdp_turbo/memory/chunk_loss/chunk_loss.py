@@ -115,9 +115,11 @@ class ChunkLoss(torch.autograd.Function):
                    loss_kwargs_chunks, chunk_size). Only the first two are non-None.
         """
         grad_input, grad_weight = ctx.saved_tensors
-        if torch.ne(grad_output[0], torch.tensor(1.0, device=grad_output[0].device)):
-            grad_input = grad_input * grad_output[0]
-            grad_weight = grad_weight * grad_output[0]
+        # Always apply the upstream scalar.  Comparing a device scalar in a
+        # Python ``if`` forces an NPU synchronization and can surface an
+        # earlier asynchronous HCCL error as an unrelated stream failure.
+        grad_input = grad_input * grad_output[0]
+        grad_weight = grad_weight * grad_output[0]
 
         return grad_input, grad_weight, None, None, None, None
 

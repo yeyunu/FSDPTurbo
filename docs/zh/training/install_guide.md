@@ -101,7 +101,9 @@ FSDPTurbo当前仅支持源码安装。请参考如下操作获取对应源码�
    基础依赖（torch、torchvision、transformers、datasets、triton等）将随上述命令自动安装。如需使用以下扩展能力，可安装对应的可选依赖：
 
    ```shell
-   # 安装fla-core、flash-linear-attention等线性注意力相关依赖（训练Kimi K3等采用线性注意力结构的模型时需要）
+   # 安装Qwen3.8等线性注意力模型所需的固定版本依赖
+   pip3 install fla-core==0.5.2 flash-linear-attention==0.5.2
+   # 安装其他NPU可选依赖
    pip3 install -e ".[npu]"
    ```
 

@@ -50,6 +50,13 @@ def kv_allgather_context_parallelize_modules(
             raise ValueError("Native KV-AllGather CP cannot be combined with function patches.")
         set_group(cp_group)
         return model
+    # Qwen4-Exp attention and GDN carry KV-AllGather in their class-forward
+    # patches.  The Ulysses patch installer will bind the size-1 Ulysses group
+    # when needed; there is no model-level native group setter to call here.
+    qwen_embedded_types = {"qsa", "gated_delta_net"}
+    ulysses_types = {spec["type"] for spec in cp_plan.ulysses_function_patches}
+    if not cp_plan.kv_allgather_function_patches and ulysses_types and ulysses_types <= qwen_embedded_types:
+        return model
     if not cp_plan.kv_allgather_function_patches:
         raise TypeError(
             "KV-AllGather CP requires model.set_context_parallel_group(group) or kv_allgather_function_patches."

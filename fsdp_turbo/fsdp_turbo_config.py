@@ -221,6 +221,8 @@ class CPPlanConfig:
     kcp_function_patches: List[Dict[str, Any]] = field(default_factory=list)
     kv_allgather_function_patches: List[Dict[str, Any]] = field(default_factory=list)
     loss_function_patches: List[Dict[str, Any]] = field(default_factory=list)
+    qsa_cp_query_chunk_size: Optional[int] = None
+    qsa_sparse_gather: Optional[bool] = None
 
 
 @dataclass
@@ -452,6 +454,8 @@ class FSDPTurboConfig:
         if not isinstance(self.memory.chunk_loss, bool):
             raise ValueError("memory.chunk_loss must be a boolean.")
         chunk_size = self.memory.chunk_loss_size
+        if chunk_size is None and not self.memory.chunk_loss:
+            return
         if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
             raise ValueError("memory.chunk_loss_size must be a positive integer.")
         if not self.memory.chunk_loss:
@@ -629,6 +633,16 @@ class FSDPTurboConfig:
         # an explicit empty ulysses_function_patches opts out for models whose
         # Ulysses forwards are built into the modeling classes.
         ulysses_patches_specified = self.distributed.cp_plan.ulysses_function_patches is not None
+        if self.distributed.cp_plan.qsa_cp_query_chunk_size is not None and (
+            isinstance(self.distributed.cp_plan.qsa_cp_query_chunk_size, bool)
+            or not isinstance(self.distributed.cp_plan.qsa_cp_query_chunk_size, int)
+            or self.distributed.cp_plan.qsa_cp_query_chunk_size <= 0
+        ):
+            raise ValueError("distributed.cp_plan.qsa_cp_query_chunk_size must be a positive integer when provided.")
+        if self.distributed.cp_plan.qsa_sparse_gather is not None and not isinstance(
+            self.distributed.cp_plan.qsa_sparse_gather, bool
+        ):
+            raise ValueError("distributed.cp_plan.qsa_sparse_gather must be a boolean when provided.")
         for field_name in (
             "ulysses_function_patches",
             "kcp_function_patches",
@@ -674,11 +688,19 @@ class FSDPTurboConfig:
                 normalized.append(normalized_patch)
             setattr(self.distributed.cp_plan, field_name, normalized)
 
+        # Qwen QSA/GDN forwards carry their own KV-AllGather implementation;
+        # they are installed through the Ulysses class-forward patches below,
+        # so they are not the native-model API path handled by this block.
+        kv_embedded_types = {"qsa", "gated_delta_net"}
+        ulysses_types = {patch["type"] for patch in self.distributed.cp_plan.ulysses_function_patches}
+        qwen_embedded_cp = bool(ulysses_types) and ulysses_types <= kv_embedded_types
+
         # An enabled KV axis without wrappers requires the model's native API.
         # The CP entry verifies that API when the model is available.
         if (
             self.distributed.kv_allgather_parallel_size > 1
             and not self.distributed.cp_plan.kv_allgather_function_patches
+            and not qwen_embedded_cp
         ):
             if any(
                 (
@@ -741,6 +763,21 @@ class FSDPTurboConfig:
                 "distributed.cp_plan.ulysses_function_patches must be set when Ulysses is enabled; "
                 "set it to [] only when the model's Ulysses forwards are built into the modeling classes."
             )
+        # Qwen QSA and GDN forwards embed their own KV-AllGather handling.
+        # They must not be combined with a generic KV patch, and do not need
+        # one when they are the complete Ulysses patch set.
+        if self.distributed.kv_allgather_parallel_size > 1:
+            generic_kv_patches = self.distributed.cp_plan.kv_allgather_function_patches
+            if generic_kv_patches and ulysses_types & kv_embedded_types:
+                raise ValueError(
+                    "Generic kv_allgather_function_patches cannot be combined with the "
+                    "KV-aware Ulysses patch types (qsa, gated_delta_net)."
+                )
+            if not generic_kv_patches and not (ulysses_types and ulysses_types <= kv_embedded_types):
+                raise ValueError(
+                    "distributed.cp_plan.kv_allgather_function_patches must be set when KV-AllGather CP is enabled, "
+                    "unless all Ulysses patch types embed KV-AllGather handling."
+                )
 
         context_parallel_active = (
             kcp_parallel_size > 1 or ulysses_parallel_size > 1 or self.distributed.kv_allgather_parallel_size > 1

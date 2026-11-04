@@ -6,8 +6,10 @@ Registers the fused Triton implementation from
 exact eager reference on its own when a layout is unsupported.
 """
 
+import torch
+
 from fsdp_turbo.ops.registry import register_op
-from fsdp_turbo.ops.triton.qsa_indexer import qsa_selected_token_mask_triton
+from fsdp_turbo.ops.triton.qsa_indexer import qsa_compress_block_keys_triton, qsa_selected_token_mask_triton
 
 
 @register_op("qsa_selected_token_mask", "cuda")
@@ -16,4 +18,25 @@ def qsa_selected_token_mask_cuda(*args, **kwargs):
     return qsa_selected_token_mask_triton(*args, **kwargs)
 
 
-__all__ = ["qsa_selected_token_mask_cuda"]
+@register_op("qsa_compress_block_keys", "cuda")
+def qsa_compress_block_keys_cuda(
+    raw_keys: torch.Tensor,
+    full_cos: torch.Tensor,
+    full_sin: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    *,
+    rms_norm_eps: float,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Compress local QSA keys with the Triton backend before CP gathering."""
+    return qsa_compress_block_keys_triton(
+        raw_keys,
+        full_cos,
+        full_sin,
+        k_norm_weight,
+        rms_norm_eps=rms_norm_eps,
+        compress_ratio=compress_ratio,
+    )
+
+
+__all__ = ["qsa_selected_token_mask_cuda", "qsa_compress_block_keys_cuda"]

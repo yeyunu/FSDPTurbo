@@ -15,7 +15,7 @@ Chunk Loss通过`config.yaml`的`memory`段开启。开关是否生效取决于�
 ```yaml
 memory:
   chunk_loss: true
-  chunk_loss_size: 1024   #每块处理的token数；默认512
+  chunk_loss_size: 512   # 每块处理的token数
 ```
 
 字段校验在`FSDPTurboConfig.__post_init__`的`validate_chunk_loss_config`；chunk loss
@@ -24,7 +24,7 @@ memory:
 
 ## 与上下文并行（CP）的关系
 
-Kimi K3上Chunk Loss与CP**兼容，且超长序列（100k+）下推荐同时开启**。CP前向（`fsdp_turbo/models/kimi/kimi_k3_cp.py`）检测到
+Qwen3.8和Kimi K3的Chunk Loss均支持与CP组合。Kimi K3上超长序列（100k+）下推荐同时开启。CP前向（`fsdp_turbo/models/kimi/kimi_k3_cp.py`）检测到
 `memory.chunk_loss`后走`cp_chunk_lm_loss`（`fsdp_turbo/distributed/context_parallel/loss.py`）：
 
 - 标签仍按**完整序列**全局移位后切分到本rank（与CP感知损失同一套`_shift_and_shard_labels`），跨rank边界样本不丢失；

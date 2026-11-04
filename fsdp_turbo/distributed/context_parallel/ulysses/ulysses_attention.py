@@ -6,8 +6,21 @@ from typing import Callable
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from fsdp_turbo.distributed.context_parallel.communication import all_to_all
+from fsdp_turbo.distributed.context_parallel.kv_allgather.sparse_gather import sparse_gather_rows
+from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import (
+    get_flattened_cp_context,
+    get_kv_allgather_context,
+    kv_allgather,
+)
+from fsdp_turbo.ops.qsa import (
+    apply_query_rope,
+    qsa_compress_block_keys,
+    qsa_selected_token_mask,
+)
 from fsdp_turbo.distributed.context_parallel.ulysses.utils import ulysses_all_to_all
 
 
@@ -249,3 +262,234 @@ def get_ulysses_transposed_compressor_attention_fn(
 ):
     """Wrap compressor attention returning sequence before heads."""
     return get_ulysses_compressor_attention_fn(fn, group=group, attn_output_transposed=True)
+
+
+def _gather_sequence(tensor, group):
+    # Only non-differentiable indexer inputs / RoPE are gathered here. Q/K/V
+    # use the autograd-capable exchanges below.
+    shards = [torch.empty_like(tensor) for _ in range(dist.get_world_size(group))]
+    dist.all_gather(shards, tensor.contiguous(), group=group)
+    return torch.cat(shards, dim=1)
+
+
+def _causal_prefix_mask(validity, start, end):
+    # Global-coordinate causal mask for query rows [start, end) over the
+    # key prefix [0, end), intersected with the full padded validity mask.
+    keys = torch.arange(end, device=validity.device)
+    queries = torch.arange(start, end, device=validity.device)
+    causal = keys[None, :] <= queries[:, None]
+    return causal[None, None, :, :] & validity[:, None, None, :end].bool()
+
+
+def get_qwen4_exp_ulysses_forward(original: Callable, group: dist.ProcessGroup) -> Callable:
+    """Wrap Qwen4ExpTextAttention before its indexer loses global history.
+
+
+
+
+    Requires a full, padded [B,S] validity mask supplied by the post-fusion
+    model forward. Cache inputs and arbitrary 4-D/packed masks are unsupported.
+    """
+
+    @wraps(original)
+    def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
+        kv_group, kv_rank, kv_size = get_kv_allgather_context()
+        cp_group, _cp_rank, cp_size = get_flattened_cp_context()
+        ulysses_size = dist.get_world_size(group)
+        if cp_size == 1:
+            return original(self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs)
+        if kv_size * ulysses_size != cp_size:
+            raise RuntimeError(
+                f"CP topology mismatch: kvallgather ({kv_size}) x ulysses ({ulysses_size}) != cp ({cp_size})."
+            )
+        if past_key_values is not None:
+            raise ValueError("Qwen4 QSA CP supports training without a KV cache only.")
+        if self.config._attn_implementation != "sdpa":
+            raise ValueError("Qwen4 QSA CP requires SDPA.")
+        batch, local_length, _ = hidden_states.shape
+        if batch != 1:
+            raise ValueError("Qwen4 QSA CP currently requires batch size 1.")
+        full_length = local_length * cp_size
+        if attention_mask is None or attention_mask.shape != (batch, full_length):
+            raise ValueError("Qwen4 QSA CP requires the full padded [batch, sequence] validity mask.")
+        validity = attention_mask.bool()
+        # Block keys are pooled per shard, so a 0 -> 1 transition inside the
+        # validity mask would break the prefix-visible assumption of the
+        # scorer (right padding only).
+        if (validity[0, 1:] & ~validity[0, :-1]).any():
+            raise ValueError("Qwen4 QSA CP requires a right-padded validity mask (no holes).")
+
+        heads = self.config.num_attention_heads
+        kv_heads = self.config.num_key_value_heads
+        padded_heads = ((heads + ulysses_size - 1) // ulysses_size) * ulysses_size
+        chunk_size = getattr(self.config, "qsa_cp_query_chunk_size", 128) or 128
+        if not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError("qsa_cp_query_chunk_size must be a positive integer.")
+        sparse_gather = bool(getattr(self.config, "qsa_sparse_gather", True))
+        indexer = self.indexer
+        if indexer.index_kv_heads != 1:
+            raise ValueError("Qwen4 QSA CP currently requires one indexer KV head.")
+        rate = indexer.compress_ratio
+        if local_length % rate != 0:
+            raise ValueError(
+                f"Local sequence length ({local_length}) must be divisible by the QSA compress "
+                f"ratio ({rate}); pad the sequence to a multiple of cp_size * compress_ratio."
+            )
+        # Query chunks stay block-aligned so the scorer's key prefix is exact.
+        chunk_size = ((chunk_size + rate - 1) // rate) * rate
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_emb
+
+        seg_len = local_length * ulysses_size
+        seg_start = kv_rank * seg_len
+        seg_end = seg_start + seg_len
+        ulysses_rank = dist.get_rank(group)
+        local_heads = padded_heads // ulysses_size
+        # Global (padded) head ids held by this rank's Ulysses shard, mapped to
+        # their GQA KV head. Dummy padding heads clamp onto the last KV head;
+        # their outputs are discarded before the gate and o_proj.
+        head_map = (
+            torch.arange(ulysses_rank * local_heads, (ulysses_rank + 1) * local_heads, device=hidden_states.device)
+            // (heads // kv_heads)
+        ).clamp_(max=kv_heads - 1)
+
+        query, gate = self.q_proj(hidden_states).view(batch, local_length, heads, self.head_dim * 2).chunk(2, -1)
+        gate = gate.reshape(batch, local_length, -1)
+        query = self.q_norm(query).transpose(1, 2)
+        key = self.k_norm(self.k_proj(hidden_states).view(batch, local_length, kv_heads, self.head_dim)).transpose(1, 2)
+        value = self.v_proj(hidden_states).view(batch, local_length, kv_heads, self.head_dim).transpose(1, 2)
+        query, key = apply_rotary_pos_emb(query, key, *position_embeddings)
+        if padded_heads != heads:
+            query = F.pad(query, (0, 0, 0, 0, 0, padded_heads - heads))
+        # Only Q takes the head all-to-all; K/V keep their compact GQA form on
+        # the originating CP shard and are gathered on demand below.
+        query = ulysses_all_to_all(query, group, scatter_dim=1, gather_dim=2)
+
+        with torch.no_grad():
+            # Segment inputs for the indexer query side (== this rank's query
+            # rows; the whole sequence when kvallgather is disabled).
+            seg_hidden = _gather_sequence(hidden_states.detach(), group)
+            seg_cos = _gather_sequence(position_embeddings[0].detach(), group)
+            seg_sin = _gather_sequence(position_embeddings[1].detach(), group)
+            # Compressed keys: pool locally, gather S/ratio rows per rank.
+            query_width = indexer.index_n_heads * indexer.index_head_dim
+            raw_keys = F.linear(hidden_states.detach(), indexer.index_qk_proj.weight[query_width:])
+            block_keys = _gather_sequence(
+                qsa_compress_block_keys(
+                    raw_keys,
+                    position_embeddings[0].detach(),
+                    position_embeddings[1].detach(),
+                    indexer.k_layernorm.weight,
+                    rms_norm_eps=indexer.k_layernorm.eps,
+                    compress_ratio=rate,
+                ),
+                cp_group,
+            )
+
+        key_full = value_full = None
+        if not sparse_gather:
+            key_full = kv_allgather(key, cp_group, gather_dim=2)
+            value_full = kv_allgather(value, cp_group, gather_dim=2)
+
+        def indexer_queries(start, end):
+            rows = end - start
+            projected = F.linear(
+                seg_hidden[:, start - seg_start : end - seg_start],
+                indexer.index_qk_proj.weight[:query_width],
+            )
+            index_q = projected.view(batch, rows, indexer.index_n_heads, indexer.index_head_dim)
+            return apply_query_rope(
+                indexer.q_layernorm(index_q),
+                seg_cos[:, start - seg_start : end - seg_start],
+                seg_sin[:, start - seg_start : end - seg_start],
+            )
+
+        def select(start, end, return_ids):
+            return qsa_selected_token_mask(
+                indexer_queries(start, end),
+                None,
+                None,
+                None,
+                _causal_prefix_mask(attention_mask, start, end),
+                None,
+                rms_norm_eps=indexer.k_layernorm.eps,
+                token_budget=indexer.token_budget,
+                compress_ratio=rate,
+                block_keys=block_keys[:, : end // rate],
+                return_token_ids=return_ids,
+            )
+
+        def attend_sparse(q, k, v, start, end):
+            # Selection is a no-grad constant; only the selected-token gather
+            # and SDPA participate in autograd (replayed under checkpoint).
+            with torch.no_grad():
+                sel_ids = select(start, end, return_ids=True)[0]
+                width = sel_ids.shape[-1]
+                flat = sel_ids.reshape(-1).to(torch.int64)
+                keep = flat >= 0
+                union_ids = torch.unique(flat[keep])
+            n_union = union_ids.numel()
+            if n_union == 0:
+                return q.new_zeros(q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
+            k_sel, v_sel = sparse_gather_rows((k, v), union_ids, local_length, cp_group)
+            k_sel = k_sel.index_select(1, head_map)
+            v_sel = v_sel.index_select(1, head_map)
+            with torch.no_grad():
+                # Position of every selected token inside the gathered set.
+                pos = torch.searchsorted(union_ids, flat.clamp(min=0))
+                row = torch.arange(flat.shape[0], device=flat.device) // width
+                rows = end - start
+                chunk_mask = torch.zeros(rows, n_union + 1, dtype=torch.bool, device=q.device)
+                chunk_mask.view(-1).index_fill_(0, (row * (n_union + 1) + pos)[keep], True)
+                chunk_mask = chunk_mask[:, :n_union].unsqueeze(0).unsqueeze(0)
+            return F.scaled_dot_product_attention(
+                q,
+                k_sel,
+                v_sel,
+                attn_mask=chunk_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=False,
+                scale=self.scaling,
+            )
+
+        def attend_dense(q, _k, _v, start, end):
+            with torch.no_grad():
+                mask = _causal_prefix_mask(attention_mask, start, end) & select(start, end, return_ids=False)
+            k_chunk = key_full[:, :, :end].index_select(1, head_map)
+            v_chunk = value_full[:, :, :end].index_select(1, head_map)
+            return F.scaled_dot_product_attention(
+                q,
+                k_chunk,
+                v_chunk,
+                attn_mask=mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=False,
+                scale=self.scaling,
+            )
+
+        attend = attend_sparse if sparse_gather else attend_dense
+
+        chunks = []
+        for start in range(seg_start, seg_end, chunk_size):
+            end = min(start + chunk_size, seg_end)
+
+            # Bind offsets now: backward recomputation happens after this loop.
+            def run_chunk(q, k, v, _start=start, _end=end):
+                return attend(q, k, v, _start, _end)
+
+            q_chunk = query[:, :, start - seg_start : end - seg_start]
+            if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (query, key, value)):
+                # Recreate the selection and replay its collectives during
+                # backward instead of retaining gathered KV sets across all
+                # chunks. Every rank replays the same deterministic sequence.
+                output = checkpoint(run_chunk, q_chunk, key, value, use_reentrant=False)
+            else:
+                output = run_chunk(q_chunk, key, value)
+            chunks.append(output)
+        output = torch.cat(chunks, dim=2).transpose(1, 2).contiguous()
+        output = ulysses_all_to_all(output, group, scatter_dim=1, gather_dim=2)
+        output = output[:, :, :heads, :]
+        output = output.reshape(batch, local_length, -1) * torch.sigmoid(gate)
+        return self.o_proj(output), None
+
+    forward._qwen4_qsa_ulysses = True
+    return forward

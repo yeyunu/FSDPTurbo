@@ -3,12 +3,16 @@
 # Copyright 2026, Huawei Technologies Co., Ltd. All rights reserved.
 from typing import Optional
 
+
+# pylint: disable=no-name-in-module
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
 from fsdp_turbo.distributed.context_parallel.batch import split_tensor_to_group
+from fsdp_turbo.distributed.context_parallel.kv_allgather.conv_tail import conv_tail_exchange
+from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import get_kv_allgather_context
 from fsdp_turbo.distributed.context_parallel.ulysses.utils import (
     get_ulysses_context,
     ulysses_all_to_all,
@@ -16,7 +20,8 @@ from fsdp_turbo.distributed.context_parallel.ulysses.utils import (
 
 
 def apply_mask_to_padding_states(hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor]):
-    """Zero padded hidden states when a two-dimensional mask is available."""
+    """
+    # pylint: disable=import-errorZero padded hidden states when a two-dimensional mask is available."""
     if attention_mask is not None and attention_mask.dim() == 2:
         return hidden_states.mul(attention_mask[:, :, None].to(device=hidden_states.device, dtype=hidden_states.dtype))
     return hidden_states
@@ -144,6 +149,42 @@ def _resolve_gdn_func(self, func_name, module_func_name=None):
     return None
 
 
+def gdn_kv_allgather_scan(query, key, value, g, beta, kv_group, total_seq_len):
+    """Chunked GDN scan with FLA's native context parallelism on the KV axis.
+
+    Each rank holds one contiguous segment (after the Ulysses head all-to-all)
+    of the global sequence described by ``cu_seqlens = [0, total_seq_len]``.
+    FLA's CP pre-process computes every rank's local prefix state, exchanges
+    the packed ``[S_ext | M]`` tensors (traffic independent of sequence
+    length) and merges the chain to recover this rank's initial state, with
+    forward and backward both implemented inside its autograd function.
+    """
+    try:
+        from fla.ops.cp import build_cp_context
+    except ImportError as error:
+        raise RuntimeError(
+            "GDN KV-AllGather CP requires a flash-linear-attention build with "
+            "fla.ops.cp (KCP support); the installed copy does not provide it."
+        ) from error
+
+    from fsdp_turbo.ops.gdn import chunk_gdn
+
+    cu_seqlens = torch.tensor([0, total_seq_len], dtype=torch.long, device=query.device)
+    cp_context = build_cp_context(cu_seqlens, group=kv_group)
+    core_attn_out, _ = chunk_gdn(
+        query,
+        key,
+        value,
+        g=g,
+        beta=beta,
+        initial_state=None,
+        output_final_state=False,
+        use_qk_l2norm_in_kernel=True,
+        cp_context=cp_context,
+    )
+    return core_attn_out
+
+
 class GatedDeltaNet(nn.Module):
     def forward(
         self,
@@ -159,10 +200,13 @@ class GatedDeltaNet(nn.Module):
         else:
             ulysses_rank = dist.get_rank(ulysses_group)
             ulysses_size = dist.get_world_size(ulysses_group)
+        kv_group, _kv_rank, kv_size = get_kv_allgather_context()
 
         if ulysses_size > 1 and cache_params is not None:
             label = "Qwen3.5 MoE" if "Moe" in type(self).__name__ else "Qwen3.5"
             raise ValueError(f"Ulysses CP for {label} GatedDeltaNet does not support cache yet.")
+        if kv_size > 1 and cache_params is not None:
+            raise ValueError("KV-AllGather CP for GatedDeltaNet does not support cache.")
 
         if (
             ulysses_size > 1
@@ -178,6 +222,11 @@ class GatedDeltaNet(nn.Module):
         hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
 
         batch_size, seq_len, _ = hidden_states.shape
+        if kv_size > 1 and batch_size != 1:
+            raise ValueError(
+                "GDN KV-AllGather CP requires batch size 1 (FLA context parallelism "
+                "operates on flattened varlen sequences)."
+            )
         use_precomputed_states = cache_params is not None and cache_params.has_previous_state(self.layer_idx)
 
         conv_state = None
@@ -215,6 +264,12 @@ class GatedDeltaNet(nn.Module):
         local_conv_dim = local_key_dim * 2 + local_value_dim
         full_seq_len = seq_len * ulysses_size if ulysses_size > 1 else seq_len
 
+        conv_borrowed = False
+        if kv_size > 1:
+            # Borrow the previous segment's last conv_kernel-1 tokens (same
+            # head shard: the KV-AllGather group fixes the Ulysses coordinate)
+            # so the causal conv sees true cross-segment context.
+            mixed_qkv, conv_borrowed = conv_tail_exchange(mixed_qkv, kv_group, self.conv_kernel_size - 1)
         mixed_qkv = mixed_qkv.transpose(1, 2)
         if ulysses_size > 1:
             conv_weight, conv_bias = ulysses_gdn_get_conv_params(
@@ -263,6 +318,10 @@ class GatedDeltaNet(nn.Module):
                 )
             if use_precomputed_states:
                 mixed_qkv = mixed_qkv[:, :, -seq_len:]
+        if conv_borrowed:
+            # Outputs for the borrowed prefix tokens belong to the previous
+            # segment; drop them so local tokens keep their true context.
+            mixed_qkv = mixed_qkv[:, :, self.conv_kernel_size - 1 :]
 
         mixed_qkv = mixed_qkv.transpose(1, 2)
         query, key, value = torch.split(
@@ -284,7 +343,21 @@ class GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(local_num_v_heads // local_num_k_heads, dim=2)
             key = key.repeat_interleave(local_num_v_heads // local_num_k_heads, dim=2)
 
-        if use_precomputed_states and seq_len == 1:
+        if kv_size > 1:
+            # FLA context-parallel scan across the KV-AllGather axis: the
+            # global sequence is [0, seq_len * (kv * ulysses)] and this rank's
+            # input is its contiguous segment of it.
+            core_attn_out = gdn_kv_allgather_scan(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                kv_group=kv_group,
+                total_seq_len=seq_len * kv_size * ulysses_size,
+            )
+            last_recurrent_state = None
+        elif use_precomputed_states and seq_len == 1:
             recurrent_gated_delta_rule = _resolve_gdn_func(
                 self, "recurrent_gated_delta_rule", "torch_recurrent_gated_delta_rule"
             )

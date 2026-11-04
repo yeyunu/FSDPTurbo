@@ -94,6 +94,11 @@ class FSDPTurbo(torch.nn.Module):
         cp_plan = self.config.distributed.cp_plan
         ulysses_enabled = self.config.distributed.ulysses_parallel_size > 1
         kcp_enabled = self.config.distributed.kcp_parallel_size > 1
+        # Qwen4-Exp class-forward patches own both the QSA/Ulysses layout and
+        # the KV-AllGather path.  Install them for pure KV-AllGather runs as
+        # well (Ulysses size 1); the size-1 Ulysses group makes its all-to-all
+        # a no-op while the flattened CP group still spans KV ranks.
+        cp_enabled = self.parallel_state.get_cp_group_size() > 1
         if self.parallel_state.get_kvallgather_group_size() > 1:
             self.model = kv_allgather_context_parallelize_modules(
                 self.model,
@@ -101,7 +106,7 @@ class FSDPTurbo(torch.nn.Module):
                 cp_plan,
             )
 
-        if ulysses_enabled:
+        if ulysses_enabled or (cp_enabled and cp_plan.ulysses_function_patches):
             self.model = ulysses_context_parallelize_modules(
                 self.model,
                 self.parallel_state.get_ulysses_group(),

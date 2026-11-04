@@ -29,7 +29,7 @@ from fsdp_turbo.ops.npu.rms_norm import rms_norm_npu
 from fsdp_turbo.ops.npu.rope import inplace_rope_npu, partial_rope_npu, rope_npu
 from fsdp_turbo.ops.npu.partial_rotary import cann_partial_rotary
 from fsdp_turbo.ops.npu.fused_attention import npu_fusion_attention_npu
-from fsdp_turbo.ops.npu.qsa import qsa_selected_token_mask_npu
+from fsdp_turbo.ops.npu.qsa import qsa_compress_block_keys_npu, qsa_selected_token_mask_npu
 
 from fsdp_turbo.ops.npu.situ_glu import situ_glu_npu
 from fsdp_turbo.ops.npu.sparse_attention import (
@@ -110,6 +110,7 @@ __all__ = [
     'partial_rope_npu',
     'cann_partial_rotary',
     'qsa_selected_token_mask_npu',
+    'qsa_compress_block_keys_npu',
     'hc_split_sinkhorn_npu',
     'lightning_indexer_score_npu',
     'sparse_flash_attention_npu',

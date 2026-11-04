@@ -49,6 +49,17 @@ def _overwrite_qwen4_exp_config(model_config, config):
     text_cfg.gdn_implementation = "triton"
     text_cfg.causal_conv1d_implementation = "triton"
     text_cfg.qsa_implementation = "triton"
+    # Qwen-specific CP settings belong to the HF text config.
+    # Preserve values loaded from the model config; adjust them here to tune CP.
+    cp_plan = config.distributed.cp_plan
+    qsa_chunk_size = getattr(cp_plan, "qsa_cp_query_chunk_size", None)
+    text_cfg.qsa_cp_query_chunk_size = (
+        qsa_chunk_size if qsa_chunk_size is not None else getattr(text_cfg, "qsa_cp_query_chunk_size", 128)
+    )
+    qsa_sparse_gather = getattr(cp_plan, "qsa_sparse_gather", None)
+    text_cfg.qsa_sparse_gather = (
+        qsa_sparse_gather if qsa_sparse_gather is not None else getattr(text_cfg, "qsa_sparse_gather", True)
+    )
     text_cfg.skip_gdn_recompute = True
     text_cfg.skip_flash_attn_recompute = True
     if vision_cfg is not None:
@@ -75,7 +86,8 @@ def _overwrite_qwen4_exp_config(model_config, config):
         if text_cfg.ngram_vocab_size_base <= 0:
             raise ValueError(f"Invalid NGRAM_VOCAB_SIZE_BASE='{ngram_vocab_size_base}'.")
 
-    text_cfg.enable_chunk_loss = getattr(config.memory, "chunk_batch", False)
+    text_cfg.enable_chunk_loss = config.memory.chunk_loss
+    text_cfg.chunk_loss_size = config.memory.chunk_loss_size
     text_cfg.enable_dynamic_chunk_loss = False
 
     text_cfg.enable_ep_balance = False
@@ -99,6 +111,7 @@ class Qwen38FlashNextTrainer(BaseTrainer):
 
             print_rank(logger.info, "> Building Processor (multimodal)...")
             processor = AutoProcessor.from_pretrained(self.config.model.tokenizer_name_or_path, trust_remote_code=True)
+            processor.tokenizer.model_max_length = self.config.data.max_seq_length
             self.processor = processor
             return processor.tokenizer
         return super().build_tokenizer()

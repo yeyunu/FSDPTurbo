@@ -21,6 +21,8 @@ distributed:
       - target_functions:
           - transformers.loss.loss_utils.ForCausalLMLoss
         type: causal_lm_loss
+    qsa_cp_query_chunk_size: null
+    qsa_sparse_gather: false
 ```
 
 ## 参数说明
@@ -32,6 +34,8 @@ distributed:
 | `ulysses_function_patches` | 注意力函数替换列表：`target_functions`指定被替换函数（全限定名），`type`指定替换类型（`full_attention`、`gated_delta_net`等，也支持Callable自定义注意力）。显式设为`[]`表示模型自管理Ulysses forward（如GLM-5.3-Flash，无需替换）；未设置该键且`ulysses_parallel_size > 1`时配置校验报错 |
 | `kv_allgather_function_patches` | KV AllGather场景的函数替换 |
 | `loss_function_patches` | 损失函数替换（如`causal_lm_loss`），保证CP切分后loss正确同步 |
+| `qsa_cp_query_chunk_size` | Qwen3.8 QSA在CP下的query分块大小；`null`使用模型默认值128 |
+| `qsa_sparse_gather` | Qwen3.8是否只收集QSA选中的KV；长序列建议设为`true` |
 
 ## 配合module_patches
 
@@ -44,6 +48,23 @@ module_patches:
 ```
 
 FSDPTurbo已为部分主流模型提供替换实现（见`fsdp_turbo/models/`）。
+
+## Qwen3.8-Flash-Next
+
+运行Qwen3.8示例前必须安装线性注意力依赖：
+
+```bash
+pip install fla-core==0.5.2 flash-linear-attention==0.5.2
+```
+
+Qwen3.8的CP实现在`fsdp_turbo/models/qwen/modeling_qwen4_exp.py`中，
+在多模态融合后切分序列，并覆盖QSA全注意力与GatedDeltaNet线性注意力。
+`examples/qwen3_8/train.py`会将`cp_plan`中的QSA参数传入模型文本配置。
+
+当`kv_allgather_parallel_size > 1`时，Qwen专用的
+`qsa`与`gated_delta_net` forward已内置KV-AllGather，
+无需配置通用`kv_allgather_function_patches`。`ulysses_parallel_size`可以设为
+`1`，此时仍可单独使用KV-AllGather。
 
 ## CP Loss同步机制
 
@@ -71,7 +92,7 @@ DeepSeek-V4.1的KV AllGather CP将序列切成连续等长分片，Q保持本地
 
 - **序列长度对齐**：`max_seq_length`应能被`ulysses_parallel_size`整除，避免序列切分时出现不等长片段。
 - **数据加载**：CP不改变数据加载方式，仍由各DP rank加载完整样本，序列切分在模型forward内完成。
-- **Kimi K3的Chunk Loss与CP兼容（推荐长序列开启）**：CP下可同时设置`memory.chunk_loss: true`，此时损失走`cp_chunk_lm_loss`分块路径，不物化`[local_seq, vocab]`全量logits（1M序列、CP=8、vocab≈160k时约200 GiB/rank，分块后降至~2 GiB），详见[分块损失计算](./chunk_loss.md)。
+- **Qwen3.8和Kimi K3的Chunk Loss均支持CP**：CP下可同时设置`memory.chunk_loss: true`，Kimi K3此时损失走`cp_chunk_lm_loss`分块路径，不物化`[local_seq, vocab]`全量logits（1M序列、CP=8、vocab≈160k时约200 GiB/rank，分块后降至~2 GiB），详见[分块损失计算](./chunk_loss.md)。
 - **与微批次切分互斥**：开启CP后不能同时配置`memory.chunk_batch`，启动时会显式报错拒绝该组合，详见[微批次切分](./chunk_batch.md)。
 - **典型长序列配置**：对于32k+ 长序列训练，建议`ulysses_parallel_size=2~4`，配合重计算与FSDP2使用。
 - **KCP**：`kcp_parallel_size>1`启用（与Ulysses互斥）；MLA走Ulysses all-to-all，KDA跨rank传递递推状态，详见Kimi K3示例README。

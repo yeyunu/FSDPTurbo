@@ -107,6 +107,15 @@ def cp_compute_lm_loss(
     """
     logits = logits.float()
 
+    seq_dim = (shift_labels if shift_labels is not None else labels).dim() - 1
+    global_logits_length = logits.size(-2) * dist.get_world_size(group)
+    label_length = (shift_labels if shift_labels is not None else labels).size(seq_dim)
+    if label_length > global_logits_length:
+        raise ValueError(
+            "CP loss received complete labels longer than the global logits: "
+            f"labels_length={label_length}, global_logits_length={global_logits_length}."
+        )
+
     if shift_labels is None:
         # Complete unshifted labels: shift globally first so tokens at CP shard
         # boundaries keep the same next-token target, then pad and split.

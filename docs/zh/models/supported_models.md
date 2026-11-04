@@ -27,6 +27,12 @@ FSDPTurbo与模型结构解耦，理论上支持各类基于Transformer架构的
 |---|---|---|---|---|---|
 | Qwen3.5-27B（多模态） | [Qwen/Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B) | `examples/qwen3_5` | 2048 | 1x16 | FSDP2 + TP + Ulysses CP + 重计算 |
 
+## 长序列多模态模型
+
+| 模型 | 下载链接 | 示例目录 | 序列长度 | 集群规模 | 关键特性 |
+|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | `examples/qwen3_8` | 1M（可配置） | 64卡示例 | FSDP2 + EP + Ulysses/KV AllGather CP + VP + Chunk Loss |
+
 ## MoE模型
 
 MoE模型（Mixture of Experts Model）通过门控网络将输入路由到部分专家网络，在扩大参数规模的同时控制计算开销。

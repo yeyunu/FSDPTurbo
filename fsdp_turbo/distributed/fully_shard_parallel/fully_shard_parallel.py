@@ -1,3 +1,4 @@
+# Copyright (c) 2024 Meta Inc.
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import logging
 from typing import Set, List, Any, Optional
@@ -35,6 +36,16 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, 
     for module, plan in fsdp_modules.items():
         module_config = config.copy()
         module_config.update(plan)
+        if getattr(module, "_fsdp_turbo_chunk_loss_head", False):
+            # This head returns an FP32 loss sum rather than BF16 logits.
+            # Keep the scalar in FP32 until normalization outside the head.
+            policy = module_config['mp_policy']
+            module_config['mp_policy'] = MixedPrecisionPolicy(
+                param_dtype=policy.param_dtype,
+                reduce_dtype=policy.reduce_dtype,
+                output_dtype=None,
+                cast_forward_inputs=policy.cast_forward_inputs,
+            )
         hook_module = find_hook_module(module, hook_modules)
         fully_shard_fn(module, hook_module=hook_module, **module_config)
     fully_shard_fn(model, **config)

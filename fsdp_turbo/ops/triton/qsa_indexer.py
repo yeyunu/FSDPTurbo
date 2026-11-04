@@ -1,12 +1,13 @@
-"""Fused Triton implementation of the Qwen3.8 / Qwen4-Exp QSA routing operator.
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+"""Fused Triton kernels for Qwen3.8 / Qwen4-Exp QSA routing.
 
-This is the Triton backend of ``qsa_selected_token_mask`` (dispatched through
-``fsdp_turbo.ops.qsa`` and registered by the NPU/CUDA backends).  The fast path
-targets the model's standard causal-prefix mask.  It removes the per-query
-Python loop from the Hugging Face reference implementation while retaining
-``torch.topk``: Ascend's optimized TopK is substantially better than an
-iterative scalar selection loop in Triton.
+The fast path targets the model's standard causal-prefix mask.  It removes the
+per-query Python loop from the Hugging Face reference implementation while
+retaining ``torch.topk``: Ascend's optimized TopK is substantially better than
+an iterative scalar selection loop in Triton.
 """
+
+# pylint: disable=possibly-used-before-assignment
 
 from __future__ import annotations
 
@@ -14,10 +15,15 @@ import logging
 
 import torch
 
-from fsdp_turbo.ops.cpu.qsa import qsa_reference_mask
+from fsdp_turbo.ops.cpu.qsa import (
+    _apply_rope,
+    qsa_compress_block_keys_cpu,
+    qsa_reference_block_mask,
+    qsa_reference_mask,
+)
+from fsdp_turbo.utils.log import log_warning_once
 
 logger = logging.getLogger(__name__)
-_fallback_warned = False
 
 try:
     import triton
@@ -251,15 +257,6 @@ if _TRITON_AVAILABLE:
         tl.store(out_ptr, token_id, mask=is_sparse & (offsets < block_budget * compress_ratio))
 
 
-def _apply_query_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    rotary_dim = cos.shape[-1]
-    half = rotary_dim // 2
-    rope, passthrough = x[..., :rotary_dim], x[..., rotary_dim:]
-    rotated_half = torch.cat((-rope[..., half:], rope[..., :half]), dim=-1)
-    rotated = rope * cos.unsqueeze(2) + rotated_half * sin.unsqueeze(2)
-    return torch.cat((rotated, passthrough), dim=-1)
-
-
 def _visible_counts(attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     visible = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
     return visible, visible[:, 0].sum(dim=-1).to(torch.int32)
@@ -273,13 +270,81 @@ def _is_prefix_mask(visible: torch.Tensor, counts: torch.Tensor) -> bool:
 
 
 @torch.no_grad()
-def qsa_selected_token_mask_triton(
-    index_queries: torch.Tensor,
+def qsa_compress_block_keys_triton(
     raw_keys: torch.Tensor,
     full_cos: torch.Tensor,
     full_sin: torch.Tensor,
-    attention_mask: torch.Tensor,
     k_norm_weight: torch.Tensor,
+    *,
+    rms_norm_eps: float,
+    compress_ratio: int,
+) -> torch.Tensor:
+    """Pool raw indexer keys into normalized, RoPE-rotated block keys.
+
+    This is the locally-shardable half of ``qsa_selected_token_mask``: the
+    context-parallel forward runs it on each rank's sequence shard (the shard
+    length must be divisible by ``compress_ratio`` so blocks never straddle a
+    rank boundary) and gathers the small ``[B, S/ratio, D]`` result instead of
+    the full hidden states.  Bitwise it mirrors the fast path: pooling and
+    RMSNorm in the Triton kernel, RoPE applied by the vectorized PyTorch op.
+    """
+    if raw_keys.ndim != 3:
+        raise ValueError("raw_keys must be [B, T, D]")
+    batch_size, seq_length, head_dim = raw_keys.shape
+    if seq_length % compress_ratio:
+        raise ValueError(f"raw_keys length ({seq_length}) must be divisible by compress_ratio ({compress_ratio}).")
+    num_blocks = seq_length // compress_ratio
+    block_cos = full_cos[:, : num_blocks * compress_ratio : compress_ratio]
+    block_sin = full_sin[:, : num_blocks * compress_ratio : compress_ratio]
+
+    use_triton = (
+        _TRITON_AVAILABLE
+        and raw_keys.device.type in ("npu", "cuda")
+        and raw_keys.dtype in (torch.float16, torch.bfloat16)
+        and head_dim >= 16
+        and head_dim % 16 == 0
+    )
+    if use_triton:
+        compressed = torch.empty((batch_size, num_blocks, head_dim), dtype=raw_keys.dtype, device=raw_keys.device)
+        _compress_norm_rope_kernel[(batch_size, num_blocks)](
+            raw_keys,
+            k_norm_weight,
+            full_cos,
+            full_sin,
+            compressed,
+            *raw_keys.stride(),
+            *compressed.stride(),
+            *full_cos.stride(),
+            *full_sin.stride(),
+            num_blocks=num_blocks,
+            head_dim=head_dim,
+            rotary_dim=full_cos.shape[-1],
+            eps=rms_norm_eps,
+            compress_ratio=compress_ratio,
+            input_is_bf16=raw_keys.dtype == torch.bfloat16,
+            apply_rope=False,
+            BLOCK_D=triton.next_power_of_2(head_dim),
+        )
+    else:
+        return qsa_compress_block_keys_cpu(
+            raw_keys,
+            full_cos,
+            full_sin,
+            k_norm_weight,
+            rms_norm_eps=rms_norm_eps,
+            compress_ratio=compress_ratio,
+        )
+    return _apply_rope(compressed, block_cos, block_sin)
+
+
+@torch.no_grad()
+def qsa_selected_token_mask_triton(
+    index_queries: torch.Tensor,
+    raw_keys: torch.Tensor | None,
+    full_cos: torch.Tensor | None,
+    full_sin: torch.Tensor | None,
+    attention_mask: torch.Tensor,
+    k_norm_weight: torch.Tensor | None,
     *,
     rms_norm_eps: float,
     token_budget: int,
@@ -287,42 +352,67 @@ def qsa_selected_token_mask_triton(
     query_chunk_size: int | None = None,
     validate_prefix_mask: bool = True,
     return_token_ids: bool = False,
+    block_keys: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Triton backend of ``qsa_selected_token_mask`` for NPU/CUDA tensors.
+    """Select QSA tokens using fused Triton kernels on NPU/CUDA.
 
     The accelerated route requires a causal prefix mask: every row must be
     ``True...True,False...False`` (or ``0...0,-inf...-inf`` for additive
     masks).  Set ``validate_prefix_mask=True`` while bringing up a new data
     pipeline; non-prefix masks then use the exact eager fallback.  Disable the
     check in production to avoid a device synchronization at every QSA layer.
+
+    Pass ``block_keys`` (``[B, S/ratio, D]`` output of
+    :func:`qsa_compress_block_keys`) instead of ``raw_keys`` to skip the
+    compression stage — used by the context-parallel forward, which pools the
+    keys locally per rank and gathers the compressed result.
     """
-    # Triton kernels are module-level names defined under ``if _TRITON_AVAILABLE``;
-    # every use below is guarded by ``use_triton`` which requires that flag.
-    # pylint: disable=possibly-used-before-assignment
-    if index_queries.ndim != 4 or raw_keys.ndim != 3:
-        raise ValueError("index_queries and raw_keys must be [B,Q,H,D] and [B,KV,D]")
+    if index_queries.ndim != 4:
+        raise ValueError("index_queries must be [B,Q,H,D]")
     batch_size, query_length, num_heads, head_dim = index_queries.shape
-    kv_length = raw_keys.shape[1]
     if not batch_size or not query_length or not num_heads or not head_dim:
         raise ValueError("QSA does not support empty batch/query/head dimensions")
-    if kv_length < query_length:
-        raise ValueError("KV length must be greater than or equal to query length")
-    if raw_keys.shape != (batch_size, kv_length, head_dim):
-        raise ValueError("raw_keys must match the query batch and head dimension")
+    if (raw_keys is None) == (block_keys is None):
+        raise ValueError("exactly one of raw_keys or block_keys must be provided")
+
+    if block_keys is not None:
+        if block_keys.ndim != 3 or block_keys.shape[0] not in (1, batch_size):
+            raise ValueError("block_keys must be [B, S/ratio, D] with batch one or B")
+        if block_keys.shape[2] != head_dim:
+            raise ValueError("block_keys must match the index query head dimension")
+        if full_cos is not None or full_sin is not None or k_norm_weight is not None:
+            raise ValueError("full_cos/full_sin/k_norm_weight are unused with block_keys")
+        kv_length = block_keys.shape[1] * compress_ratio
+        keys_dtype = block_keys.dtype
+    else:
+        if raw_keys.ndim != 3:
+            raise ValueError("raw_keys must be [B,KV,D]")
+        kv_length = raw_keys.shape[1]
+        if kv_length < query_length:
+            raise ValueError("KV length must be greater than or equal to query length")
+        if raw_keys.shape != (batch_size, kv_length, head_dim):
+            raise ValueError("raw_keys must match the query batch and head dimension")
+        if full_cos is None or full_sin is None or k_norm_weight is None:
+            raise ValueError("full_cos/full_sin/k_norm_weight are required with raw_keys")
+        if full_cos.ndim != 3 or full_sin.shape != full_cos.shape:
+            raise ValueError("full_cos/full_sin must have the same [B,KV,R] shape")
+        if full_cos.shape[1] != kv_length or full_cos.shape[0] not in (1, batch_size):
+            raise ValueError("RoPE batch must be one or B and its sequence axis must equal KV")
+        if k_norm_weight.shape != (head_dim,):
+            raise ValueError("k_norm_weight must have shape [D]")
+        keys_dtype = raw_keys.dtype
+
     if attention_mask.shape != (batch_size, 1, query_length, kv_length):
         raise ValueError("attention_mask must be [B,1,Q,KV]")
-    if full_cos.ndim != 3 or full_sin.shape != full_cos.shape:
-        raise ValueError("full_cos/full_sin must have the same [B,KV,R] shape")
-    if full_cos.shape[1] != kv_length or full_cos.shape[0] not in (1, batch_size):
-        raise ValueError("RoPE batch must be one or B and its sequence axis must equal KV")
-    if k_norm_weight.shape != (head_dim,):
-        raise ValueError("k_norm_weight must have shape [D]")
-    rotary_dim = full_cos.shape[-1]
+    rotary_dim = full_cos.shape[-1] if full_cos is not None else head_dim
     if rotary_dim <= 0 or rotary_dim > head_dim or rotary_dim % 2:
         raise ValueError("RoPE width must be positive, even, and no greater than the head dimension")
-    input_tensors = (raw_keys, full_cos, full_sin, attention_mask, k_norm_weight)
+    input_tensors = (attention_mask, block_keys if block_keys is not None else raw_keys)
     if any(tensor.device != index_queries.device for tensor in input_tensors):
         raise ValueError("all QSA tensors must be on the same device")
+    if full_cos is not None:
+        if full_cos.device != index_queries.device or full_sin.device != index_queries.device:
+            raise ValueError("all QSA tensors must be on the same device")
     if token_budget <= 0 or compress_ratio <= 1 or token_budget % compress_ratio:
         raise ValueError("token_budget must be positive and divisible by compress_ratio > 1")
     if query_chunk_size is not None and query_chunk_size <= 0:
@@ -335,7 +425,7 @@ def qsa_selected_token_mask_triton(
         _TRITON_AVAILABLE
         and device_type in ("npu", "cuda")
         and supported_dtype
-        and raw_keys.dtype == index_queries.dtype
+        and keys_dtype == index_queries.dtype
         and head_dim >= 16
         and head_dim % 16 == 0
     )
@@ -344,24 +434,15 @@ def qsa_selected_token_mask_triton(
     if not use_triton:
         # Loud once: the fallback is exact but runs a per-query Python loop, which is a
         # severe per-step slowdown when it happens silently inside a training run.
-        global _fallback_warned
-        if not _fallback_warned:
-            _fallback_warned = True
-            if not _TRITON_AVAILABLE:
-                reason = "triton is not importable"
-            elif device_type not in ("npu", "cuda"):
-                reason = f"device '{device_type}' is not supported by the Triton kernels"
-            elif not supported_dtype or raw_keys.dtype != index_queries.dtype:
-                reason = "qsa fast path requires matching fp16/bf16 index tensors"
-            else:
-                reason = (
-                    "mask is not a plain causal prefix (validate_prefix_mask) or "
-                    f"head_dim={head_dim} is not a multiple of 16"
-                )
-            logger.warning(
-                "QSA Triton fast path disabled (%s); falling back to the exact eager reference "
-                "with a per-query Python loop. Further fallbacks will not be logged.",
-                reason,
+        log_warning_once(logger, "QSA Triton fast path unavailable for this input; using the exact eager reference.")
+        if block_keys is not None:
+            return qsa_reference_block_mask(
+                index_queries,
+                block_keys,
+                attention_mask,
+                token_budget=token_budget,
+                compress_ratio=compress_ratio,
+                return_token_ids=return_token_ids,
             )
         return qsa_reference_mask(
             index_queries,
@@ -376,10 +457,11 @@ def qsa_selected_token_mask_triton(
             return_token_ids=return_token_ids,
         )
 
-    if full_cos.shape[0] == 1 and batch_size != 1:
+    if full_cos is not None and full_cos.shape[0] == 1 and batch_size != 1:
         full_cos = full_cos.expand(batch_size, -1, -1)
         full_sin = full_sin.expand(batch_size, -1, -1)
-    k_norm_weight = k_norm_weight.contiguous()
+    if k_norm_weight is not None:
+        k_norm_weight = k_norm_weight.contiguous()
     num_blocks = kv_length // compress_ratio
     block_budget = token_budget // compress_ratio
     output_width = token_budget + compress_ratio - 1
@@ -404,36 +486,40 @@ def qsa_selected_token_mask_triton(
     sparse_start = max(0, token_budget - query_position_offset)
     if num_blocks > block_budget and sparse_start < query_length:
         block_q, block_p, block_d = 64, 128, triton.next_power_of_2(head_dim)
-        # Compression and key RoPE are only consumed by sparse TopK rows.  For
-        # short/prefill sequences whose visible prefix fits in the token
-        # budget, skip this preprocessing entirely.
-        compressed = torch.empty((batch_size, num_blocks, head_dim), dtype=raw_keys.dtype, device=raw_keys.device)
-        _compress_norm_rope_kernel[(batch_size, num_blocks)](
-            raw_keys,
-            k_norm_weight,
-            full_cos,
-            full_sin,
-            compressed,
-            *raw_keys.stride(),
-            *compressed.stride(),
-            *full_cos.stride(),
-            *full_sin.stride(),
-            num_blocks=num_blocks,
-            head_dim=head_dim,
-            rotary_dim=full_cos.shape[-1],
-            eps=rms_norm_eps,
-            compress_ratio=compress_ratio,
-            input_is_bf16=raw_keys.dtype == torch.bfloat16,
-            apply_rope=False,
-            BLOCK_D=block_d,
-        )
-        # Triton-Ascend fuses the BF16 RoPE mul/add into an FMA, while the gold
-        # PyTorch path rounds each multiplication before addition.  The tiny
-        # difference can reorder a TopK boundary, so keep this vectorized NPU
-        # operation outside the compression kernel for exact routing parity.
-        block_cos = full_cos[:, : num_blocks * compress_ratio : compress_ratio]
-        block_sin = full_sin[:, : num_blocks * compress_ratio : compress_ratio]
-        compressed = _apply_query_rope(compressed.unsqueeze(2), block_cos, block_sin).squeeze(2)
+        if block_keys is not None:
+            # Already pooled, normalized and RoPE-rotated by the CP forward.
+            compressed = block_keys.contiguous()
+        else:
+            # Compression and key RoPE are only consumed by sparse TopK rows.  For
+            # short/prefill sequences whose visible prefix fits in the token
+            # budget, skip this preprocessing entirely.
+            compressed = torch.empty((batch_size, num_blocks, head_dim), dtype=raw_keys.dtype, device=raw_keys.device)
+            _compress_norm_rope_kernel[(batch_size, num_blocks)](
+                raw_keys,
+                k_norm_weight,
+                full_cos,
+                full_sin,
+                compressed,
+                *raw_keys.stride(),
+                *compressed.stride(),
+                *full_cos.stride(),
+                *full_sin.stride(),
+                num_blocks=num_blocks,
+                head_dim=head_dim,
+                rotary_dim=full_cos.shape[-1],
+                eps=rms_norm_eps,
+                compress_ratio=compress_ratio,
+                input_is_bf16=raw_keys.dtype == torch.bfloat16,
+                apply_rope=False,
+                BLOCK_D=block_d,
+            )
+            # Triton-Ascend fuses the BF16 RoPE mul/add into an FMA, while the gold
+            # PyTorch path rounds each multiplication before addition.  The tiny
+            # difference can reorder a TopK boundary, so keep this vectorized NPU
+            # operation outside the compression kernel for exact routing parity.
+            block_cos = full_cos[:, : num_blocks * compress_ratio : compress_ratio]
+            block_sin = full_sin[:, : num_blocks * compress_ratio : compress_ratio]
+            compressed = _apply_rope(compressed, block_cos, block_sin)
         padded_num_blocks = triton.cdiv(num_blocks, block_p) * block_p
         sparse_rows = query_length - sparse_start
         if query_chunk_size is None:

@@ -87,6 +87,7 @@ data:
 distributed:
   fully_shard_parallel_size: 64      # FSDP2: 64 cards full-shard
   tensor_parallel_size: 1             # TP: off
+  kv_allgather_parallel_size: 1      # KV-AllGather CP: sequence axis
   ulysses_parallel_size: 2            # Ulysses CP: split sequence across 2 ranks (32k→16k/rank)
   expert_parallel_size: 64           # EP: 64 cards (512 experts / 64 = 8 per card)
   expert_fully_shard_parallel_size: 1
@@ -162,8 +163,8 @@ distributed:
   cp_plan:
     ulysses_function_patches:
       - target_functions:
-          - transformers.integrations.sdpa_attention.sdpa_attention_forward
-        type: full_attention
+          - transformers.models.qwen4_exp.modeling_qwen4_exp.Qwen4ExpTextAttention.forward
+        type: qsa
       - target_functions:
           - transformers.models.qwen4_exp.modeling_qwen4_exp.Qwen4ExpTextGatedDeltaNet.forward
         type: gated_delta_net
@@ -171,6 +172,8 @@ distributed:
       - target_functions:
           - transformers.loss.loss_utils.ForCausalLMLoss
         type: causal_lm_loss
+    qsa_cp_query_chunk_size: null # QSA query rows per CP attention chunk; null uses the model default.
+    qsa_sparse_gather: false # Whether to gather only QSA-selected K/V tokens across the CP group.
 
   # --- Expert Parallel Plan ---
   ep_plan:
@@ -190,6 +193,8 @@ memory:
     - model.visual.blocks.{*}
     - model.language_model.layers.{*}
   chunk_batch: false
+  chunk_loss: false
+  chunk_loss_size: null
   swap_activation: true
   swap_activation_plan:
     apply_modules:

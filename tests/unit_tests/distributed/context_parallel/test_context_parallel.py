@@ -7,6 +7,7 @@ from unittest import mock
 import torch
 
 from fsdp_turbo.distributed.context_parallel.batch import pad_tensor_to_group, split_sequence_batch
+from fsdp_turbo.distributed.context_parallel.loss import cp_compute_lm_loss
 from fsdp_turbo.distributed.context_parallel.patch import (
     CP_PATCHES_ATTR,
     apply_cp_loss_patches,
@@ -82,6 +83,48 @@ class ContextParallelConfigTests(unittest.TestCase):
                 memory=MemoryConfig(chunk_batch=True),
             )
 
+    def test_kv_allgather_accepts_embedded_ulysses_patch_types(self):
+        config = FSDPTurboConfig(
+            distributed=DistributedConfig(
+                kv_allgather_parallel_size=16,
+                ulysses_parallel_size=2,
+                cp_plan=CPPlanConfig(
+                    ulysses_function_patches=[
+                        {"target_functions": ["a.b.C.forward"], "type": "qsa"},
+                        {"target_functions": ["a.b.D.forward"], "type": "gated_delta_net"},
+                    ],
+                ),
+            )
+        )
+        self.assertEqual(len(config.distributed.cp_plan.ulysses_function_patches), 2)
+
+    def test_kv_allgather_rejects_unrelated_ulysses_patch_types(self):
+        distributed = DistributedConfig(
+            kv_allgather_parallel_size=2,
+            cp_plan=CPPlanConfig(
+                ulysses_function_patches=[
+                    {"target_functions": ["a.b.C"], "type": "full_attention"},
+                ],
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "kv_allgather_function_patches"):
+            FSDPTurboConfig(distributed=distributed)
+
+    def test_kv_allgather_rejects_generic_kv_patches_mixed_with_embedded_types(self):
+        distributed = DistributedConfig(
+            kv_allgather_parallel_size=2,
+            cp_plan=CPPlanConfig(
+                ulysses_function_patches=[
+                    {"target_functions": ["a.b.C.forward"], "type": "qsa"},
+                ],
+                kv_allgather_function_patches=[
+                    {"target_functions": ["a.b.D"], "type": "full_attention"},
+                ],
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            FSDPTurboConfig(distributed=distributed)
+
 
 class ContextParallelBatchTests(unittest.TestCase):
     @mock.patch("torch.distributed.get_rank", return_value=2)
@@ -101,6 +144,44 @@ class ContextParallelBatchTests(unittest.TestCase):
         torch.testing.assert_close(output["input_ids"], torch.tensor([[4, 5]]))
         torch.testing.assert_close(output["position_ids"], torch.tensor([[4, 5]]))
         torch.testing.assert_close(output["labels"], batch["labels"])
+
+
+class ContextParallelLossTests(unittest.TestCase):
+    @mock.patch("torch.distributed.get_rank", return_value=1)
+    @mock.patch("torch.distributed.get_world_size", return_value=2)
+    @mock.patch("fsdp_turbo.distributed.context_parallel.loss.cp_fixed_cross_entropy")
+    def test_labels_pad_to_model_global_logits_length(self, cross_entropy, _world_size, _rank):
+        cross_entropy.side_effect = lambda _source, target, **_kwargs: target
+        logits = torch.zeros(1, 4, 8)
+        labels = torch.arange(6).view(1, 6)
+
+        local_targets = cp_compute_lm_loss(logits, labels, object())
+
+        torch.testing.assert_close(
+            local_targets,
+            torch.tensor([5, -100, -100, -100]),
+        )
+
+    @mock.patch("torch.distributed.get_rank", return_value=1)
+    @mock.patch("torch.distributed.get_world_size", return_value=2)
+    @mock.patch("fsdp_turbo.distributed.context_parallel.loss.cp_fixed_cross_entropy")
+    def test_pre_shifted_labels_are_padded_and_sharded(self, cross_entropy, _world_size, _rank):
+        cross_entropy.side_effect = lambda _source, target, **_kwargs: target
+        logits = torch.zeros(1, 4, 8)
+        labels = torch.full((1, 6), 99)
+        shift_labels = torch.arange(6).view(1, 6)
+
+        local_targets = cp_compute_lm_loss(logits, labels, object(), shift_labels=shift_labels)
+
+        torch.testing.assert_close(local_targets, torch.tensor([4, 5, -100, -100]))
+
+    @mock.patch("torch.distributed.get_world_size", return_value=2)
+    def test_labels_longer_than_global_logits_are_rejected(self, _world_size):
+        logits = torch.zeros(1, 3, 8)
+        labels = torch.arange(7).view(1, 7)
+
+        with self.assertRaisesRegex(ValueError, "labels longer than the global logits"):
+            cp_compute_lm_loss(logits, labels, object())
 
 
 class ContextParallelPadTests(unittest.TestCase):

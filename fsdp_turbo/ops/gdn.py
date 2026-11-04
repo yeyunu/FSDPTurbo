@@ -19,14 +19,38 @@ def chunk_gdn(
     chunk_size: int = 64,
     head_first: bool = False,
     implementation: str = 'auto',
+    cp_context: object | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Compute GDN in BTHD layout, preserving state and packed sequence boundaries.
 
     ``eager`` selects the portable implementation on the input device.
     ``ascendc`` requires the NPU kernel and never silently falls back.
-    No checkpoint replay or training-context arguments are accepted. AscendC
-    supports BF16 initial-state gradients on Ascend 950; final-state gradients require eager.
+    ``cp_context`` selects FLA's context-parallel path for KV-AllGather. It
+    requires the default ``auto`` implementation because the other backends do
+    not provide the FLA context-parallel state exchange. No checkpoint replay
+    or other training-context arguments are accepted. AscendC supports BF16
+    initial-state gradients on Ascend 950; final-state gradients require eager.
     """
+    if cp_context is not None:
+        if implementation != 'auto':
+            raise ValueError("GDN KV-AllGather CP requires implementation='auto'.")
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+
+        return chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=cu_seqlens,
+            chunk_size=chunk_size,
+            cp_context=cp_context,
+        )
+
     device_type = 'cpu' if implementation == 'eager' else q.device.type
     if implementation == 'ascendc' and device_type != 'npu':
         raise ValueError('AscendC GDN requires NPU tensors.')
