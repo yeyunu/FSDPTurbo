@@ -91,6 +91,7 @@ DeepSeek-V4.1的KV AllGather CP将序列切成连续等长分片，Q保持本地
 ## 注意事项
 
 - **序列长度对齐**：`max_seq_length`应能被`ulysses_parallel_size`整除，避免序列切分时出现不等长片段。
+- **DeepSeek-V4 compressor CP 单轴限制**：使用`compressor_full_attention`或`compressor_full_attention_transposed`时，`kv_allgather_parallel_size`和`ulysses_parallel_size`仅允许一个大于1，另一个必须为1；双轴同时启用会在配置阶段报错。DeepSeek-V4 attention 的 mask/compressor/attention 语义位于 `fsdp_turbo/models/deepseek/deepseek_v4/context_parallel.py`；CP 通信侧通过 `fsdp_turbo/distributed/context_parallel/patch.py` 中的通用 capability installer 接入，通用 CP attention wrapper 不直接承载模型实现。若启用了该计划但模型中没有 Transformers `DeepseekV4Attention`，初始化会显式报错。KCP 暂不支持该 DeepSeek-V4 compressor attention 适配，配置阶段会拒绝该组合。
 - **数据加载**：CP不改变数据加载方式，仍由各DP rank加载完整样本，序列切分在模型forward内完成。
 - **Qwen3.8和Kimi K3的Chunk Loss均支持CP**：CP下可同时设置`memory.chunk_loss: true`，Kimi K3此时损失走`cp_chunk_lm_loss`分块路径，不物化`[local_seq, vocab]`全量logits（1M序列、CP=8、vocab≈160k时约200 GiB/rank，分块后降至~2 GiB），详见[分块损失计算](./chunk_loss.md)。
 - **与微批次切分互斥**：开启CP后不能同时配置`memory.chunk_batch`，启动时会显式报错拒绝该组合，详见[微批次切分](./chunk_batch.md)。

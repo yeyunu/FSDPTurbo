@@ -41,6 +41,8 @@ everything except expert execution.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from torch import nn
 from torch.distributed._functional_collectives import all_to_all_single_autograd
@@ -48,6 +50,7 @@ from torch.distributed.tensor import DTensor
 
 from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
+    DeepseekV4Attention as HFDeepseekV4Attention,
     DeepseekV4DecoderLayer as HFDeepseekV4DecoderLayer,
     DeepseekV4Experts as HFDeepseekV4Experts,
     DeepseekV4ForCausalLM as HFDeepseekV4ForCausalLM,
@@ -65,6 +68,7 @@ from fsdp_turbo.distributed.expert_parallel.utils import (
     normalize_expert_args,
 )
 from fsdp_turbo.ops.moe import grouped_matmul
+from .context_parallel import deepseek_v4_cp_attention_forward
 
 
 class DeepseekV4Experts(HFDeepseekV4Experts):
@@ -215,11 +219,17 @@ class DeepseekV4DecoderLayer(HFDeepseekV4DecoderLayer):
 class DeepseekV4Model(HFDeepseekV4Model):
     """Stock model with the FSDPTurbo decoder-layer chain.
 
+    ``context_parallel_attention_class`` is consumed by the generic CP
+    installer; the model-specific attention implementation remains in
+    ``context_parallel.py``.
+
     The parent ``__init__`` builds its own layer stack (which already ran
     ``post_init``), so after replacing the stack we re-run ``post_init`` to
     apply the official initialization to the local layer chain. Re-running
     ``post_init`` is idempotent for initialized modules.
     """
+
+    context_parallel_attention_class = HFDeepseekV4Attention
 
     def __init__(self, config: DeepseekV4Config):
         super().__init__(config)
@@ -227,6 +237,29 @@ class DeepseekV4Model(HFDeepseekV4Model):
             [DeepseekV4DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.post_init()
+
+    def context_parallel_attention_forward(
+        self,
+        attention_module: nn.Module,
+        hidden_states: torch.Tensor,
+        position_embeddings: object,
+        query_indices: torch.Tensor,
+        cp_state: dict[str, object],
+        group: object,
+        gather_tensor: Callable[[torch.Tensor, object, int], torch.Tensor],
+        kwargs: dict[str, object],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run the model-specific attention path using injected CP communication."""
+        return deepseek_v4_cp_attention_forward(
+            attention_module,
+            hidden_states,
+            position_embeddings,
+            query_indices,
+            cp_state,
+            group,
+            gather_tensor,
+            kwargs,
+        )
 
 
 class DeepseekV4ForCausalLM(HFDeepseekV4ForCausalLM):

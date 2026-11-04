@@ -688,6 +688,20 @@ class FSDPTurboConfig:
                 normalized.append(normalized_patch)
             setattr(self.distributed.cp_plan, field_name, normalized)
 
+        deepseek_compressor_specs = [
+            spec
+            for axis in ("kv_allgather", "ulysses", "kcp")
+            for spec in getattr(self.distributed.cp_plan, f"{axis}_function_patches")
+            if spec["type"] in {"compressor_full_attention", "compressor_full_attention_transposed"}
+        ]
+        if deepseek_compressor_specs and kcp_parallel_size > 1:
+            raise ValueError("DeepSeek-V4 compressor attention CP is not supported on the KCP axis.")
+        if deepseek_compressor_specs and self.distributed.kv_allgather_parallel_size > 1 and ulysses_parallel_size > 1:
+            raise ValueError(
+                "DeepSeek-V4 compressor CP supports only one sequence-parallel axis at a time: "
+                "kv_allgather_parallel_size and ulysses_parallel_size cannot both be greater than 1."
+            )
+
         # Qwen QSA/GDN forwards carry their own KV-AllGather implementation;
         # they are installed through the Ulysses class-forward patches below,
         # so they are not the native-model API path handled by this block.
@@ -710,7 +724,19 @@ class FSDPTurboConfig:
                     self.module_patches,
                 )
             ):
-                raise ValueError("Native KV-AllGather CP cannot be combined with function or module patches.")
+                raise ValueError(
+                    "Native KV-AllGather CP without kv_allgather_function_patches "
+                    "cannot be combined with function or module patches."
+                )
+
+        compressor_sparse_patches = [
+            spec
+            for spec in self.distributed.cp_plan.kv_allgather_function_patches
+            if spec["type"] == "compressor_sparse_attention"
+        ]
+        if compressor_sparse_patches:
+            if len(self.distributed.cp_plan.kv_allgather_function_patches) != 1:
+                raise ValueError("DeepSeek-V4.1 CP requires exactly one compressor sparse attention patch.")
             if ulysses_parallel_size != 1 or kcp_parallel_size != 1 or self.distributed.tensor_parallel_size != 1:
                 raise ValueError("DeepSeek-V4.1 KV-AllGather requires Ulysses=KCP=TP=1.")
             if self.memory.chunk_batch:
@@ -764,19 +790,14 @@ class FSDPTurboConfig:
                 "set it to [] only when the model's Ulysses forwards are built into the modeling classes."
             )
         # Qwen QSA and GDN forwards embed their own KV-AllGather handling.
-        # They must not be combined with a generic KV patch, and do not need
-        # one when they are the complete Ulysses patch set.
+        # They must not be combined with a generic KV patch. Patch-free native
+        # KV-AllGather and incompatible patch combinations are validated above.
         if self.distributed.kv_allgather_parallel_size > 1:
             generic_kv_patches = self.distributed.cp_plan.kv_allgather_function_patches
             if generic_kv_patches and ulysses_types & kv_embedded_types:
                 raise ValueError(
                     "Generic kv_allgather_function_patches cannot be combined with the "
                     "KV-aware Ulysses patch types (qsa, gated_delta_net)."
-                )
-            if not generic_kv_patches and not (ulysses_types and ulysses_types <= kv_embedded_types):
-                raise ValueError(
-                    "distributed.cp_plan.kv_allgather_function_patches must be set when KV-AllGather CP is enabled, "
-                    "unless all Ulysses patch types embed KV-AllGather handling."
                 )
 
         context_parallel_active = (

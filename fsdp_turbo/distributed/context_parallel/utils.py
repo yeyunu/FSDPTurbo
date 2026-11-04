@@ -4,6 +4,9 @@ from typing import List, Tuple, Union
 import torch
 
 
+_PREPARED_COMPRESSED_KV_KEY = "_fsdp_turbo_prepared_compressed_kv"
+
+
 def cal_split_sizes(dim_size: int, world_size: int):
     split_size = dim_size // world_size
     remainder = dim_size % world_size

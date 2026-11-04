@@ -88,8 +88,8 @@ distributed:
   data_parallel_size: 1
   fully_shard_parallel_size: 8
   tensor_parallel_size: 1
-  kv_allgather_parallel_size: 2
-  ulysses_parallel_size: 2
+  kv_allgather_parallel_size: 1  # Set to 2 and Ulysses to 1 for KV-AllGather CP.
+  ulysses_parallel_size: 2  # DeepSeek-V4 compressor CP supports only one axis at a time.
   expert_parallel_size: 4
   expert_fully_shard_parallel_size: 1
   expert_data_parallel_size: 1

@@ -5,7 +5,6 @@ from torch import nn
 from transformers.models.deepseek_v4 import modeling_deepseek_v4
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4RMSNorm, DeepseekV4HyperConnection, repeat_kv
 
-from fsdp_turbo.distributed.parallel_state import get_parallel_state
 from fsdp_turbo.modules.rms_norm import RMSNorm
 from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.modules.hyper_connection import HyperConnection
@@ -48,12 +47,8 @@ def eager_attention_forward(
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
 
-    ps = get_parallel_state()
-    ulysses_rank = ps.get_ulysses_rank()
-    ulysses_size = ps.get_ulysses_group_size()
-    head = module.sinks.size(0) // ulysses_size
-    sinks = module.sinks[ulysses_rank * head : (ulysses_rank + 1) * head]
-    sinks = sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    # The compressor CP wrapper owns head sharding; eager consumes local sinks directly.
+    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
 
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
     del attn_weights

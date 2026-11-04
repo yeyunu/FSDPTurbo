@@ -11,6 +11,7 @@ from .adapter import (
     initialize_deepseek_v4_model,
     prepare_deepseek_v4_model_for_fsdp,
 )
+from .context_parallel import build_raw_attention_mask, deepseek_v4_cp_attention_forward
 from .modeling import (
     DeepseekV4Config,
     DeepseekV4DecoderLayer,
@@ -31,6 +32,8 @@ __all__ = [
     "DeepseekV4SparseMoeBlock",
     "build_deepseek_v4_model",
     "build_deepseek_v4_model_args",
+    "build_raw_attention_mask",
+    "deepseek_v4_cp_attention_forward",
     "initialize_deepseek_v4_model",
     "prepare_deepseek_v4_model_for_fsdp",
 ]

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from fsdp_turbo.distributed.context_parallel.communication import all_to_all
+from fsdp_turbo.distributed.context_parallel.utils import _PREPARED_COMPRESSED_KV_KEY
 from fsdp_turbo.distributed.context_parallel.kv_allgather.sparse_gather import sparse_gather_rows
 from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import (
     get_flattened_cp_context,
@@ -223,35 +224,74 @@ def get_ulysses_compressor_attention_fn(
     def wrapper(module, query, key, value, *args, **kwargs):
         ulysses_size = dist.get_world_size(group)
         shared_kv = key is value
+        has_prepared_compressed_kv = _PREPARED_COMPRESSED_KV_KEY in kwargs
+        prepared_compressed_kv = kwargs.pop(_PREPARED_COMPRESSED_KV_KEY, None)
         num_groups = int(module.config.num_attention_heads / module.config.num_key_value_heads)
+        saved_kv_groups = None
+        saved_sinks = None
+        sinks_overridden = False
         if num_groups > 1 or ulysses_size > module.config.num_key_value_heads:
             key = torch.repeat_interleave(key, dim=1, repeats=num_groups)
             value = key if shared_kv else torch.repeat_interleave(value, dim=1, repeats=num_groups)
+            if hasattr(module, "num_key_value_groups"):
+                saved_kv_groups = module.num_key_value_groups
+                module.num_key_value_groups = 1
 
-        if ulysses_size > 1:
-            sliding_len = query.shape[2]
-            compressed_len = key.shape[2] - sliding_len
-            sliding_key, compressed_key = key.split([sliding_len, compressed_len], dim=2)
-            query = ulysses_all_to_all(query, group, scatter_dim=1, gather_dim=2)
-            sliding_key = ulysses_all_to_all(sliding_key, group, scatter_dim=1, gather_dim=2)
-            compressed_key = ulysses_all_to_all(compressed_key, group, scatter_dim=1, gather_dim=2)
-            key = torch.cat([sliding_key, compressed_key], dim=2)
+        try:
+            if ulysses_size > 1:
+                query = ulysses_all_to_all(query, group, scatter_dim=1, gather_dim=2)
+                if not has_prepared_compressed_kv:
+                    sliding_len = query.shape[2] // ulysses_size
+                    compressed_len = key.shape[2] - sliding_len
+                    sliding_key, compressed_key = key.split([sliding_len, compressed_len], dim=2)
+                    sliding_key = ulysses_all_to_all(sliding_key, group, scatter_dim=1, gather_dim=2)
+                    compressed_key = ulysses_all_to_all(compressed_key, group, scatter_dim=1, gather_dim=2)
+                    key = torch.cat([sliding_key, compressed_key], dim=2)
 
-            if shared_kv:
-                value = key
-            else:
-                sliding_value, compressed_value = value.split([sliding_len, compressed_len], dim=2)
-                sliding_value = ulysses_all_to_all(sliding_value, group, scatter_dim=1, gather_dim=2)
-                compressed_value = ulysses_all_to_all(compressed_value, group, scatter_dim=1, gather_dim=2)
-                value = torch.cat([sliding_value, compressed_value], dim=2)
+                    if shared_kv:
+                        value = key
+                    else:
+                        sliding_value, compressed_value = value.split([sliding_len, compressed_len], dim=2)
+                        sliding_value = ulysses_all_to_all(sliding_value, group, scatter_dim=1, gather_dim=2)
+                        compressed_value = ulysses_all_to_all(compressed_value, group, scatter_dim=1, gather_dim=2)
+                        value = torch.cat([sliding_value, compressed_value], dim=2)
+                else:
+                    key = ulysses_all_to_all(key, group, scatter_dim=1, gather_dim=2)
+                    value = key if shared_kv else ulysses_all_to_all(value, group, scatter_dim=1, gather_dim=2)
 
-        attn_output, attn_weights = fn(module, query, key, value, *args, **kwargs)
-        if ulysses_size > 1:
-            if attn_output_transposed:
-                attn_output = ulysses_all_to_all(attn_output, group, scatter_dim=1, gather_dim=2)
-            else:
-                attn_output = ulysses_all_to_all(attn_output, group, scatter_dim=2, gather_dim=1)
-        return attn_output, attn_weights
+            if has_prepared_compressed_kv and prepared_compressed_kv is not None:
+                if prepared_compressed_kv.shape[1] != key.shape[1]:
+                    if prepared_compressed_kv.shape[1] != 1:
+                        raise ValueError("Prepared DeepSeek-V4 compressed KV must have one head.")
+                    prepared_compressed_kv = torch.repeat_interleave(
+                        prepared_compressed_kv, dim=1, repeats=key.shape[1]
+                    )
+                key = torch.cat([key, prepared_compressed_kv], dim=2)
+                value = key if shared_kv else torch.cat([value, prepared_compressed_kv], dim=2)
+
+            s_aux = kwargs.get("s_aux", getattr(module, "sinks", None))
+            if ulysses_size > 1 and s_aux is not None:
+                head_start = dist.get_rank(group) * query.shape[1]
+                kwargs["s_aux"] = s_aux.narrow(0, head_start, query.shape[1])
+                if getattr(module, "sinks", None) is not None:
+                    saved_sinks = module.sinks
+                    delattr(module, "sinks")
+                    module.sinks = kwargs["s_aux"]
+                    sinks_overridden = True
+
+            attn_output, attn_weights = fn(module, query, key, value, *args, **kwargs)
+            if ulysses_size > 1:
+                if attn_output_transposed:
+                    attn_output = ulysses_all_to_all(attn_output, group, scatter_dim=1, gather_dim=2)
+                else:
+                    attn_output = ulysses_all_to_all(attn_output, group, scatter_dim=2, gather_dim=1)
+            return attn_output, attn_weights
+        finally:
+            if sinks_overridden:
+                delattr(module, "sinks")
+                module.sinks = saved_sinks
+            if saved_kv_groups is not None:
+                module.num_key_value_groups = saved_kv_groups
 
     return wrapper
 

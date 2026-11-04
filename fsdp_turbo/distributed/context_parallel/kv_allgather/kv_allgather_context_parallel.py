@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from fsdp_turbo.distributed.context_parallel.patch import install_model_context_parallel
 from fsdp_turbo.distributed.context_parallel.kv_allgather.kv_allgather_attention import (
     get_kv_allgather_attention_fn,
     get_kv_allgather_compressor_attention_fn,
@@ -54,7 +55,7 @@ def kv_allgather_context_parallelize_modules(
     # patches.  The Ulysses patch installer will bind the size-1 Ulysses group
     # when needed; there is no model-level native group setter to call here.
     qwen_embedded_types = {"qsa", "gated_delta_net"}
-    ulysses_types = {spec["type"] for spec in cp_plan.ulysses_function_patches}
+    ulysses_types = {spec["type"] for spec in getattr(cp_plan, "ulysses_function_patches", [])}
     if not cp_plan.kv_allgather_function_patches and ulysses_types and ulysses_types <= qwen_embedded_types:
         return model
     if not cp_plan.kv_allgather_function_patches:
@@ -68,4 +69,11 @@ def kv_allgather_context_parallelize_modules(
         label="KVAllGather",
         model=model,
     )
+    if any(spec["type"] == "compressor_full_attention" for spec in cp_plan.kv_allgather_function_patches):
+        from fsdp_turbo.models.deepseek.deepseek_v4.context_parallel import (
+            expose_deepseek_v4_context_parallel_capability,
+        )
+
+        expose_deepseek_v4_context_parallel_capability(model)
+        install_model_context_parallel(model, cp_group, mode="kv_allgather")
     return model

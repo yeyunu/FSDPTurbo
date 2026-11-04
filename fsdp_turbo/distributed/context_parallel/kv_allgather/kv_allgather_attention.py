@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 
 from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import kv_allgather
+from fsdp_turbo.distributed.context_parallel.utils import _PREPARED_COMPRESSED_KV_KEY
 
 
 def get_kv_allgather_attention_fn(fn, group: Optional[torch.distributed.ProcessGroup] = None):
@@ -73,8 +74,17 @@ def get_kv_allgather_compressor_attention_fn(
     def wrapper(module, query, key, value, *args, **kwargs):
         cp_size = torch.distributed.get_world_size(group) if group is not None else 1
         shared_kv = id(key) == id(value)
+        has_prepared_compressed_kv = _PREPARED_COMPRESSED_KV_KEY in kwargs
+        prepared_compressed_kv = kwargs.pop(_PREPARED_COMPRESSED_KV_KEY, None)
 
-        if cp_size > 1:
+        if has_prepared_compressed_kv:
+            if cp_size > 1:
+                key = kv_allgather(key, group, gather_dim=2)
+                value = key if shared_kv else kv_allgather(value, group, gather_dim=2)
+            if prepared_compressed_kv is not None:
+                key = torch.cat([key, prepared_compressed_kv], dim=2)
+                value = key if shared_kv else torch.cat([value, prepared_compressed_kv], dim=2)
+        elif cp_size > 1:
             # Split KV into sliding and compressed portions.
             # sliding_kv has the same seq_len as query; compressed_kv is the rest.
             sliding_len = query.shape[2]

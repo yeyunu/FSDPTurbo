@@ -12,6 +12,9 @@ from torch import nn
 from torch.nn import functional
 
 _MODULE_PATH = Path(__file__).parents[3] / "examples" / "deepseekv4" / "modeling_deepseek_v4.py"
+_SYSTEM_TEST_MODULE_PATH = (
+    Path(__file__).parents[3] / "tests" / "system_tests" / "model" / "deepseekv4" / "modeling_deepseek_v4.py"
+)
 
 
 def _repeat_kv(hidden_states, repeats):
@@ -25,9 +28,9 @@ def _repeat_kv(hidden_states, repeats):
     )
 
 
-def _load_attention(ulysses_size=1, retain_temporaries=False):
+def _load_attention(ulysses_size=1, retain_temporaries=False, module_path=_MODULE_PATH):
     """Load the actual attention function without importing fused backend modules."""
-    module = ast.parse(_MODULE_PATH.read_text(encoding="utf-8"))
+    module = ast.parse(module_path.read_text(encoding="utf-8"))
     function = deepcopy(
         next(
             node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "eager_attention_forward"
@@ -72,7 +75,7 @@ def test_attention_releasing_buffers_preserves_output_and_gradients(
     query_data = torch.randn(1, 4, 6, 4).to(dtype)
     key_data = torch.randn(1, kv_heads, 8, 4).to(dtype)
     value_data = torch.randn_like(key_data)
-    sink_data = torch.randn(4 * ulysses_size).to(dtype)
+    sink_data = torch.randn(4).to(dtype)
     upstream = torch.randn(1, 6, 4, 4).to(dtype)
     attention_mask = None
     if use_mask:
@@ -96,12 +99,13 @@ def test_attention_releasing_buffers_preserves_output_and_gradients(
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("module_path", [_MODULE_PATH, _SYSTEM_TEST_MODULE_PATH])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("kv_heads", [1, 4])
 @pytest.mark.parametrize("ulysses_size", [1, 2])
-def test_causal_attention_blocks_future_tokens_and_gradients(dtype, kv_heads, ulysses_size):
+def test_causal_attention_blocks_future_tokens_and_gradients(dtype, kv_heads, ulysses_size, module_path):
     torch.manual_seed(123)
-    attention, _, _ = _load_attention(ulysses_size)
+    attention, _, _ = _load_attention(ulysses_size, module_path=module_path)
     sequence_length = 6
     prefix_length = 2
     query = torch.ones(1, 4, sequence_length, 4, dtype=dtype)
@@ -109,7 +113,7 @@ def test_causal_attention_blocks_future_tokens_and_gradients(dtype, kv_heads, ul
     value = torch.randn_like(key, requires_grad=True)
     module = SimpleNamespace(
         num_key_value_groups=4 // kv_heads,
-        sinks=torch.zeros(4 * ulysses_size, dtype=dtype),
+        sinks=torch.zeros(4, dtype=dtype),
         training=False,
     )
     future_positions = torch.arange(sequence_length)[None, :] > torch.arange(sequence_length)[:, None]
