@@ -62,6 +62,7 @@ class ModelConfig:
     mtp_loss_scaling_factor: float = 0.1
     use_fused_causal_conv1d: bool = False
     use_fused_gdn: bool = False
+    tilekernels: Dict[str, bool] = field(default_factory=lambda: {"tilekernels_mhc_post": False})
 
 
 @dataclass
@@ -480,6 +481,13 @@ class FSDPTurboConfig:
 
     def validate_model_config(self):
         """Validate model loading configuration."""
+        if not isinstance(self.model.tilekernels, dict):
+            raise ValueError("model.tilekernels must be a dict / YAML mapping.")
+        for name, enabled in self.model.tilekernels.items():
+            if name != "tilekernels_mhc_post":
+                raise ValueError(f"Unknown model.tilekernels key '{name}'; use tilekernels_mhc_post: true/false.")
+            if not isinstance(enabled, bool):
+                raise ValueError(f"model.tilekernels.{name} must be a boolean.")
         if self.model.config_path is not None and (
             not isinstance(self.model.config_path, str) or not self.model.config_path.strip()
         ):
@@ -693,6 +701,7 @@ class FSDPTurboConfig:
                     self.model.use_fused_lightning_indexer,
                     self.model.use_fused_compressor,
                     self.model.use_fused_mhc,
+                    self.model.tilekernels.get("tilekernels_mhc_post", False),
                     self.model.use_fused_clipped_swiglu,
                     self.model.use_triton_inplace_rope,
                     self.model.use_deepgemm_wo_a,
@@ -1124,7 +1133,6 @@ def load_config_from_yaml(yaml_path):
     checkpoint_cfg = (
         _dict_to_dataclass(CheckpointConfig, checkpoint_raw) if checkpoint_raw is not None else CheckpointConfig()
     )
-
     # Extract distributed sub-config
     distributed_raw = raw.pop("distributed", None)
     if distributed_raw is not None:

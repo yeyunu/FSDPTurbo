@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Configuration fields for the DeepSeek-V4.1 reference architecture."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 
@@ -69,6 +69,8 @@ class ModelArgs:
     use_fused_compressor: bool = False
     # Fuse MHC projection/Sinkhorn/premix and post residual mixing on NPU.
     use_fused_mhc: bool = False
+    # Optional per-operator TileKernels backends; missing switches are disabled.
+    tilekernels: dict[str, bool] = field(default_factory=dict)
     use_fused_clipped_swiglu: bool = False
     use_triton_inplace_rope: bool = False
     use_deepgemm_wo_a: bool = False

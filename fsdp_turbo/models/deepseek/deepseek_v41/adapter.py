@@ -374,6 +374,7 @@ def build_deepseek_v41_model(
     use_fused_lightning_indexer: bool = False,
     use_fused_compressor: bool = False,
     use_fused_mhc: bool = False,
+    tilekernels: dict[str, bool] | None = None,
     use_fused_clipped_swiglu: bool = False,
     use_triton_inplace_rope: bool = False,
     use_deepgemm_wo_a: bool = False,
@@ -391,6 +392,7 @@ def build_deepseek_v41_model(
     the public chunk-loss head, using this adapter's loss_function.
     ``use_deepgemm_wo_a`` selects the optional BF16 NPU output projection;
     its DeepGEMM dependency is loaded on the first projection call.
+    ``tilekernels`` supplies per-operator switches; None preserves model_args.
     """
     if model_args is None:
         model_args = build_deepseek_v41_model_args(config_path=config_path, model_name_or_path=model_name_or_path)
@@ -403,6 +405,7 @@ def build_deepseek_v41_model(
         use_fused_lightning_indexer=use_fused_lightning_indexer,
         use_fused_compressor=use_fused_compressor,
         use_fused_mhc=use_fused_mhc,
+        tilekernels=dict(model_args.tilekernels if tilekernels is None else tilekernels),
         use_fused_clipped_swiglu=use_fused_clipped_swiglu,
         use_triton_inplace_rope=use_triton_inplace_rope,
         use_deepgemm_wo_a=use_deepgemm_wo_a,

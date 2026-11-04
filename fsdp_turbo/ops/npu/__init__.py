@@ -1,6 +1,8 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 import logging
 
+# Register the lazy adapter before imports of optional native libraries.
+from fsdp_turbo.ops.npu.tilekernels_mhc import tilekernels_mhc_post_npu
 from fsdp_turbo.ops.npu.cce_loss import cce_loss_npu
 from fsdp_turbo.ops.npu.attn_res import attn_res_npu
 from fsdp_turbo.ops.npu.attention_projection import attention_output_projection_npu
@@ -126,4 +128,5 @@ __all__ = [
     'hf32_linear_npu',
     'flash_attention_npu',
     'rotary_mul_npu',
+    'tilekernels_mhc_post_npu',
 ]

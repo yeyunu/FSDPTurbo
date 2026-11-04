@@ -196,6 +196,7 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 | CANN Compressor/CompressorGrad 融合压缩算子 | 可选；设置 `model.use_fused_compressor: true` |
 | Lightning Indexer 融合算子 | 可选；支持 Atlas A3（Ascend 910_93）、Ascend 910B/910C 和 Ascend950DT |
 | MhcPreSinkhornPremix/MhcPost 融合算子 | 可选；设置 `model.use_fused_mhc: true` |
+| TileKernels MhcPost | Ascend 950 可选；设置 `model.tilekernels.tilekernels_mhc_post: true`，仅替换 post；默认关闭 |
 | Clipped SwiGLU 前反向融合 | 可选；设置 `model.use_fused_clipped_swiglu: true`，模型的 `swiglu_limit` 必须大于 0 |
 | Inplace-RoPE Triton算子 | 可选；设置 `model.use_triton_inplace_rope: true` |
 | DeepGEMM attention 输出投影 | 可选；设置 `model.use_deepgemm_wo_a: true`，仅优化 BF16 NPU 的 `wo_a` |

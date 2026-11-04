@@ -5,6 +5,11 @@
 
 # --- Model Configuration ---
 model:
+  # --- Optional TileKernels backend (independent from model fused operators) ---
+  tilekernels:
+    tilekernels_mhc_post: false
+    # Add future operator switches here after separate validation.
+
   model_name_or_path: "./DSV41/models/DeepSeek-V4.1-Flash"
   # Optional architecture JSON override; otherwise read model_name_or_path/config.json.
   config_path: "./model_config/config_8p_A5.json"

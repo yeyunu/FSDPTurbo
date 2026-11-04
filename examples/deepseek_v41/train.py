@@ -137,6 +137,7 @@ class DeepseekV41Trainer(BaseTrainer):
             use_fused_lightning_indexer=(self.config.model.use_fused_lightning_indexer),
             use_fused_compressor=self.config.model.use_fused_compressor,
             use_fused_mhc=self.config.model.use_fused_mhc,
+            tilekernels=self.config.model.tilekernels,
             use_fused_clipped_swiglu=self.config.model.use_fused_clipped_swiglu,
             use_triton_inplace_rope=self.config.model.use_triton_inplace_rope,
             use_deepgemm_wo_a=self.config.model.use_deepgemm_wo_a,

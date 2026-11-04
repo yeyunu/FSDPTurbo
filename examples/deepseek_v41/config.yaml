@@ -1,0 +1,151 @@
+# DeepSeek-V4.1 Ascend 950 entry configuration, based on config_A5.yaml.
+# Paths are relative to the launch directory; adjust them for your environment.
+
+model:
+  # Enable TileKernels mHC post without shape routing.
+  tilekernels:
+    tilekernels_mhc_post: false
+    # Future operator switches belong here, after separate validation.
+
+  model_name_or_path: "./DSV41/models/DeepSeek-V4.1-Flash"
+  config_path: "./model_config/config_8p_A5.json"
+  tokenizer_name_or_path: "./DSV41/models/DeepSeek-V4.1-Flash"
+  torch_dtype: "bf16"
+  head_compute_dtype: "bf16"
+  engram_storage_backend: "elastic_buffer"
+  use_sparse_flash_attn: true
+  use_fused_lightning_indexer: true
+  use_fused_compressor: true
+  # Keeps CANN pre, and CANN post whenever TileKernels is not selected.
+  use_fused_mhc: true
+  use_triton_inplace_rope: true
+  use_fused_vision_flash_attn: true
+  use_fused_engram: false
+
+optimizer:
+  optimizer_type: "AdamW"
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1e-8
+  lr: 3.0e-4
+  warmup_ratio: 0.03
+  lr_scheduler_type: "CosineAnnealingLR"
+  min_lr: 3.0e-5
+  clip_grad: 1.0
+
+run:
+  seed: 42
+  deterministic: false
+  max_steps: -1
+  num_train_epochs: 1
+  gradient_accumulation_steps: 1
+  logging_steps: 1
+  profile:
+    enabled: true
+    wait_steps: 1
+    warmup_steps: 1
+    active_steps: 1
+    repeat: 1
+    skip_first: 5
+    output_dir: "./DSV41/profiles/dsv41_8p"
+    record_shapes: true
+    profile_memory: false
+    with_stack: false
+  memory_snapshot:
+    enable: false
+    start_step: 1
+    end_step: 2
+    save_path: ./memory_snapshot
+    dump_ranks: [0]
+    stacks: all
+    max_entries: null
+    mem_info: false
+
+checkpoint:
+  output_dir: "./output"
+  save_steps: 500
+  strict: true
+  save_optim: true
+  load_optim: true
+  resume_from_checkpoint: null
+
+data:
+  dataset_path: "./DSV41/datasets/mock/mock_data_pic_num_2_textlen_4096.jsonl"
+  dataset_config: null
+  text_column: "text"
+  image_column: "images"
+  conversation_column: "messages"
+  media_key: "images"
+  split: "train"
+  batch_size: 1
+  max_seq_length: 4096
+  num_workers: 8
+  pin_memory: true
+  shuffle: false
+  is_multimodal: true
+
+distributed:
+  data_parallel_size: 1
+  fully_shard_parallel_size: 8
+  tensor_parallel_size: 1
+  kv_allgather_parallel_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 8
+  expert_fully_shard_parallel_size: 1
+  expert_data_parallel_size: 1
+  fsdp_plan:
+    ignored_modules: []
+    apply_modules:
+      model.layers.{*}: {}
+      model.vision: {}
+      model.aligner: {}
+      model.embed: {}
+      model.head: {}
+    param_dtype: "bf16"
+    reduce_dtype: "fp32"
+    # Preserve FP32 mHC coefficients across layer boundaries.
+    output_dtype: null
+    cast_forward_inputs: false
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+    prefetch_modules:
+      - model.embed
+      - model.vision
+      - model.aligner
+      - model.layers.{*}
+      - model.head
+    hook_modules:
+      - model.layers.{*}
+      - model.vision
+    fsdp_implementation: "custom"
+  tp_plan:
+    colwise_parallel:
+      - model.layers.{*}.ffn.shared_experts.w1
+      - model.layers.{*}.ffn.shared_experts.w3
+    rowwise_parallel:
+      - model.layers.{*}.ffn.shared_experts.w2
+    sequence_parallel: []
+  ep_plan:
+    apply_modules:
+      - model.layers.{*}.ffn.experts
+    dispatcher: "all2all"
+    use_fused_ops: true
+    fixed_router: true
+    apply_efsdp_modules:
+      - model.layers.{*}.ffn.experts
+  cp_plan:
+    ulysses_function_patches: []
+    kv_allgather_function_patches: []
+    loss_function_patches: []
+
+memory:
+  chunk_loss: false
+  chunk_loss_size: 512
+  # Shared attention runtime still requires model-specific recompute support.
+  recompute: false
+  recompute_plan:
+    - model.layers.{*}.ffn
+
+quantization:
+  quantization_plan: null

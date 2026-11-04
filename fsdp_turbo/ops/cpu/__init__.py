@@ -28,6 +28,7 @@ from fsdp_turbo.ops.cpu.sparse_attention import indexed_sparse_attention_torch, 
 from fsdp_turbo.ops.cpu.situ_glu import situ_glu_cpu
 from fsdp_turbo.ops.cpu.flash_attn import flash_attention_cpu
 from fsdp_turbo.ops.cpu.rotary_mul import rotary_mul_cpu
+from fsdp_turbo.ops.cpu.tilekernels_mhc import tilekernels_mhc_post_cpu
 
 __all__ = [
     'attention_output_projection_cpu',
@@ -67,4 +68,5 @@ __all__ = [
     'situ_glu_cpu',
     'flash_attention_cpu',
     'rotary_mul_cpu',
+    'tilekernels_mhc_post_cpu',
 ]

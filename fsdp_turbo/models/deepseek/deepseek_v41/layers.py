@@ -12,6 +12,7 @@ from fsdp_turbo.ops.mhc import fused_mhc_post, fused_mhc_pre_sinkhorn_premix
 from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.ops.rope import inplace_rope
 from fsdp_turbo.ops.sinkhorn import hc_split_sinkhorn
+from fsdp_turbo.ops.tilekernels import tilekernels_mhc_post
 
 from .activation import limited_swiglu, silu_mul
 from .engram import Engram, EngramLayout
@@ -316,6 +317,7 @@ class Block(nn.Module):
         self.hc_sinkhorn_iters = args.hc_sinkhorn_iters
         self.hc_eps = args.hc_eps
         self.use_fused_mhc = args.use_fused_mhc
+        self.use_tilekernels_mhc_post = args.tilekernels.get("tilekernels_mhc_post", False)
         if self.use_fused_mhc and (self.hc_mult != 4 or self.hc_sinkhorn_iters != 20):
             raise ValueError("Fused MHC requires hc_mult=4 and hc_sinkhorn_iters=20")
         mix_hc = (2 + hc_mult) * hc_mult
@@ -370,10 +372,12 @@ class Block(nn.Module):
         pre, post, comb = self.hc_mixes(x, hc_fn, hc_scale, hc_base)
         return self.hc_pre(x, pre_mix), post, comb, pre
 
-    def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
+    def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
         """Expand the sublayer output back to hc copies and mix the residual in through `comb`.
         x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc] -> [b,s,hc,d]
         """
+        if self.use_tilekernels_mhc_post:
+            return tilekernels_mhc_post(x, residual, post, comb)
         if self.use_fused_mhc:
             return fused_mhc_post(x, residual, post, comb)
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
