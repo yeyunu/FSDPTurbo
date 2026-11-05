@@ -782,6 +782,7 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
         pixel_values_videos: torch.FloatTensor | None = None,
         image_grid_thw: torch.LongTensor | None = None,
         video_grid_thw: torch.LongTensor | None = None,
+        mm_token_type_ids: torch.IntTensor | None = None,
         cache_position: torch.LongTensor | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
@@ -805,6 +806,7 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
+            mm_token_type_ids=mm_token_type_ids,
             cache_position=cache_position,
             **kwargs,
         )
