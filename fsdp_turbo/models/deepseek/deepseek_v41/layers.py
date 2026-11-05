@@ -18,7 +18,7 @@ from .activation import limited_swiglu, silu_mul
 from .engram import Engram, EngramLayout
 from .experts import DeepSeekV41Experts
 from .model_args import ModelArgs
-from .runtime import ContextParallelAttentionState
+from .runtime import ContextParallelAttentionState, shared_attn
 from .utils import set_dtype
 
 
@@ -283,6 +283,8 @@ class Block(nn.Module):
     """
 
     attention_cls: type[nn.Module] | None = None
+
+    batch_chunk_context = staticmethod(shared_attn.chunk_window)
 
     def __init__(self, layer_id: int, args: ModelArgs, engram_layout: EngramLayout | None = None):
         super().__init__()

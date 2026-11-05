@@ -20,6 +20,9 @@ model:
   engram_storage_backend: "elastic_buffer"
   # Use CANN SparseFlashMla/SparseFlashMlaGrad instead of eager indexed attention.
   use_sparse_flash_attn: true
+  # Indexer auxiliary gradients are enabled only when indexer_loss_coeff > 0.
+  indexer_loss_coeff: 0.0
+  use_fused_lightning_indexer_loss: false
   # Use QuantLightningIndexer/QuantSparseLightningIndexer on Ascend950DT.
   # Ascend 910B/910C/910_93 candidate indexers are not supported yet.
   use_fused_lightning_indexer: true

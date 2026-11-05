@@ -1,0 +1,93 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+"""CANN SparseLightningIndexerKLLossGrad, independent of the attention backend."""
+
+import logging
+
+import torch
+
+from fsdp_turbo.ops.cpu.sparse_indexer_loss import sparse_indexer_gradient_torch
+from fsdp_turbo.ops.registry import register_op
+from fsdp_turbo.utils.log import log_warning_once
+
+
+class _IndexerGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, weights, indices, target, ratio):
+        ctx.save_for_backward(query, key, weights, indices, target)
+        ctx.ratio = ratio
+        return query.new_zeros((), dtype=torch.float32)
+
+    @staticmethod
+    def backward(ctx, scale):
+        from cann_ops_transformer import ops
+
+        q, k, w, indices, teacher = ctx.saved_tensors
+        batch, length, heads, dim = q.shape
+        residual = indices.new_full((batch,), length % ctx.ratio)
+        attrs = dict(
+            cmp_residual_k=residual,
+            layout_q="BSND",
+            layout_k="BSND",
+            mask_mode=3,
+            cmp_ratio=ctx.ratio,
+        )
+        metadata = ops.sparse_lightning_indexer_kl_loss_grad_metadata(
+            heads,
+            1,
+            dim,
+            batch_size=batch,
+            max_seqlen_q=length,
+            max_seqlen_k=k.size(1),
+            topk=indices.size(-1),
+            **attrs,
+        )
+        dq, dk, dw, _ = ops.sparse_lightning_indexer_kl_loss_grad(
+            q,
+            k,
+            w,
+            indices,
+            teacher,
+            metadata=metadata,
+            **attrs,
+        )
+        return dq * scale, dk * scale, dw * scale, None, None, None
+
+
+@register_op("sparse_indexer_gradient", "npu")
+def sparse_indexer_gradient_npu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    weights: torch.Tensor,
+    indices: torch.Tensor,
+    target: torch.Tensor,
+    ratio: int,
+) -> torch.Tensor:
+    """Dispatch supported BSND slices to SLIG, retaining device-local PyTorch for other inputs."""
+    try:
+        from cann_ops_transformer import ops
+    except ImportError:
+        ops = None
+    if (
+        not hasattr(ops, "sparse_lightning_indexer_kl_loss_grad")
+        or not hasattr(ops, "sparse_lightning_indexer_kl_loss_grad_metadata")
+        or query.shape[-2:] != (32, 128)
+        or indices.size(-1) > 1024
+    ):
+        log_warning_once(
+            logging.getLogger(__name__),
+            "SLIG unavailable for this build or shape; using PyTorch.",
+        )
+        return sparse_indexer_gradient_torch(query, key, weights, indices, target, ratio)
+    # CANN uses y * sum(p) - p; normalize the teacher to match the mean-token KL reference.
+    target = torch.nn.functional.normalize(target.detach().float(), p=1, dim=-1)
+    # K controls SLIG softmax visibility. Preserve the selected width, including K < 512.
+    native_indices = indices.to(torch.int32).unsqueeze(2).contiguous()
+    target = target.unsqueeze(2)
+    return _IndexerGradient.apply(
+        query.bfloat16().contiguous(),
+        key.unsqueeze(2).bfloat16().contiguous(),
+        weights.float().contiguous(),
+        native_indices,
+        target.contiguous(),
+        ratio,
+    )

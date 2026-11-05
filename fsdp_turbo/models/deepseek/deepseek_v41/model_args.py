@@ -65,6 +65,8 @@ class ModelArgs:
     # Enable the fused indexer on Ascend950DT. The 910B/910C/910_93
     # candidate implementation is reserved for future development.
     use_fused_lightning_indexer: bool = False
+    use_fused_lightning_indexer_loss: bool = False
+    indexer_loss_coeff: float = 0.0
     # Use the training-capable CANN Compressor/CompressorGrad operators.
     use_fused_compressor: bool = False
     # Fuse MHC projection/Sinkhorn/premix and post residual mixing on NPU.

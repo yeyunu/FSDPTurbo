@@ -135,6 +135,8 @@ class DeepseekV41Trainer(BaseTrainer):
             engram_storage_backend=self.config.model.engram_storage_backend,
             use_sparse_flash_attn=self.config.model.use_sparse_flash_attn,
             use_fused_lightning_indexer=(self.config.model.use_fused_lightning_indexer),
+            use_fused_lightning_indexer_loss=self.config.model.use_fused_lightning_indexer_loss,
+            indexer_loss_coeff=self.config.model.indexer_loss_coeff,
             use_fused_compressor=self.config.model.use_fused_compressor,
             use_fused_mhc=self.config.model.use_fused_mhc,
             tilekernels=self.config.model.tilekernels,

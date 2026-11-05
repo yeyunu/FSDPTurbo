@@ -125,7 +125,9 @@ python examples/deepseek_v41/generate_mock_data_for_vlmodel.py \
 或增大 `max_seq_length`。
 
 ## 数据格式转换
+
 如果使用数据格式为原生的llava格式，不是上述中json格式，如原llava_instruct.json格式为：
+
 ```json
 [
   {
@@ -144,7 +146,9 @@ python examples/deepseek_v41/generate_mock_data_for_vlmodel.py \
   },
 ]
 ```
+
 可以使用下面的脚本进行转换
+
 ```bash
 bash convert_llava_for_fsdp_turbo.sh
 ```
@@ -195,6 +199,7 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 | CSA2 跨层压缩状态与稀疏索引结构 | 支持构造与结构验证 |
 | CANN Compressor/CompressorGrad 融合压缩算子 | 可选；设置 `model.use_fused_compressor: true` |
 | Lightning Indexer 融合算子 | 可选；支持 Atlas A3（Ascend 910_93）、Ascend 910B/910C 和 Ascend950DT |
+| SparseLightningIndexerKLLossGrad 融合算子 | `model.indexer_loss_coeff` 默认为 `0.0`，设为正值时启用辅助梯度。`model.use_fused_lightning_indexer_loss` 默认为 `false`，使用 PyTorch；设为 `true` 时优先使用融合 SLIG，缺少算子或输入形状不受支持时回退到 PyTorch。 |
 | MhcPreSinkhornPremix/MhcPost 融合算子 | 可选；设置 `model.use_fused_mhc: true` |
 | TileKernels MhcPost | Ascend 950 可选；设置 `model.tilekernels.tilekernels_mhc_post: true`，仅替换 post；默认关闭 |
 | Clipped SwiGLU 前反向融合 | 可选；设置 `model.use_fused_clipped_swiglu: true`，模型的 `swiglu_limit` 必须大于 0 |

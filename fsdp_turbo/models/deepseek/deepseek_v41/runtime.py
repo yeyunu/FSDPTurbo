@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from torch.utils._pytree import tree_map
 from typing import Any
 
 import torch
@@ -19,11 +22,13 @@ class ContextParallelAttentionState(NamedTuple):
     index_k: torch.Tensor | None = None
     topk_idxs: torch.Tensor | None = None
     candidates: torch.Tensor | None = None
+    indexer_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
 
 _SLOTS = (
     "compress_kv",
     "index_k",
+    "indexer_inputs",
     "topk_idxs",
     "candidates",
     "packed_candidates",
@@ -86,12 +91,41 @@ class SharedAttentionRuntime:
         Declared explicitly (rather than through ``_SLOTS``) so static analysers know the members.
         """
         self.compress_kv: torch.Tensor | None = None
+        self.indexer_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self.index_k: torch.Tensor | None = None
         self.topk_idxs: torch.Tensor | None = None
         self.candidates: torch.Tensor | None = None
         self.packed_candidates: list[torch.Tensor] | None = None
         self.candidate_block_indices: torch.Tensor | None = None
         self.candidate_block_length: torch.Tensor | None = None
+
+    @contextmanager
+    def chunk_window(self, batch_dim: int) -> Iterator[Callable]:
+        """Slice cross-layer slots with each microbatch and reassemble published tensors."""
+        if batch_dim != 0:
+            raise ValueError("DeepSeek shared attention slots use batch dimension zero.")
+        outer = self.snapshot()
+        parts = []
+        changed = set()
+
+        @contextmanager
+        def microbatch(start, end):
+            sliced = tree_map(lambda value: value[start:end] if isinstance(value, torch.Tensor) else value, outer)
+            self.restore(sliced)
+            try:
+                yield
+                part = self.snapshot()
+                parts.append(part)
+                changed.update(slot for slot in _SLOTS if part[slot] is not sliced[slot])
+            finally:
+                self.restore(outer)
+
+        yield microbatch
+        for slot in changed:
+            values = [part[slot] for part in parts]
+            self.publish(
+                slot, tree_map(lambda *xs: torch.cat(xs) if isinstance(xs[0], torch.Tensor) else xs[0], *values)
+            )
 
     def snapshot(self) -> dict[str, Any]:
         """Return the current slot values (references, no tensor copies)."""

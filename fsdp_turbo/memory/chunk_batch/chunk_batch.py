@@ -3,6 +3,7 @@
 
 import logging
 from collections.abc import Mapping
+from contextlib import nullcontext
 from functools import wraps
 from typing import Any, List, Optional
 
@@ -66,6 +67,7 @@ def apply_chunkmbs_module(chunk_mbs_modules, chunkmbs_cfg):
     for name, module in chunk_mbs_modules:
         print_rank(logger.info, f'Applying chunkmbs to module: {name}')
         module.forward = chunk_mbs_forward(
+            batch_context=getattr(module, "batch_chunk_context", None),
             chunk_mbs=chunkmbs_cfg.chunk_mbs,
             batch_dim=chunkmbs_cfg.batch_dim,
             chunk_arg_indexes=chunkmbs_cfg.chunk_arg_indexes,
@@ -104,6 +106,7 @@ def chunk_mbs_forward(
     batch_dim: int = 0,
     chunk_arg_indexes: Optional[List[int]] = None,
     chunk_kwarg_names: Optional[List[str]] = None,
+    batch_context=None,
 ):
     """Build a decorator that runs a module forward by batch chunks.
 
@@ -148,31 +151,35 @@ def chunk_mbs_forward(
 
             num_micros = (full_batch_size + chunk_mbs - 1) // chunk_mbs
             outputs = []
-            for idx in range(num_micros):
-                start = idx * chunk_mbs
-                end = min(start + chunk_mbs, full_batch_size)
+            owner = getattr(forward_func, "__self__", None)
+            chunk_context = batch_context or getattr(owner, "batch_chunk_context", None)
+            with chunk_context(batch_dim) if chunk_context is not None else nullcontext() as microbatch:
+                for idx in range(num_micros):
+                    start = idx * chunk_mbs
+                    end = min(start + chunk_mbs, full_batch_size)
 
-                # Slice only the configured positional arguments. Other
-                # arguments may be scalar metadata, cache objects, or tensors
-                # without a batch dimension, so they are forwarded unchanged.
-                micro_args = []
-                for arg_idx, arg in enumerate(args):
-                    if arg_idx in chunk_arg_indexes:
-                        micro_args.append(_slice_batch_recursive(arg, start, end, batch_dim))
-                    else:
-                        micro_args.append(arg)
+                    # Slice only the configured positional arguments. Other
+                    # arguments may be scalar metadata, cache objects, or tensors
+                    # without a batch dimension, so they are forwarded unchanged.
+                    micro_args = []
+                    for arg_idx, arg in enumerate(args):
+                        if arg_idx in chunk_arg_indexes:
+                            micro_args.append(_slice_batch_recursive(arg, start, end, batch_dim))
+                        else:
+                            micro_args.append(arg)
 
-                # Slice only the configured keyword arguments. For attention
-                # layers, ``attention_mask`` must be sliced together with
-                # ``hidden_states`` when it has the full batch dimension.
-                micro_kwargs = {}
-                for kwarg_name, kwarg_value in kwargs.items():
-                    if kwarg_name in chunk_kwarg_names:
-                        micro_kwargs[kwarg_name] = _slice_batch_recursive(kwarg_value, start, end, batch_dim)
-                    else:
-                        micro_kwargs[kwarg_name] = kwarg_value
+                    # Slice only the configured keyword arguments. For attention
+                    # layers, ``attention_mask`` must be sliced together with
+                    # ``hidden_states`` when it has the full batch dimension.
+                    micro_kwargs = {}
+                    for kwarg_name, kwarg_value in kwargs.items():
+                        if kwarg_name in chunk_kwarg_names:
+                            micro_kwargs[kwarg_name] = _slice_batch_recursive(kwarg_value, start, end, batch_dim)
+                        else:
+                            micro_kwargs[kwarg_name] = kwarg_value
 
-                outputs.append(forward_func(*micro_args, **micro_kwargs))
+                    with microbatch(start, end) if microbatch is not None else nullcontext():
+                        outputs.append(forward_func(*micro_args, **micro_kwargs))
 
             # Most transformer blocks return either a tensor or a tuple/list
             # whose first element is the hidden states. Concatenate each output

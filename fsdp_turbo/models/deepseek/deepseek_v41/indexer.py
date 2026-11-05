@@ -25,7 +25,7 @@ class Indexer(torch.nn.Module):
     levels; `select_candidate_blocks` is the first.
     """
 
-    def __init__(self, args: ModelArgs, layer_id: int):
+    def __init__(self, args: ModelArgs, layer_id: int) -> None:
         super().__init__()
         # the index keys are derived from the compressor's latent, so only a layer that compresses
         # its own KV can produce them; every other indexer reads them from that layer's cache
@@ -36,6 +36,7 @@ class Indexer(torch.nn.Module):
         self.candidate_topk_blocks = args.candidate_topk_blocks
         self.candidate_block_size = args.candidate_block_size
         self.use_fused_lightning_indexer = args.use_fused_lightning_indexer
+        self.indexer_loss_coeff = args.indexer_loss_coeff
         self.lightning_indexer_page_size = args.lightning_indexer_page_size
         self.dim = args.dim
         self.n_heads = args.index_n_heads
@@ -97,6 +98,7 @@ class Indexer(torch.nn.Module):
         if packed_lengths is not None:
             compressed_lengths = [length // ratio for length in packed_lengths]
             index_parts = []
+            input_parts = []
             key_parts = []
             candidate_parts = []
             full_index_k = shared_attn.index_k
@@ -124,6 +126,8 @@ class Indexer(torch.nn.Module):
                 if part_indices.shape[-1] < self.index_topk:
                     part_indices = F.pad(part_indices, (0, self.index_topk - part_indices.shape[-1]), value=-1)
                 index_parts.append(part_indices)
+                if self.indexer_loss_coeff and start_pos == 0 and self.training and torch.is_grad_enabled():
+                    input_parts.append(shared_attn.indexer_inputs)
                 if self.is_candidate_source:
                     candidate_parts.append(shared_attn.candidates)
                 if self.owns_k:
@@ -136,6 +140,8 @@ class Indexer(torch.nn.Module):
             if self.is_candidate_source:
                 shared_attn.publish("packed_candidates", candidate_parts)
             shared_attn.publish("candidates", None)
+            if input_parts:
+                shared_attn.publish("indexer_inputs", tuple(torch.cat(parts, dim=1) for parts in zip(*input_parts)))
             return torch.cat(index_parts, dim=1)
 
         # latent is None while a group is still filling up, so there is nothing to publish yet
@@ -163,6 +169,10 @@ class Indexer(torch.nn.Module):
         # pylint: disable-next=unsubscriptable-object
         index_k = shared_attn.index_k[:bsz, : end_pos // ratio]
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+
+        if self.indexer_loss_coeff and start_pos == 0 and self.training and torch.is_grad_enabled():
+            # Keep the differentiable triple paired with the indices published by this source.
+            shared_attn.publish("indexer_inputs", (q, index_k, weights))
 
         if self.use_fused_lightning_indexer:
             if start_pos != 0:

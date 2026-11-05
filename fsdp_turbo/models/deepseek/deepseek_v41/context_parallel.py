@@ -16,6 +16,7 @@ import torch.nn.functional as F
 
 from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import kv_allgather
 from fsdp_turbo.ops.sparse_attention import indexed_sparse_attention
+from fsdp_turbo.ops.sparse_indexer_loss import record_indexer_gradient
 from .indexer import _compute_index_score
 from .layers import apply_rotary_emb
 from .runtime import ContextParallelAttentionState
@@ -219,7 +220,7 @@ def _indexer_forward(
         scores = scores.masked_fill(~candidates, -torch.inf)
     selected_scores, indices = _topk_by_position(scores, min(indexer.index_topk, total // ratio))
     indices = torch.where(selected_scores > -torch.inf, indices + total, -1)
-    return indices.sort(dim=-1).values.int(), index_k, candidates
+    return indices.sort(dim=-1).values.int(), index_k, candidates, (q, index_k, weights)
 
 
 def compute_context_parallel_attention(
@@ -228,6 +229,7 @@ def compute_context_parallel_attention(
     start_pos: int,
     group: dist.ProcessGroup,
     state: ContextParallelAttentionState | None = None,
+    attention_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ContextParallelAttentionState]:
     """Compute local rows and return immutable cross-layer state for checkpoint replay."""
     if start_pos != 0 or not attention.training:
@@ -235,7 +237,9 @@ def compute_context_parallel_attention(
     batch, length, _ = hidden_states.shape
     size, rank = dist.get_world_size(group), dist.get_rank(group)
     start, total = rank * length, size * length
-    compress_kv, index_k, topk_idxs, candidates = state if state is not None else ContextParallelAttentionState()
+    compress_kv, index_k, topk_idxs, candidates, indexer_inputs = (
+        state if state is not None else ContextParallelAttentionState()
+    )
     rope_head_dim = attention.rope_head_dim
     rotary_freqs = attention.freqs_cis[start : start + length]
     query_latent = attention.q_norm(attention.wq_a(hidden_states))
@@ -253,7 +257,7 @@ def compute_context_parallel_attention(
     if attention.compress_ratio:
         latent = attention.compressor(hidden_states, 0) if attention.is_kv_source else None
         if attention.is_index_source:
-            topk_idxs, index_k, candidates = _indexer_forward(
+            topk_idxs, index_k, candidates, indexer_inputs = _indexer_forward(
                 attention.indexer,
                 hidden_states,
                 query_latent,
@@ -273,6 +277,24 @@ def compute_context_parallel_attention(
                 latent[..., -rope_head_dim:], attention.freqs_cis[start : start + length : attention.compress_ratio]
             )
             compress_kv = kv_allgather(latent, group, gather_dim=1)
+        if attention.indexer_loss_coeff and torch.is_grad_enabled():
+            # CANN's BSND mask counts from query position zero; local CP rows have a global offset.
+            relative = torch.where(topk_idxs >= 0, topk_idxs - total, -1)
+            record_indexer_gradient(
+                q,
+                kv,
+                compress_kv,
+                indices,
+                relative,
+                indexer_inputs,
+                attention.attn_sink,
+                attention.softmax_scale,
+                attention.compress_ratio,
+                False,
+                attention_mask,
+            )
+        else:
+            indexer_inputs = None
         kv = torch.cat((kv, compress_kv), dim=1)
         indices = torch.cat((indices, topk_idxs), dim=-1)
     output = indexed_sparse_attention(q, kv, attention.attn_sink, indices, attention.softmax_scale)
@@ -281,4 +303,4 @@ def compute_context_parallel_attention(
     output = output.reshape(batch, length, attention.n_local_groups, -1)
     weight = attention.wo_a.weight.view(attention.n_local_groups, attention.o_lora_rank, -1)
     output = attention.wo_b(torch.einsum("bsgd,grd->bsgr", output, weight).flatten(2))
-    return output, ContextParallelAttentionState(compress_kv, index_k, topk_idxs, candidates)
+    return output, ContextParallelAttentionState(compress_kv, index_k, topk_idxs, candidates, indexer_inputs)

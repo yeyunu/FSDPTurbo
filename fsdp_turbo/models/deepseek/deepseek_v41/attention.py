@@ -11,6 +11,8 @@ from fsdp_turbo.ops.sparse_attention import indexed_sparse_attention
 from fsdp_turbo.ops.rope import partial_rope
 from fsdp_turbo.utils.device import IS_CANN_OPS_TRANSFORMER_AVAILABLE
 
+from fsdp_turbo.ops.sparse_indexer_loss import record_indexer_gradient
+
 from .compressor import Compressor
 from .context_parallel import compute_context_parallel_attention
 from .indexer import Indexer
@@ -49,6 +51,8 @@ class Attention(nn.Module):
     the rest read that same cache.
     """
 
+    batch_chunk_context = staticmethod(shared_attn.chunk_window)
+
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.layer_id = layer_id
@@ -69,6 +73,8 @@ class Attention(nn.Module):
         self.window_size = args.window_size
         self.compress_ratio = args.compress_ratios[layer_id]
         self.use_sparse_flash_attn = args.use_sparse_flash_attn
+        self.indexer_loss_coeff = args.indexer_loss_coeff
+        self.use_fused_lightning_indexer_loss = args.use_fused_lightning_indexer_loss
         self.use_deepgemm_wo_a = args.use_deepgemm_wo_a
         self.eps = args.norm_eps
 
@@ -201,6 +207,8 @@ class Attention(nn.Module):
                     if start_pos == 0
                     else self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
                 )
+            if self.indexer_loss_coeff and self.training:
+                latent = latent.clone()  # Index-key projection saved the unrotated input for backward.
             latent = apply_rotary_emb(latent, freqs, use_triton_inplace_rope=self.use_triton_inplace_rope)
             if self.training and start_pos == 0:
                 # Use the write itself: during a replay the slot holds the captured state, so
@@ -239,7 +247,7 @@ class Attention(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, ContextParallelAttentionState]:
         """Attend to local queries, using globally gathered KV when CP is enabled."""
         if cp_group is not None:
-            return compute_context_parallel_attention(self, x, start_pos, cp_group, cp_state)
+            return compute_context_parallel_attention(self, x, start_pos, cp_group, cp_state, attention_mask)
         bsz, seqlen, _ = x.size()
         packed_cu_seqlens = cu_seqlens if sfa_layout == "TND" else None
         packed_lengths = _packed_sequence_lengths(seqlen, packed_cu_seqlens) if start_pos == 0 else None
@@ -264,6 +272,37 @@ class Attention(nn.Module):
             if self.use_sparse_flash_attn and compress_kv.size(1) == 0:
                 compress_kv = None
                 compress_idxs = None
+
+        train_indexer = self.training and self.indexer_loss_coeff > 0 and torch.is_grad_enabled()
+        if train_indexer and start_pos == 0 and compress_kv is not None and compress_kv.size(1):
+            indexer_inputs = shared_attn.indexer_inputs
+            if indexer_inputs is None:
+                raise RuntimeError("Expected shared indexer inputs for auxiliary gradient computation")
+            # publish() sets the tuple dynamically; pylint only infers the initial None.
+            # pylint: disable-next=unpacking-non-sequence
+            iq, ik, weights = indexer_inputs
+            query_start = key_start = 0
+            for length in packed_lengths or [seqlen]:
+                rows = slice(query_start, query_start + length)
+                keys = slice(key_start, key_start + length // self.compress_ratio)
+                selected = compress_idxs[:, rows]
+                if not self.use_sparse_flash_attn:
+                    selected = torch.where(selected >= 0, selected - kv.size(1), -1)
+                record_indexer_gradient(
+                    q[:, rows],
+                    kv[:, rows],
+                    compress_kv[:, keys],
+                    get_window_topk_idxs(self.window_size, bsz, length, 0, q.device),
+                    selected,
+                    (iq[:, rows], ik[:, keys], weights[:, rows]),
+                    self.attn_sink,
+                    self.softmax_scale,
+                    self.compress_ratio,
+                    self.use_fused_lightning_indexer_loss,
+                    attention_mask[:, rows] if attention_mask is not None else None,
+                )
+                query_start += length
+                key_start += length // self.compress_ratio
 
         if self.use_sparse_flash_attn:
             output_shape = q.shape

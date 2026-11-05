@@ -22,6 +22,7 @@ from fsdp_turbo.memory.chunk_loss.chunk_loss import (
     fixed_cross_entropy,
 )
 from fsdp_turbo.memory.recompute.recompute import register_replay_context
+from fsdp_turbo.ops.sparse_indexer_loss import collect_indexer_gradients
 from fsdp_turbo.ops.hf32_linear import hf32_linear
 
 from .engram.host_offload_engram import HostOffloadEngram
@@ -278,17 +279,20 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
             if labels is not None:
                 labels = labels.masked_fill(~full_mask.to(device=labels.device), -100)
 
-        hidden_states, _, collected_hidden_states = self.model.forward_backbone(
-            input_ids,
-            images=images,
-            token_types=token_types,
-            attention_mask=attention_mask,
-            output_hidden_states=output_hidden_states,
-            sfa_layout=sfa_layout,
-            cu_seqlens=cu_seqlens,
-            engram_hashes=engram_hashes,
-            cp_group=cp_group,
-        )
+        with collect_indexer_gradients() as indexer_terms:
+            hidden_states, _, collected_hidden_states = self.model.forward_backbone(
+                input_ids,
+                images=images,
+                token_types=token_types,
+                attention_mask=attention_mask,
+                output_hidden_states=output_hidden_states,
+                sfa_layout=sfa_layout,
+                cu_seqlens=cu_seqlens,
+                engram_hashes=engram_hashes,
+                cp_group=cp_group,
+            )
+        if indexer_terms:
+            reference_model.shared_attn.publish("indexer_inputs", None)
         shift_labels = None
         if labels is not None and cp_group is None:
             if cu_seqlens is not None and cu_seqlens.numel() > 2:
@@ -322,6 +326,16 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
                 )
                 valid_target_count = (shift_labels != -100).sum().clamp_min(1)
                 loss = loss / valid_target_count
+
+        if loss is not None and indexer_terms:
+            gradient = torch.stack(indexer_terms).sum()
+            mask = full_mask if cp_group is not None else attention_mask
+            count = input_ids.numel() if mask is None else mask.sum().clamp_min(1)
+            if cp_group is not None:
+                from fsdp_turbo.distributed.context_parallel.loss import cp_all_reduce_forward_backward
+
+                gradient = cp_all_reduce_forward_backward(gradient, cp_group)
+            loss = loss + gradient * (self.model_args.indexer_loss_coeff / count)
 
         return DeepseekV41CausalLMOutput(
             loss=loss,
@@ -372,6 +386,8 @@ def build_deepseek_v41_model(
     engram_storage_backend: Literal["host_offload", "elastic_buffer"] = "host_offload",
     use_sparse_flash_attn: bool = False,
     use_fused_lightning_indexer: bool = False,
+    use_fused_lightning_indexer_loss: bool = False,
+    indexer_loss_coeff: float = 0.0,
     use_fused_compressor: bool = False,
     use_fused_mhc: bool = False,
     tilekernels: dict[str, bool] | None = None,
@@ -403,6 +419,8 @@ def build_deepseek_v41_model(
         engram_storage_backend=engram_storage_backend,
         use_sparse_flash_attn=use_sparse_flash_attn,
         use_fused_lightning_indexer=use_fused_lightning_indexer,
+        use_fused_lightning_indexer_loss=use_fused_lightning_indexer_loss,
+        indexer_loss_coeff=indexer_loss_coeff,
         use_fused_compressor=use_fused_compressor,
         use_fused_mhc=use_fused_mhc,
         tilekernels=dict(model_args.tilekernels if tilekernels is None else tilekernels),

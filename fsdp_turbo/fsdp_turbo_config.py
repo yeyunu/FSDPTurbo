@@ -2,6 +2,7 @@
 # Keep the configuration schema and its __post_init__ validation together.
 # pylint: disable=too-many-lines
 import logging
+import math
 import os
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Callable, Literal, Union, Optional
@@ -32,6 +33,8 @@ class ModelConfig:
     engram_storage_backend: Optional[Literal["host_offload", "elastic_buffer"]] = None
     use_sparse_flash_attn: bool = False
     use_fused_lightning_indexer: bool = False
+    use_fused_lightning_indexer_loss: bool = False
+    indexer_loss_coeff: float = 0.0
     # GLM-5.3-Flash DSA/indexer/attention dispatch knobs (model_config-driven;
     # train.py injects them into the HF text/vision sub-configs).
     # dsa_implementation: 'dense' (mask-based) or 'sfa' (npu_sparse_flash_attention).
@@ -434,6 +437,7 @@ class FSDPTurboConfig:
         if not isinstance(self.distributed.split_com_groups, bool):
             raise ValueError("distributed.split_com_groups must be a boolean.")
         self.validate_model_config()
+        self.validate_indexer_loss_config()
         self.validate_data_config()
         self.validate_tp_config()
         self.validate_chunk_loss_config()
@@ -512,6 +516,19 @@ class FSDPTurboConfig:
             raise ValueError("model.model_name_or_path is required when load_pretrained_weights is enabled.")
         if self.model.pretrained_engram_rows_per_chunk <= 0:
             raise ValueError("model.pretrained_engram_rows_per_chunk must be positive.")
+
+    def validate_indexer_loss_config(self) -> None:
+        """Validate the indexer backend selection and auxiliary gradient weight."""
+        if not isinstance(self.model.use_fused_lightning_indexer_loss, bool):
+            raise ValueError("model.use_fused_lightning_indexer_loss must be a boolean.")
+        coefficient = self.model.indexer_loss_coeff
+        if (
+            isinstance(coefficient, bool)
+            or not isinstance(coefficient, (int, float))
+            or not math.isfinite(coefficient)
+            or coefficient < 0
+        ):
+            raise ValueError("model.indexer_loss_coeff must be a finite non-negative number.")
 
     def validate_data_config(self):
         """Validate and normalize dataloader configuration."""
