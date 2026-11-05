@@ -6,10 +6,8 @@
 
 ## 模型文件准备
 
-从下载的 Kimi-K3 模型目录中拷贝`media_utils.py` 和
-`configuration_kimi_k3.py` 到 FSDPTurbo 的`fsdp_turbo/models/kimi/` 目录。
-以本地仓库为例，目标目录为`D:\FSDPTurbo\fsdp_turbo\models\kimi`这两个文件需要与
-`modeling_kimi_k3.py`、`kimi_k3_processor.py` 同级，以满足相对导入。
+从下载的 Kimi-K3 模型目录中复制 `media_utils.py` 到 FSDPTurbo 的
+`fsdp_turbo/models/kimi/` 目录，使它与 `kimi_k3_processor.py` 同级。
 
 在训练服务器上执行以下命令，并将路径替换为实际位置：
 
@@ -18,7 +16,6 @@ HF_PATH="/download/Kimi-K3"
 TURBO_PATH="/home/workspace/FSDPTurbo"
 
 cp "${HF_PATH}/media_utils.py" "${TURBO_PATH}/fsdp_turbo/models/kimi/"
-cp "${HF_PATH}/configuration_kimi_k3.py" "${TURBO_PATH}/fsdp_turbo/models/kimi/"
 ```
 
 请保留仓库内已适配的 `modeling_kimi_k3.py`、`modeling_kimi_linear.py`
@@ -143,7 +140,7 @@ padding，并通过 `attention_mask` 排除 padding token。
 
 ## 环境依赖
 
-在 A5 服务器上执行 Kimi K3 预训练前，需要先下载并安装 `mindspeed_ops` 库（https://gitcode.com/Ascend/MindSpeed-Ops）。
+在 A5 服务器上执行 Kimi K3 预训练前，需要先下载并安装 `mindspeed_ops` 库 https://gitcode.com/Ascend/MindSpeed-Ops
 
 ### 安装 ops-transformer 以适配 AscendC 版本 attn_res
 

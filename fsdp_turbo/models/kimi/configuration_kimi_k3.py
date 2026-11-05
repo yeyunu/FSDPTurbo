@@ -1,7 +1,10 @@
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) 2026 Moonshot AI
 
-from typing import Optional
+from typing import ClassVar, Optional
 
+from torch.distributed.tensor import Placement, Replicate
+from torch.distributed.tensor.parallel import ColwiseParallel, ParallelStyle, RowwiseParallel
 from transformers.configuration_utils import PretrainedConfig
 
 
@@ -255,6 +258,11 @@ class KimiK3Config(PretrainedConfig):
     """
 
     model_type = "kimi_k3"
+    # KDA and MLA consume complete heads between the TP projections.
+    fsdp_turbo_tp_layouts: ClassVar[dict[type[ParallelStyle], dict[str, Placement]]] = {
+        ColwiseParallel: {"output_layouts": Replicate()},
+        RowwiseParallel: {"input_layouts": Replicate()},
+    }
 
     def __init__(
         self,

@@ -1,4 +1,3 @@
-import fnmatch
 import logging
 
 import torch
@@ -12,23 +11,25 @@ from fsdp_turbo.utils.str_match import module_name_match
 logger = logging.getLogger(__name__)
 
 
-def tensor_parallel_modules(model: torch.nn.Module, tp_mesh: DeviceMesh, tp_plan: TPPlanConfig):
+def tensor_parallel_modules(model: torch.nn.Module, tp_mesh: DeviceMesh, tp_plan: TPPlanConfig) -> torch.nn.Module:
+    """Shard modules selected by the TP plan using any layouts declared by the model config class."""
+    layouts = getattr(type(getattr(model, 'config', None)), 'fsdp_turbo_tp_layouts', {})
     torch_tp_parallelize_plan = {}
     for name, _ in model.named_modules():
         parallel_style = get_parallel_style(name, tp_plan)
         if parallel_style is not None:
             print_rank(logger.debug, f'[TP]: Apply module <{name}> with parallel style {parallel_style}')
-            torch_tp_parallelize_plan[name] = parallel_style()
+            torch_tp_parallelize_plan[name] = parallel_style(**layouts.get(parallel_style, {}))
     return parallelize_module(model, tp_mesh, torch_tp_parallelize_plan)
 
 
 def get_parallel_style(module_name, tp_plan: TPPlanConfig):
     parallel_style = []
-    if any([module_name_match(pattern, module_name) for pattern in tp_plan.colwise_parallel]):
+    if any(module_name_match(pattern, module_name) for pattern in tp_plan.colwise_parallel):
         parallel_style.append(ColwiseParallel)
-    elif any([module_name_match(pattern, module_name) for pattern in tp_plan.rowwise_parallel]):
+    elif any(module_name_match(pattern, module_name) for pattern in tp_plan.rowwise_parallel):
         parallel_style.append(RowwiseParallel)
-    elif any([module_name_match(pattern, module_name) for pattern in tp_plan.sequence_parallel]):
+    elif any(module_name_match(pattern, module_name) for pattern in tp_plan.sequence_parallel):
         parallel_style.append(SequenceParallel)
 
     if len(parallel_style) > 1:
