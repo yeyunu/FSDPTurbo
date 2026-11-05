@@ -815,9 +815,7 @@ class Qwen3_5MoeForConditionalGeneration(hf.Qwen3_5MoeForConditionalGeneration):
 
         loss = None
         logits = None
-        chunk_loss_enabled = getattr(self, "enable_chunk_loss", False) or getattr(
-            self, "enable_dynamic_chunk_loss", False
-        )
+        chunk_loss_enabled = getattr(self, "enable_chunk_loss", False)
         if chunk_loss_enabled:
             # Training injects either legacy chunk loss or CCE through loss_function.
             # Both consume the full sequence; logits_to_keep only selects returned logits.

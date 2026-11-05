@@ -384,9 +384,7 @@ class MultiTokenPredictionBlock(nn.Module):
 
             hidden_states = self.norm(hidden_states)
 
-            if getattr(self.config, "enable_chunk_loss", False) or getattr(
-                self.config, "enable_dynamic_chunk_loss", False
-            ):
+            if getattr(self.config, "enable_chunk_loss", False):
                 mtp_loss = output_layer(hidden_states[:, slice_indices, :], loss_function, labels)
             else:
                 mtp_logits = output_layer(hidden_states[:, slice_indices, :])

@@ -257,9 +257,22 @@ def calculate_lm_loss(
     return loss, logits
 
 
-def chunk_loss(hidden_states, head_weight, head_bias, loss_forward, loss_kwargs_chunks, chunk_size):
+def chunk_loss(
+    hidden_states: torch.Tensor,
+    head_weight: torch.Tensor,
+    head_bias: Optional[torch.Tensor],
+    loss_forward: Callable[..., Tuple[torch.Tensor, torch.Tensor]],
+    loss_kwargs_chunks: list[dict[str, torch.Tensor | int | str]],
+    chunk_size: int,
+) -> torch.Tensor:
     """
     Compute loss in chunks using the custom autograd function `ChunkLoss`.
+
+    Merge batch and sequence into one token axis, keeping labels and alpha
+    aligned. Callers can pass one dictionary with unsplit labels/alpha, or
+    existing sequence-split dictionaries. Other loss kwargs must be shared.
+    Alpha is a scalar, a per-sample [B] denominator, or per-token [B, S].
+    Label shifting and normalization denominators are owned by the caller.
 
     For sum reduction with a scalar alpha, filter ignored tokens before the
     output projection and re-chunk valid tokens across the batch. Boolean
@@ -271,26 +284,42 @@ def chunk_loss(hidden_states, head_weight, head_bias, loss_forward, loss_kwargs_
         head_weight: Weight matrix of the output classification head.
         head_bias: Bias vector of the head.
         loss_forward: Callable that computes the loss for a given chunk.
-        loss_kwargs_chunks: List of keyword arguments for `loss_forward`, one per chunk.
-        chunk_size: Number of sequence positions per chunk (along dim=1).
+        loss_kwargs_chunks: Aligned labels/alpha and shared kwargs for `loss_forward`.
+        chunk_size: Maximum total tokens per chunk, independent of batch size.
+            Any positive integer is supported; the final chunk can be shorter.
 
     Returns:
         The total accumulated loss as a scalar tensor.
     """
     loss_kwargs = loss_kwargs_chunks[0]
+    shift_labels = torch.cat([chunk["shift_labels"] for chunk in loss_kwargs_chunks], dim=1)
     alpha = loss_kwargs.get("alpha")
+    if torch.is_tensor(alpha) and alpha.ndim > 0:
+        alpha_chunks = []
+        for chunk in loss_kwargs_chunks:
+            chunk_alpha = chunk["alpha"]
+            if chunk_alpha.ndim == 1:
+                chunk_alpha = chunk_alpha.unsqueeze(1)
+            alpha_chunks.append(chunk_alpha.expand_as(chunk["shift_labels"]))
+        alpha = torch.cat(alpha_chunks, dim=1).reshape(1, -1)
+
+    hidden_states = hidden_states.reshape(1, -1, hidden_states.shape[-1])
+    shift_labels = shift_labels.reshape(1, -1)
     if loss_kwargs.get("reduction") == "sum" and torch.is_tensor(alpha) and alpha.ndim == 0:
         ignore_index = loss_kwargs.get("ignore_index", -100)
-        shift_labels = torch.cat([chunk["shift_labels"] for chunk in loss_kwargs_chunks], dim=1)
         valid_tokens = shift_labels.reshape(-1) != ignore_index
         valid_token_count = int(valid_tokens.sum())
 
         if 0 < valid_token_count < valid_tokens.numel():
             hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))[valid_tokens].unsqueeze(0)
             shift_labels = shift_labels.reshape(-1)[valid_tokens].unsqueeze(0)
-            loss_kwargs_chunks = [
-                {**loss_kwargs, "shift_labels": labels} for labels in torch.split(shift_labels, chunk_size, dim=1)
-            ]
+
+    if torch.is_tensor(alpha) and alpha.ndim > 0:
+        alpha = torch.split(alpha, chunk_size, dim=1)
+    loss_kwargs_chunks = [
+        {**loss_kwargs, "shift_labels": labels, "alpha": alpha[index] if isinstance(alpha, tuple) else alpha}
+        for index, labels in enumerate(torch.split(shift_labels, chunk_size, dim=1))
+    ]
 
     return ChunkLoss.apply(hidden_states, head_weight, head_bias, loss_forward, loss_kwargs_chunks, chunk_size)
 
