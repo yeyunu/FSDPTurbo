@@ -16,13 +16,10 @@ def _use_fused_permute(hidden_states, global_indices):
     return hidden_states.device.type == "npu" and hidden_states.numel() > 0 and global_indices.numel() > 0
 
 
-def _reorder_router_weights(weights, row_map, fused):
-    if fused:
-        # NPU returns original-route -> permuted-row, the inverse of the
-        # eager gather indices. Scatter preserves FP32 probabilities and their
-        # autograd connection without sorting again or moving the multiply.
-        return torch.empty_like(weights).scatter(0, row_map.long(), weights)
-    return weights.index_select(0, row_map.long())
+def _reorder_router_weights(weights, row_map):
+    # Both eager and NPU permutation return original-route -> permuted-row.
+    # Scatter preserves FP32 probabilities and their autograd connection.
+    return torch.empty_like(weights).scatter(0, row_map.long(), weights)
 
 
 def _build_fixed_dispatch_metadata(
@@ -111,7 +108,7 @@ def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes
     return hidden_states, (unpermute_indices1, unpermute_indices2)
 
 
-def _unpermute_preweighted(hidden_states, sorted_indices, routing_shape):
+def _unpermute_preweighted(hidden_states, inverse_map, routing_shape):
     """Restore expert slots and sum them in the eager weighted path's order.
 
     Router weights have already been applied before the down projection.
@@ -119,8 +116,7 @@ def _unpermute_preweighted(hidden_states, sorted_indices, routing_shape):
     restored activations. Keep the same FP32 sum as the caller's input.
     """
     num_tokens, topk = routing_shape
-    restored = hidden_states.new_zeros((num_tokens * topk, hidden_states.shape[-1]))
-    restored.index_copy_(0, sorted_indices.long(), hidden_states)
+    restored = hidden_states.index_select(0, inverse_map.long())
     return restored.reshape(num_tokens, topk, hidden_states.shape[-1]).sum(dim=1)
 
 
@@ -385,14 +381,14 @@ class DeepSeekV41Experts(nn.Module):
             fused=fused_permute,
         )
         source_order, expert_order = unpermute_indices
-        router_weights = _reorder_router_weights(topk_weights.reshape(-1), source_order, fused_permute)
+        router_weights = _reorder_router_weights(topk_weights.reshape(-1), source_order)
         router_weights = all_to_all_single_autograd(
             router_weights,
             output_splits,
             input_split,
             ep_group,
         )
-        router_weights = _reorder_router_weights(router_weights, expert_order, fused_permute)
+        router_weights = _reorder_router_weights(router_weights, expert_order)
         gate_up_proj = self.gate_up_proj.to_local() if isinstance(self.gate_up_proj, DTensor) else self.gate_up_proj
         down_proj = self.down_proj.to_local() if isinstance(self.down_proj, DTensor) else self.down_proj
 
