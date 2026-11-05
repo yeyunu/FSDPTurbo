@@ -49,6 +49,27 @@ def fully_shard_parallel_modules(model: torch.nn.Module, fsdp_mesh: DeviceMesh, 
         hook_module = find_hook_module(module, hook_modules)
         fully_shard_fn(module, hook_module=hook_module, **module_config)
     fully_shard_fn(model, **config)
+    # Ignored modules are not wrapped into any FSDP unit, so FSDP never moves
+    # their parameters to the compute device, and forward fails with device
+    # mismatch. Move them parameter by parameter here. Exceptions:
+    # - Modules with pre_fsdp_hook: apply_pre_fsdp_module_hooks already invoked
+    #   their hook before FSDP and they manage device layout themselves (e.g.
+    #   the host-offload engram table must stay on host after materializing;
+    #   moving it would OOM and break the host storage protocol)
+    # - Meta placeholder parameters: filled by the loading/materialize flow;
+    #   to() would silently materialize an uninitialized tensor
+    # Parameters of FSDP descendants are already on device, so to() is
+    # idempotent. A pure CPU mesh needs no move.
+    if ignored_modules and fsdp_mesh.device_type != "cpu":
+        device = torch.device(f"{fsdp_mesh.device_type}:{torch.accelerator.current_device_index()}")
+        for name, module in model.named_modules():
+            if name not in ignored_modules:
+                continue
+            if callable(getattr(module, "pre_fsdp_hook", None)):
+                continue
+            for t in (*module.parameters(recurse=True), *module.buffers(recurse=True)):
+                if not t.is_meta:
+                    t.data = t.data.to(device)
     set_modules_to_prefetch(model, fsdp_modules, fsdp_plan)
     if fsdp_plan.num_to_backward_prefetch == 0:
         # FSDP2's default backward prefetch is enabled when no explicit list

@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor
 
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.utils.dtype import get_dtype
@@ -474,9 +475,27 @@ class BaseTrainer:
             if self.config.optimizer.param_prefetch is not None:
                 kwargs["param_prefetch"] = self.config.optimizer.param_prefetch
 
+        # ignored_modules (e.g. vision_tower.encoder.blocks, mm_projector) keep
+        # plain nn.Parameter while FSDP-sharded language layers hold DTensor.
+        # In one param group AdamW's foreach path buckets them by (device, dtype)
+        # into the same _foreach_mul_ batch and raises "mixed torch.Tensor and
+        # DTensor". Split them so every foreach bucket is homogeneous; the
+        # hyperparameters stay identical, so the two groups train the same.
+        dtensor_params, plain_params = [], []
+        for param in self.model.parameters():
+            if type(param) is DTensor:  # pylint: disable=unidiomatic-typecheck
+                dtensor_params.append(param)
+            else:
+                plain_params.append(param)
+        param_groups = []
+        if dtensor_params:
+            param_groups.append({"params": dtensor_params})
+        if plain_params:
+            param_groups.append({"params": plain_params})
+
         optimizer = OptimizerFactory.create(
             self.config.optimizer.optimizer_type,
-            self.model.parameters(),
+            param_groups,
             **kwargs,
         )
         hook_optimizer_step(self.model, optimizer)
