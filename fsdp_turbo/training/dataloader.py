@@ -66,11 +66,13 @@ def build_dataloader(data_cfg, tokenizer=None, processor=None):
             data_cfg=data_cfg,
         )
     else:
-        if os.path.isfile(data_cfg.dataset_path):
-            # datasets >= 5 rejects a bare local file path as a builder name
-            # ("Couldn't find any data file at ..."); route it through the json
-            # loader exactly like the multimodal branch.
-            dataset = load_dataset("json", data_files=data_cfg.dataset_path, split=data_cfg.split)
+        # Local file paths need an explicit builder name; HF hub datasets
+        # are loaded by name. Every local file keeps the historical
+        # json-builder routing (json/jsonl/txt alike); parquet is the one
+        # extension routed to its own builder.
+        if _is_local_file(data_cfg.dataset_path):
+            builder = "parquet" if str(data_cfg.dataset_path).lower().endswith(".parquet") else "json"
+            dataset = load_dataset(builder, data_files=data_cfg.dataset_path, split=data_cfg.split)
         else:
             dataset = load_dataset(data_cfg.dataset_path, data_cfg.dataset_config, split=data_cfg.split)
         dataset = _process_text_dataset(dataset, data_cfg, tokenizer) if tokenizer is not None else dataset
@@ -103,6 +105,11 @@ def build_dataloader(data_cfg, tokenizer=None, processor=None):
         pin_memory=data_cfg.pin_memory,
         collate_fn=collate_fn,
     )
+
+
+def _is_local_file(dataset_path):
+    """True when ``dataset_path`` points at a file on local disk."""
+    return isinstance(dataset_path, (str, os.PathLike)) and os.path.isfile(dataset_path)
 
 
 def _is_local_jsonl(dataset_path):

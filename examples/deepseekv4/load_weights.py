@@ -113,7 +113,7 @@ def _translate_key(real_key: str) -> str | None:
     if m:
         site = {"hc_attn": "attn_hc", "hc_ffn": "ffn_hc"}[m.group(2)]
         return f"model.layers.{m.group(1)}.{site}.{m.group(3)}"
-    if real_key.startswith("layers.") and ".attn.compressor." in real_key:
+    if real_key.startswith("layers.") and (".attn.compressor." in real_key or ".attn.indexer.compressor." in real_key):
         pre = real_key.split(".attn.compressor.", 1)[0]  # layers.N.attn.compressor|indexer.compressor
         layer = int(pre.split(".")[1])
         if ".indexer.compressor." in real_key:

@@ -8,7 +8,9 @@ from .adapter import (
     DeepseekV4ForCausalLMAdapter,
     build_deepseek_v4_model,
     build_deepseek_v4_model_args,
+    build_deepseek_v4_model_meta,
     initialize_deepseek_v4_model,
+    materialize_deepseek_v4_model,
     prepare_deepseek_v4_model_for_fsdp,
 )
 from .context_parallel import build_raw_attention_mask, deepseek_v4_cp_attention_forward
@@ -34,6 +36,8 @@ __all__ = [
     "build_deepseek_v4_model_args",
     "build_raw_attention_mask",
     "deepseek_v4_cp_attention_forward",
+    "build_deepseek_v4_model_meta",
     "initialize_deepseek_v4_model",
+    "materialize_deepseek_v4_model",
     "prepare_deepseek_v4_model_for_fsdp",
 ]
