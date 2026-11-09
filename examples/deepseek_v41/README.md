@@ -200,6 +200,7 @@ SparseFlashMla 路径时，设置 `FSDP_TURBO_CMP_MASK_MODE_WITHOUT_KV=3`；A5
 | CANN Compressor/CompressorGrad 融合压缩算子 | 可选；设置 `model.use_fused_compressor: true` |
 | Lightning Indexer 融合算子 | 可选；支持 Atlas A3（Ascend 910_93）、Ascend 910B/910C 和 Ascend950DT |
 | SparseLightningIndexerKLLossGrad 融合算子 | `model.indexer_loss_coeff` 默认为 `0.0`，设为正值时启用辅助梯度。`model.use_fused_lightning_indexer_loss` 默认为 `false`，使用 PyTorch；设为 `true` 时优先使用融合 SLIG，缺少算子或输入形状不受支持时回退到 PyTorch。 |
+| LightningIndexerKLLoss 融合算子 | 设置 `model.track_indexer_kl_loss: true` 且 `model.indexer_loss_coeff > 0`，在日志步记录 `Indexer KL`。`model.use_fused_indexer_kl_loss` 控制 KL 标量计算：默认 `true`，优先使用融合算子，不支持时回退；设为 `false` 时使用输入设备上的 PyTorch 实现。指标按有效 query 取平均、跨层求和并乘以 `indexer_loss_coeff`，不参与梯度计算。 |
 | MhcPreSinkhornPremix/MhcPost 融合算子 | 可选；设置 `model.use_fused_mhc: true` |
 | TileKernels MhcPost | Ascend 950 可选；设置 `model.tilekernels.tilekernels_mhc_post: true`，仅替换 post；默认关闭 |
 | Clipped SwiGLU 前反向融合 | 可选；设置 `model.use_fused_clipped_swiglu: true`，模型的 `swiglu_limit` 必须大于 0 |

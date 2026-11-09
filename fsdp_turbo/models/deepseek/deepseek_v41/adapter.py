@@ -22,6 +22,7 @@ from fsdp_turbo.memory.chunk_loss.chunk_loss import (
     fixed_cross_entropy,
 )
 from fsdp_turbo.memory.recompute.recompute import register_replay_context
+from fsdp_turbo.ops.indexer_kl_metric import current_indexer_kl_metrics
 from fsdp_turbo.ops.sparse_indexer_loss import collect_indexer_gradients
 from fsdp_turbo.ops.hf32_linear import hf32_linear
 
@@ -335,7 +336,12 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
                 from fsdp_turbo.distributed.context_parallel.loss import cp_all_reduce_forward_backward
 
                 gradient = cp_all_reduce_forward_backward(gradient, cp_group)
-            loss = loss + gradient * (self.model_args.indexer_loss_coeff / count)
+            scale = self.model_args.indexer_loss_coeff / count
+            loss = loss + gradient * scale
+            metrics = current_indexer_kl_metrics()
+            if metrics is not None:
+                # sync_loss averages CP ranks; the denominator already counts global queries.
+                metrics.scale = scale * (torch.distributed.get_world_size(cp_group) if cp_group is not None else 1)
 
         return DeepseekV41CausalLMOutput(
             loss=loss,

@@ -1,6 +1,7 @@
 import os
 import logging
 from collections.abc import Mapping
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -8,6 +9,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
+from fsdp_turbo.ops.indexer_kl_metric import collect_indexer_kl_metrics
 from fsdp_turbo.utils.dtype import get_dtype
 from fsdp_turbo.utils.log import set_log_level, print_rank
 from fsdp_turbo.training.checkpoint import Checkpointer
@@ -255,7 +257,7 @@ class BaseTrainer:
                         for v in self._accumulated_losses.values():
                             v.clear()
                         self._global_step += 1
-                        self._on_log_step(loss, grad_norm, aux_loss)
+                        self._on_log_step(loss, grad_norm, aux_loss, indexer_kl=synced.get("indexer_kl"))
                         self._on_checkpoint_step()
                         if prof is not None:
                             prof.step()
@@ -304,18 +306,27 @@ class BaseTrainer:
         self.optimizer.zero_grad()
         return grad_norm
 
-    def _on_log_step(self, loss: torch.Tensor, grad_norm: float, aux_loss: Optional[torch.Tensor] = None):
+    def _on_log_step(
+        self,
+        loss: torch.Tensor,
+        grad_norm: float,
+        aux_loss: Optional[torch.Tensor] = None,
+        indexer_kl: Optional[torch.Tensor] = None,
+    ):
         """Log training metrics if the logging interval is reached."""
         if self._global_step % self.config.run.logging_steps != 0:
             return
         loss_val = loss.item()
         aux_loss_val = aux_loss.item() if aux_loss is not None else None
+        indexer_kl_val = indexer_kl.item() if indexer_kl is not None else None
         if self._monitor is not None:
-            self._monitor.log(self._global_step, loss_val, grad_norm, aux_loss=aux_loss_val)
+            self._monitor.log(self._global_step, loss_val, grad_norm, aux_loss=aux_loss_val, indexer_kl=indexer_kl_val)
         else:
             parts = [f"Step {self._global_step} | Loss: {loss_val:.6f}"]
             if aux_loss_val is not None:
                 parts.append(f"Aux Loss: {aux_loss_val:.6f}")
+            if indexer_kl_val is not None:
+                parts.append(f"Indexer KL: {indexer_kl_val:.6f}")
             print_rank(logger.info, f"  {' | '.join(parts)}")
 
     def _on_checkpoint_step(self):
@@ -325,12 +336,25 @@ class BaseTrainer:
 
     def train_step(self, batch):
         """Execute a single training step: forward + backward."""
-        outputs = self.model(**batch)
+        track_kl = (
+            self.config.model.track_indexer_kl_loss and (self._global_step + 1) % self.config.run.logging_steps == 0
+        )
+        # Capture only the original forward. Fused backward keeps its collector on ctx.
+        collector = (
+            collect_indexer_kl_metrics(use_fused=self.config.model.use_fused_indexer_kl_loss)
+            if track_kl
+            else nullcontext(None)
+        )
+        with collector as metrics:
+            outputs = self.model(**batch)
         loss = outputs.loss
         if loss is None:
             raise RuntimeError("Model did not return a loss. Make sure the batch contains labels.")
         loss = loss / self.config.run.gradient_accumulation_steps
         loss.backward()
+        if metrics is not None:
+            value = metrics.value(loss.detach()) / self.config.run.gradient_accumulation_steps
+            self._accumulated_losses.setdefault("indexer_kl", []).append(value)
         aux_loss = outputs.aux_loss if hasattr(outputs, 'aux_loss') else None
         return loss, aux_loss
 

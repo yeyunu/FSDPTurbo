@@ -35,6 +35,8 @@ class ModelConfig:
     use_fused_lightning_indexer: bool = False
     use_fused_lightning_indexer_loss: bool = False
     indexer_loss_coeff: float = 0.0
+    track_indexer_kl_loss: bool = False
+    use_fused_indexer_kl_loss: bool = True
     # GLM-5.3-Flash DSA/indexer/attention dispatch knobs (model_config-driven;
     # train.py injects them into the HF text/vision sub-configs).
     # dsa_implementation: 'dense' (mask-based) or 'sfa' (npu_sparse_flash_attention).
@@ -658,6 +660,13 @@ class FSDPTurboConfig:
             or coefficient < 0
         ):
             raise ValueError("model.indexer_loss_coeff must be a finite non-negative number.")
+
+        if not isinstance(self.model.track_indexer_kl_loss, bool):
+            raise ValueError("model.track_indexer_kl_loss must be a boolean.")
+        if not isinstance(self.model.use_fused_indexer_kl_loss, bool):
+            raise ValueError("model.use_fused_indexer_kl_loss must be a boolean.")
+        if self.model.track_indexer_kl_loss and coefficient == 0:
+            raise ValueError("track_indexer_kl_loss requires a positive indexer_loss_coeff.")
 
     def validate_data_config(self):
         """Validate and normalize dataloader configuration."""

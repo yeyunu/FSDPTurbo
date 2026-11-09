@@ -5,7 +5,9 @@ import logging
 
 import torch
 
-from fsdp_turbo.ops.cpu.sparse_indexer_loss import sparse_indexer_gradient_torch
+from fsdp_turbo.ops.cpu.sparse_indexer_loss import indexer_kl_sum_torch, sparse_indexer_gradient_torch
+from fsdp_turbo.ops.npu.sparse_attention import _is_a2_or_a3
+from fsdp_turbo.ops.indexer_kl_metric import current_indexer_kl_metrics, indexer_kl_metric
 from fsdp_turbo.ops.registry import register_op
 from fsdp_turbo.utils.log import log_warning_once
 
@@ -15,6 +17,7 @@ class _IndexerGradient(torch.autograd.Function):
     def forward(ctx, query, key, weights, indices, target, ratio):
         ctx.save_for_backward(query, key, weights, indices, target)
         ctx.ratio = ratio
+        ctx.metrics = current_indexer_kl_metrics()
         return query.new_zeros((), dtype=torch.float32)
 
     @staticmethod
@@ -41,7 +44,7 @@ class _IndexerGradient(torch.autograd.Function):
             topk=indices.size(-1),
             **attrs,
         )
-        dq, dk, dw, _ = ops.sparse_lightning_indexer_kl_loss_grad(
+        dq, dk, dw, index_probs = ops.sparse_lightning_indexer_kl_loss_grad(
             q,
             k,
             w,
@@ -50,6 +53,17 @@ class _IndexerGradient(torch.autograd.Function):
             metadata=metadata,
             **attrs,
         )
+        if ctx.metrics is not None:
+            if index_probs.shape == teacher.squeeze(2).shape:
+                index_probs = index_probs.unsqueeze(2)
+            if index_probs.shape == teacher.shape:
+                metric = indexer_kl_metric(teacher, index_probs, use_fused=ctx.metrics.use_fused)
+            else:
+                log_warning_once(
+                    logging.getLogger(__name__), "Unexpected SLIG probability shape; reporting NaN for Indexer KL."
+                )
+                metric = teacher.new_full((), float("nan"))
+            ctx.metrics.sums.append(metric)
         return dq * scale, dk * scale, dw * scale, None, None, None
 
 
@@ -91,3 +105,27 @@ def sparse_indexer_gradient_npu(
         target.contiguous(),
         ratio,
     )
+
+
+def _supports_indexer_kl_kernel(device_index: int | None) -> bool:
+    if _is_a2_or_a3(device_index):
+        return True
+    name = torch.accelerator.get_device_name(device_index).upper()
+    return name.replace("-", "").replace("_", "").replace(" ", "").startswith("ASCEND950DT")
+
+
+@register_op("indexer_kl_sum", "npu")
+def indexer_kl_sum_npu(teacher: torch.Tensor, student: torch.Tensor) -> torch.Tensor:
+    """Use the scalar kernel on A2/A3 and the supported Ascend 950DT build."""
+    if (
+        _supports_indexer_kl_kernel(teacher.device.index)
+        and teacher.shape[-1] <= 8192
+        and (teacher.ndim == 2 or teacher.shape[0] <= 512)
+    ):
+        try:
+            from cann_ops_transformer import lightning_indexer_kl_loss
+        except ImportError:
+            log_warning_once(logging.getLogger(__name__), "KL scalar kernel unavailable; using PyTorch on NPU.")
+        else:
+            return lightning_indexer_kl_loss(teacher, student, eps=1e-9, weight_type="logits")
+    return indexer_kl_sum_torch(teacher, student)

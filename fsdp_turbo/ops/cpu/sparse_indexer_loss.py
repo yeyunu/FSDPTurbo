@@ -3,6 +3,7 @@
 
 import torch
 
+from fsdp_turbo.ops.indexer_kl_metric import current_indexer_kl_metrics, indexer_kl_metric
 from fsdp_turbo.ops.registry import register_op
 
 
@@ -18,6 +19,7 @@ def sparse_indexer_gradient_torch(
     """Return a zero-valued scalar with the gradient of the summed, detached-teacher KL."""
     batch = torch.arange(query.size(0), device=query.device)[:, None, None]
     total = query.new_zeros((), dtype=torch.float32)
+    metrics = current_indexer_kl_metrics()
     for q, w, idx, teacher in zip(
         query.split(32, 1),
         weights.split(32, 1),
@@ -30,5 +32,14 @@ def sparse_indexer_gradient_torch(
         logits = (logits * w.float().unsqueeze(-1)).sum(2).masked_fill(~valid, -torch.inf)
         logits = torch.where(valid.any(-1, keepdim=True), logits, 0.0)
         log_probs = logits.log_softmax(-1).masked_fill(~valid, 0)
+        if metrics is not None:
+            student = log_probs.detach().exp().masked_fill_(~valid, 0)
+            metrics.sums.append(indexer_kl_metric(teacher, student, use_fused=metrics.use_fused))
         total = total - (torch.nn.functional.normalize(teacher, p=1, dim=-1) * log_probs).sum()
     return total - total.detach()
+
+
+@register_op("indexer_kl_sum", "cpu")
+def indexer_kl_sum_torch(teacher: torch.Tensor, student: torch.Tensor) -> torch.Tensor:
+    probabilities = teacher / (teacher.sum(dim=-1, keepdim=True) + 1e-9)
+    return (teacher * (probabilities.clamp_min(1e-9).log() - (student + 1e-9).log())).sum()

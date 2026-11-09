@@ -359,12 +359,23 @@ def test_real_recompute_and_chunk_wrappers_on_adapter():
         assert (p.grad.float() - ref.float()).norm() / ref.float().norm() < 0.05
 
 
-def test_npu_wrapper_normalizes_teacher_and_preserves_zero_rows(monkeypatch):
+@pytest.mark.parametrize("use_fused_kl", [False, True])
+@pytest.mark.parametrize("layout", ["bsnk", "bsk", "swapped"])
+def test_npu_wrapper_normalizes_teacher_and_preserves_zero_rows(monkeypatch, layout, use_fused_kl):
     """Check the native call boundary without needing an Ascend device."""
     import sys
     from types import SimpleNamespace
     from fsdp_turbo.ops.npu import sparse_indexer_loss as npu
 
+    from fsdp_turbo.ops.indexer_kl_metric import collect_indexer_kl_metrics
+
+    metric_impl = npu.indexer_kl_metric
+
+    def checked_metric(target, probs, *, use_fused):
+        assert use_fused == use_fused_kl
+        return metric_impl(target, probs, use_fused=use_fused)
+
+    monkeypatch.setattr(npu, "indexer_kl_metric", checked_metric)
     observed = []
     metadata_widths = []
 
@@ -375,7 +386,12 @@ def test_npu_wrapper_normalizes_teacher_and_preserves_zero_rows(monkeypatch):
         assert indices.shape == teacher.shape == (1, 4, 1, 2)
         assert indices.dtype == torch.int32
         observed.append(teacher.detach().clone())
-        return torch.ones_like(q), torch.ones_like(k), torch.ones_like(w), torch.zeros_like(teacher)
+        probs = teacher
+        if layout == "bsk":
+            probs = teacher.squeeze(2)
+        elif layout == "swapped":
+            probs = teacher.transpose(1, 3)
+        return torch.ones_like(q), torch.ones_like(k), torch.ones_like(w), probs
 
     fake_ops = SimpleNamespace(
         sparse_lightning_indexer_kl_loss_grad_metadata=metadata,
@@ -389,10 +405,16 @@ def test_npu_wrapper_normalizes_teacher_and_preserves_zero_rows(monkeypatch):
     teacher = torch.tensor([[[3.0, 0.0], [2.0, 6.0], [10.0, 10.0], [0.0, 0.0]]])
     expected = torch.tensor([[[1.0, 0.0], [0.25, 0.75], [0.5, 0.5], [0.0, 0.0]]])
     for mass in (1.0, 17.0):
-        carrier = npu.sparse_indexer_gradient_npu(q, k, w, indices, teacher * mass, 1)
+        with collect_indexer_kl_metrics(use_fused=use_fused_kl) as metrics:
+            carrier = npu.sparse_indexer_gradient_npu(q, k, w, indices, teacher * mass, 1)
         grads = torch.autograd.grad(carrier * 0.25, (q, k, w))
         for grad in grads:
             torch.testing.assert_close(grad, torch.full_like(grad, 0.25))
+        (metric,) = metrics.sums
+        if layout == "swapped":
+            assert metric.isnan()
+        else:
+            torch.testing.assert_close(metric, torch.zeros_like(metric), atol=1e-6, rtol=0)
         actual = observed[-1].squeeze(2)
         torch.testing.assert_close(actual, expected)
         assert metadata_widths[-1] == 2
@@ -435,3 +457,38 @@ def test_tnd_adapter_requires_sfa_before_backbone(monkeypatch, fused):
             sfa_layout="TND",
             actual_seq_len=torch.tensor([4, 10], dtype=torch.int32),
         )
+
+
+@pytest.mark.parametrize("use_fused_kl", [False, True])
+def test_trainer_reports_kl_only_on_logging_step(use_fused_kl):
+    from types import SimpleNamespace
+    from fsdp_turbo.models.deepseek.deepseek_v41.adapter import build_deepseek_v41_model
+    from fsdp_turbo.training.trainer import BaseTrainer
+
+    model = build_deepseek_v41_model(model_args=_adapter_args(), indexer_loss_coeff=0.3)
+    torch.manual_seed(51)
+    with torch.no_grad():
+        for param in model.parameters():
+            param.normal_(0, 0.2)
+    ids = torch.randint(0, 32, (2, 10))
+    batch = dict(input_ids=ids, labels=ids, attention_mask=torch.ones_like(ids, dtype=torch.bool))
+    batch["attention_mask"][1, -2:] = False
+    trainer = SimpleNamespace(
+        model=model,
+        _global_step=0,
+        _accumulated_losses={},
+        config=SimpleNamespace(
+            model=SimpleNamespace(track_indexer_kl_loss=True, use_fused_indexer_kl_loss=use_fused_kl),
+            run=SimpleNamespace(logging_steps=2, gradient_accumulation_steps=1),
+        ),
+    )
+    plain, _ = BaseTrainer.train_step(trainer, batch)
+    assert "indexer_kl" not in trainer._accumulated_losses
+    reference_grad = model.model.layers[0].attn.indexer.wq_b.weight.grad.clone()
+    model.zero_grad(set_to_none=True)
+    trainer._global_step = 1
+    tracked, _ = BaseTrainer.train_step(trainer, batch)
+    (metric,) = trainer._accumulated_losses["indexer_kl"]
+    assert metric.item() > 0 and not metric.requires_grad
+    torch.testing.assert_close(tracked, plain)
+    torch.testing.assert_close(model.model.layers[0].attn.indexer.wq_b.weight.grad, reference_grad)

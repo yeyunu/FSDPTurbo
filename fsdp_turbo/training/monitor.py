@@ -32,7 +32,10 @@ class Monitor:
         if self._memory_backend is not None:
             self._memory_backend.reset_peak_memory_stats()
 
-    def log(self, step: int, loss: float, grad_norm: float = None, aux_loss: float = None):
+    def log(
+        self, step: int, loss: float, grad_norm: float = None, aux_loss: float = None, indexer_kl: float = None
+    ) -> None:
+        """Emit losses, optional indexer KL, timing and memory in one training log line."""
         step_time = None
         if self._step_start_time is not None:
             step_time = time.perf_counter() - self._step_start_time
@@ -44,6 +47,8 @@ class Monitor:
             parts.append(f"Grad Norm: {grad_norm:.4f}")
         if aux_loss is not None:
             parts.append(f"Aux Loss: {aux_loss:.6f}")
+        if indexer_kl is not None:
+            parts.append(f"Indexer KL: {indexer_kl:.6f}")
         if step_time is not None:
             parts.append(f"Step Time: {step_time:.4f}s")
         memory_stats = self._get_memory_stats()
@@ -68,6 +73,7 @@ class Monitor:
 
     @staticmethod
     def _get_memory_backend():
+        # NPU memory statistics require its native allocator API on supported CANN builds.
         if hasattr(torch, "npu") and torch.npu.is_available():
             return torch.npu
         if torch.cuda.is_available():
