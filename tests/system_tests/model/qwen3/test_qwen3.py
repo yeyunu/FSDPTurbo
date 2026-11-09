@@ -18,6 +18,7 @@ from fsdp_turbo.fsdp_turbo_config import (
     FSDPTurboConfig,
     FSDPPlanConfig,
     EPPlanConfig,
+    MoonEPConfig,
     TPPlanConfig,
     DistributedConfig,
     MemoryConfig,
@@ -53,6 +54,17 @@ TENSOR_PARALLEL_SIZE = int(os.environ.get('TENSOR_PARALLEL_SIZE', '2'))
 EXPERT_PARALLEL_SIZE = int(os.environ.get('EXPERT_PARALLEL_SIZE', '8'))
 EXPERT_FULLY_SHARD_PARALLEL_SIZE = int(os.environ.get('EXPERT_FULLY_SHARD_PARALLEL_SIZE', '1'))
 FULLY_SHARD_PARALLEL_SIZE = int(os.environ.get('FULLY_SHARD_PARALLEL_SIZE', '4'))
+
+# Expert dispatcher. Selectable so this case can serve as the baseline for
+# another dispatcher without editing the file: run it once as-is and once with
+# EP_DISPATCHER=moonep, and the two runs differ in nothing else.
+EP_DISPATCHER = os.environ.get('EP_DISPATCHER', 'all2all')
+
+# Shuffling is on by default, as it has always been here. Turn it off when
+# comparing two dispatchers: the sampler is seeded from the global RNG at
+# iteration time, so anything that draws a different number of random values
+# during setup reorders the batches and makes the losses incomparable.
+SHUFFLE = os.environ.get('SHUFFLE', '1').lower() in ('1', 'true', 'yes', 'on')
 
 # Chunk batch configuration
 ENABLE_CHUNK_BATCH = os.environ.get('ENABLE_CHUNK_BATCH', '0').lower() in ('1', 'true', 'yes', 'on')
@@ -108,8 +120,45 @@ def get_dataloader(tokenizer, batch_size=BATCH_SIZE, max_length=MAX_LENGTH):
         return examples
 
     tokenized_dataset = tokenized_dataset.map(add_labels)
-    dataloader = torch.utils.data.DataLoader(tokenized_dataset, batch_size=batch_size, shuffle=True)
+    dataloader = torch.utils.data.DataLoader(tokenized_dataset, batch_size=batch_size, shuffle=SHUFFLE)
     return dataloader
+
+
+def get_ep_plan():
+    """Build the EP plan for EP_DISPATCHER.
+
+    MoonEP needs its static token shape declared up front: on Ascend every
+    symmetric allocation is registered before the symmetric heap comes up, so the
+    shape cannot be inferred on the first expert forward the way it is on CUDA.
+    ``padding='max_length'`` above is what makes BATCH_SIZE * MAX_LENGTH the token
+    count on every step rather than an upper bound.
+    """
+    if EP_DISPATCHER != 'moonep':
+        # main 的 Qwen3 ST 默认 fused + fixed_router=True（G-a 重排后）。
+        # 非 moonep 路径必须带上，避免 rebase 把默认用例从 True 改回字段默认 False。
+        return EPPlanConfig(
+            apply_modules=['model.layers.{*}.mlp.experts'],
+            dispatcher=EP_DISPATCHER,
+            use_fused_ops=False,
+            fixed_router=True,
+        )
+
+    from transformers import AutoConfig
+
+    top_k = getattr(AutoConfig.from_pretrained(MODEL_PATH), 'num_experts_per_tok', None)
+    if not isinstance(top_k, int) or top_k <= 0:
+        raise ValueError(
+            f'MoonEP needs the router width; {MODEL_PATH} reports '
+            f'num_experts_per_tok={top_k!r}. This model is not a top-k MoE.'
+        )
+    return EPPlanConfig(
+        apply_modules=['model.layers.{*}.mlp.experts'],
+        dispatcher='moonep',
+        moonep_config=MoonEPConfig(
+            tokens_per_rank=BATCH_SIZE * MAX_LENGTH,
+            top_k=top_k,
+        ),
+    )
 
 
 # ============================================================
@@ -121,7 +170,7 @@ def get_complete_custom_config():
 
     Features:
     - FSDP2 with fully sharded data parallel
-    - Expert Parallel with all2all dispatcher and fused ops
+    - Expert Parallel with the EP_DISPATCHER dispatcher
     - Tensor Parallel
     - Recompute for memory optimization
     - Mixed Precision (BF16 param/output, FP32 reduce)
@@ -166,12 +215,7 @@ def get_complete_custom_config():
             ),
             expert_parallel_size=EXPERT_PARALLEL_SIZE,
             expert_fully_shard_parallel_size=EXPERT_FULLY_SHARD_PARALLEL_SIZE,
-            ep_plan=EPPlanConfig(
-                apply_modules=['model.layers.{*}.mlp.experts'],
-                dispatcher='all2all',
-                use_fused_ops=False,
-                fixed_router=True,
-            ),
+            ep_plan=get_ep_plan(),
         ),
         memory=MemoryConfig(
             recompute=True,
@@ -288,6 +332,13 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
                     f'max memory: {torch.npu.max_memory_allocated() / 1024**3:.4f} GB',
                 )
 
+    # Release backend resources while the process group is still up, the way
+    # BaseTrainer._release_model_resources does; MoonEP's symmetric heap and
+    # reserved VMM handles are freed here rather than at interpreter teardown.
+    close = getattr(model, 'close', None)
+    if callable(close):
+        close()
+
     if torch.accelerator.current_device_index() == 0:
         print(f'\n Test completed: {config_name}\n')
 
@@ -309,6 +360,8 @@ def test_qwen3():
         description=(
             'FSDP2 + EP + TP + Recompute + Mixed Precision + Hook Module + Prefetch (Custom)'
             f' + ChunkBatch={ENABLE_CHUNK_BATCH}, ChunkMBS={CHUNK_MBS}'
+            f', Dispatcher={EP_DISPATCHER}, TP={TENSOR_PARALLEL_SIZE}'
+            f', EP={EXPERT_PARALLEL_SIZE}, Shuffle={SHUFFLE}'
         ),
         enable_profiler=ENABLE_PROFILER,
     )

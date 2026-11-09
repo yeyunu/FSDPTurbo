@@ -20,6 +20,10 @@ tests/system_tests/
 │   ├── kimi_k3/                        # Kimi-K3 减层冒烟用例
 │   │   ├── run_test_kimi_k3.sh
 │   │   └── test_kimi_k3.py
+│   ├── moonep/                         # MoonEP 逐张量正确性（无基线 JSON，功能测试）
+│   │   ├── README.md
+│   │   ├── run_test_moonep.sh
+│   │   └── test_moonep.py
 │   ├── deepseekv4/                     # DeepSeekV4 CI 基线（5 个可共存特性同时开启）
 │   │    ├── run_test_deepseekv4.sh      # 启动脚本（torchrun）
 │   │    ├── test_deepseekv4.py          # 训练循环（含 SwapActivation / SwapOptimizer / ChunkLoss）
@@ -48,16 +52,20 @@ ST 编排逻辑内联在 `ci/MindSpeed_FSDPTurbo_ut.sh` 的 `run_testcase` 函�
 对每个 `run_test_*.sh`：
 
 1. **训练（总是跑）**：`bash -e run_test_*.sh`（内部 `torchrun` 起 8 NPU），stdout+stderr 写入 `run_logs/<name>.log`（当前目录下）。`-e` 保证脚本中间命令失败即向上传播退出码，不会被末尾 `torchrun` 掩盖而误判 PASSED。训练每步在 rank0 打印一行汇总：
+
    ```
    [Rank 0] step N step time: X.XXXXs loss: X.XXXX grad norm: X.XXXX memory: X.XXXX GB max memory: X.XXXX GB
    ```
+
    （`acquire_json` 只匹配该行；`[Rank 0] Loss: ...` 等其它行被忽略。loss/grad norm/显存用 `(\S+)` 捕获，可匹配 `nan`/`inf`/`-inf`，避免非有限值被静默丢弃导致各指标列表长度错位。）
 2. **功能判定**：训练退出码非 0 → `failed_script_cases`，走 fail-fast（功能失败照常暴露）。
 3. **基线存在性检查**：若 `baseline_results/<name>.json` 不存在 → 该用例判 `[PASS-functional]`（训练已过、跳过比对），计入 `skipped_cases`（标 `no baseline (functional only)`），返回 0。即**无基线也跑训练做功能看护**，只是不量精度/性能；提交一个基线 JSON（哪怕空列表）即可激活精度/性能看护。
 4. **解析**：有基线时 `compare_baseline.py` 调 `acquire_json.transfer_logs_as_json` 把日志解析为 `<name>.json`（路径由 log 路径派生：`run.log` → `run.json`，落在 log 同目录）。JSON schema：
+
    ```json
    {"lm loss": [...], "grad norm": [...], "time info": [ms...], "memo info": [{"rank","allocated memory","max allocated memory"}]}
    ```
+
    （`time info` 由秒×1000 转为 ms；`memo info` 取每个 rank 最后一步的内存快照。）
 5. **比对**：与 `baseline_results/<name>.json` 逐指标比对，任一指标超差 → 退出码 1。
 6. **汇总**：`run_testcase` 把比对退出码非 0 的用例计入 `failed_compare_cases`，按 `CI_CONTINUE_ON_FAILURE` 决定 fail-fast 或继续；功能-only 的用例计入 `skipped_cases`（不计为失败）。
@@ -66,14 +74,15 @@ ST 编排逻辑内联在 `ci/MindSpeed_FSDPTurbo_ut.sh` 的 `run_testcase` 函�
 
 | 指标 | 比对方式 | 相对容差（默认） | 绝对容差地板（默认） | 失败条件 |
 |---|---|---|---|---|
-| `lm loss` | 逐 step 相对偏差 | rel 2% | abs_tol 0.1 | 任一步：`|expected|>0.1` 时偏差 >2%，否则绝对差 >0.1 |
-| `grad norm` | 逐 step 相对偏差 | rel 10% | abs_tol 1.0 | 任一步：`|expected|>1.0` 时偏差 >10%，否则绝对差 >1.0 |
+| `lm loss` | 逐 step 相对偏差 | rel 2% | abs_tol 0.1 | 任一步：abs(expected) 大于 0.1 时偏差超过 2%，否则绝对差大于 0.1 |
+| `grad norm` | 逐 step 相对偏差 | rel 10% | abs_tol 1.0 | 任一步：abs(expected) 大于 1.0 时偏差超过 10%，否则绝对差大于 1.0 |
 | `time info` | 丢前 `WARM_UP=2` 步后取**中位数**，相对偏差 | rel 5% | —（禁用） | 比基线中位数慢 >5%（更快或 ≤5% 慢均过） |
 | `memo info` | per-rank `allocated`/`max allocated`，相对偏差 | rel 10% | —（禁用） | 任一 rank 显存超基线 >10% |
 
 > **绝对容差地板（abs_tol）**：相对误差在近零值处无意义（如 grad norm 0.0007↔0.2316 相对差 330×、绝对差仅 0.23）。当 `|expected| <= abs_tol` 时改用绝对差 `|actual - expected| <= abs_tol` 判定，避免近零噪声误判 FAIL；`abs_tol=0` 表示禁用、纯相对。time/显存值不会近零，故默认禁用。真回归（如 loss 10→15、grad 100→200）仍照常 FAIL，不被掩盖。
 
 补充规则：
+
 - **基线列表为空** → 该指标 `SKIP`（不失败）。所以基线未填时门禁不生效，填了才激活。
 - **actual 列表为空**（训练没产出该指标）→ `FAIL`。
 - **长度不匹配**（baseline 与 actual 步数/rank 数不一致）→ `FAIL`。
@@ -110,8 +119,6 @@ ST 编排逻辑内联在 `ci/MindSpeed_FSDPTurbo_ut.sh` 的 `run_testcase` 函�
 | Kimi-K3 | `kimi_k3/run_test_kimi_k3.sh` / `test_kimi_k3.py` | Kimi-K3 | 4 | FSP=8, TP=1, EP=8, EFP=1 | 10 |
 | DeepSeekV4 | `deepseekv4/run_test_deepseekv4.sh` / `test_deepseekv4.py` | DeepSeekV4-4L | 4 | FSP=8, TP=1, EP=1 | 10 |
 | GLM-5.3-Flash | `glm5.3_flash/run_test_glm5_3_flash.sh` / `test_glm5_3_flash.py` | GLM-5.3-Flash | 4 | FSP=8, TP=1, EP=8 | 10 |
-
-
 
 ### DeepSeekV4 CI 基线用例
 
@@ -161,6 +168,7 @@ Qwen3 为**全层真实权重用例**：`AutoModelForCausalLM.from_pretrained` �
 
 1. 在 CI/备用环境多次跑：`bash tests/system_tests/model/<name>/run_test_<name>.sh`（每次日志落到 `run_logs/run_test_<name>.log`；多跑时改名保留，如 `.run0/.run1/.run2`）。
 2. 用 `acquire_json.py` 把多条日志合成**中位数基线**（loss/grad/time 逐步取中位数、memo per-rank 取中位数）：
+
    ```bash
    python tests/system_tests/test_tools/acquire_json.py \
        --log run_logs/run_test_qwen3_5.run0.log \
@@ -168,6 +176,7 @@ Qwen3 为**全层真实权重用例**：`AutoModelForCausalLM.from_pretrained` �
              run_logs/run_test_qwen3_5.run2.log \
        --json tests/system_tests/baseline_results/run_test_qwen3_5.json
    ```
+
    单条日志则逐字写入（等同该次运行结果）。
 3. 提交。下次 CI 即对该用例逐 step 比对。
 
@@ -176,14 +185,17 @@ Qwen3 为**全层真实权重用例**：`AutoModelForCausalLM.from_pretrained` �
 ## 工具 CLI
 
 ### `compare_baseline.py`（解析 + 比对，CI 调用）
+
 ```bash
 python tests/system_tests/test_tools/compare_baseline.py \
     --generate-log <run.log> --baseline-json <baseline.json>
 ```
+
 - 两个参数均必填。JSON 路径由 log 路径自动派生（`run.log` → `run.json`，同目录）。
 - 退出码 0 = 通过，1 = 有指标超差。
 
 ### `acquire_json.py`（解析日志为 JSON / 合成中位数基线）
+
 ```bash
 # 单条日志 → 逐字写入
 python tests/system_tests/test_tools/acquire_json.py --log <run.log> --json <out.json>
@@ -192,6 +204,7 @@ python tests/system_tests/test_tools/acquire_json.py --log <run.log> --json <out
 python tests/system_tests/test_tools/acquire_json.py \
     --log run1.log run2.log run3.log --json tests/system_tests/baseline_results/run_test_<name>.json
 ```
+
 - `--log` 可传一个或多个。单条逐字写；多条取中位数（抗单次抖动，推荐用于基线生成）。
 - 不做比对，只生成 JSON。
 

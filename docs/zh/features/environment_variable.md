@@ -29,8 +29,10 @@ NNODES=2 GPUS_PER_NODE=16 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 bash run.sh
 | `ASCEND_LAUNCH_BLOCKING` | NPU同步执行开关（示例脚本中设置为`1`，便于调试定位） |
 | `ASCEND_SLOG_PRINT_TO_STDOUT` | NPU日志输出到标准输出（调试用，默认关闭） |
 
+Kimi 路由诊断已迁到 `ep_plan.router_debug`（`apply_custom_router`、`target_max_vio`、`router_mode`、`record_load_balance`），默认关闭。见[专家并行](./expert_parallel.md)。
+
 > [!NOTE]
-> 
+>
 > NPU环境下，训练前需正确加载昇腾环境：
 >
 > ```bash
@@ -61,3 +63,7 @@ export ASCEND_LAUNCH_BLOCKING=1
 > [!NOTE]
 >
 > 以上NPU性能调优变量为推荐配置，实际效果因模型规模、硬件型号与并行策略而异，建议结合[性能数据采集](../tools/profiling.md)进行调优。
+
+## MoonEP调试
+
+`trace_enabled`、`trace_sync_enabled`、`vmm_probe_enabled`、`npu_async_comm` 已迁到 `ep_plan.moonep_config`，默认全部关闭。见[专家并行](./expert_parallel.md)。

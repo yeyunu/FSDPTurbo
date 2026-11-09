@@ -244,13 +244,84 @@ class CPPlanConfig:
 
 
 @dataclass
+class MoonEPConfig:
+    """MoonEP communication, memory and static-shape tuning options.
+
+    ``tokens_per_rank`` and ``top_k`` may be omitted on CUDA, where they are
+    inferred on the first expert forward and then locked. The Ascend backend
+    requires them up front, because every symmetric allocation must be
+    registered before its symmetric heap is initialized.
+
+    MoonEP training always reserves one prefetch slot per local expert: that is
+    the ``E/R`` bound proved tight in Appendix E of the Kimi K3 report, so
+    planning is always feasible and training is never interrupted.
+    """
+
+    num_sms: int = 32
+    token_padding: int = 128
+    comm_stream_priority: int = -1
+    # Let the collectives complete asynchronously on a side stream where the
+    # backend can. Off by default because Ascend cannot: its kernels carry
+    # device-side all-rank barriers whose generation counters desynchronise on a
+    # side stream, so the request is masked off there and setting it has no
+    # effect. Only the CUDA backend acts on it.
+    async_finish: bool = False
+    tokens_per_rank: Optional[int] = None
+    top_k: Optional[int] = None
+    # Trade one extra all-to-all in the backward pass for K times less saved
+    # activation memory on the first expert GEMM (K3 report S5.2.2). Leave this
+    # off when full-layer activation checkpointing is enabled, because the
+    # dispatch is already replayed by the recompute.
+    recompute_dispatch: bool = False
+    # Run the device-side plan and routing assertions on every step instead of
+    # only the first one. Useful during bring-up; costs a few extra elementwise
+    # kernels per MoE layer.
+    validate_plan_invariants: bool = False
+    # CANN SHMEM bootstrap endpoint for a multi-node EP group on Ascend, for
+    # example "tcp://10.0.0.1:29501". Derived from MASTER_ADDR/MASTER_PORT when
+    # left unset.
+    shmem_ip_port: Optional[str] = None
+    # Ascend only: use CANN SHMEM's stream-ordered global barrier before the
+    # weight-gradient reduction instead of a host synchronize plus dist.barrier,
+    # saving one pipeline drain per MoE layer in the backward pass. On by
+    # default since it measured 2.3-3.8% faster with bit-identical losses and
+    # passed the per-tensor correctness check at 3 and 20 steps. Kept as a knob
+    # because it is the synchronization that a past data race turned on, and 20
+    # steps is not a proof.
+    shmem_stream_barrier: bool = True
+    trace_enabled: bool = False
+    trace_sync_enabled: bool = False
+    vmm_probe_enabled: bool = False
+    npu_async_comm: bool = False
+
+
+@dataclass
+class KimiRouterDebugConfig:
+    apply_custom_router: bool = False
+    target_max_vio: float = -1.0
+    router_mode: str = "lognormal"
+    record_load_balance: bool = False
+
+    def __post_init__(self):
+        if not self.apply_custom_router:
+            return
+        target = float(self.target_max_vio)
+        if math.isnan(target) or math.isinf(target) or target < 0:
+            raise ValueError("apply_custom_router requires a finite target_max_vio >= 0.")
+        if self.router_mode not in ("exact", "lognormal"):
+            raise ValueError("router_mode must be exact or lognormal.")
+
+
+@dataclass
 class EPPlanConfig:
     """Configuration for Expert Parallelism (EP) plan for MoE models."""
 
     apply_modules: List[str] = field(default_factory=list)
-    dispatcher: Union[Literal["all2all", "allgather", "mc2", "domino", "chunkmoe"], Callable, str] = "all2all"
+    dispatcher: Union[Literal["all2all", "allgather", "mc2", "domino", "chunkmoe", "moonep"], Callable, str] = "all2all"
     fixed_router: bool = False
     apply_efsdp_modules: List[str] = field(default_factory=list)
+    moonep_config: Optional[MoonEPConfig] = None
+    router_debug: Optional[KimiRouterDebugConfig] = None
     # Gradient divide factor for expert HSDP. When unset (None) it is
     # computed in the config validation as ep * edp * efsdp.
     gradient_divide_factor: Optional[float] = None
@@ -475,6 +546,7 @@ class FSDPTurboConfig:
         self.validate_chunk_batch_config()
         self.validate_swap_activation_config()
         self.validate_quantization_config()
+        self.validate_moonep_config()
         self.validate_fsdp_config()
         self.validate_vp_config()
         self.validate_memory_snapshot_config()
@@ -892,7 +964,7 @@ class FSDPTurboConfig:
             distributed=DistributedConfig(
                 ep_plan=EPPlanConfig(
                     apply_modules: ['*mlp.experts*'],
-                    dispatcher: 'all2all', 'mc2', 'domino', 'allgather', 'chunkmoe',
+                    dispatcher: 'all2all', 'mc2', 'domino', 'allgather', 'chunkmoe', 'moonep',
                                 'custom_ep_forward_eager', 'custom_ep_forward_fused'
                 )
             )
@@ -915,9 +987,51 @@ class FSDPTurboConfig:
             )
         if not self.distributed.ep_plan.apply_efsdp_modules:
             self.distributed.ep_plan.apply_efsdp_modules = []
-            for ep_module in self.distributed.ep_plan.apply_modules:
-                if ep_module.endswith(".experts"):
-                    self.distributed.ep_plan.apply_efsdp_modules.append(ep_module)
+            if self.distributed.ep_plan.dispatcher != "moonep":
+                for ep_module in self.distributed.ep_plan.apply_modules:
+                    if ep_module.endswith(".experts"):
+                        self.distributed.ep_plan.apply_efsdp_modules.append(ep_module)
+
+    def validate_moonep_config(self) -> None:
+        ep_plan = self.distributed.ep_plan
+        if ep_plan is None or ep_plan.dispatcher != "moonep":
+            return
+        if self.distributed.expert_parallel_size <= 1:
+            raise ValueError(
+                "MoonEP requires expert_parallel_size > 1; use the model's local expert path when EP is disabled."
+            )
+        if self.distributed.expert_fully_shard_parallel_size != 1:
+            raise ValueError(
+                "MoonEP does not support expert FSDP; set expert_fully_shard_parallel_size=1 or use another dispatcher."
+            )
+        if ep_plan.apply_efsdp_modules:
+            raise ValueError(
+                "MoonEP owns the expert weights, so they cannot also be wrapped "
+                "by expert FSDP. Leave ep_plan.apply_efsdp_modules empty or use "
+                f"another dispatcher; got {ep_plan.apply_efsdp_modules}."
+            )
+        moon_cfg = ep_plan.moonep_config
+        if moon_cfg is None:
+            moon_cfg = MoonEPConfig()
+            ep_plan.moonep_config = moon_cfg
+        if moon_cfg.num_sms <= 0:
+            raise ValueError("MoonEP num_sms must be positive.")
+        if moon_cfg.token_padding <= 0:
+            raise ValueError("MoonEP token_padding must be positive.")
+        if moon_cfg.tokens_per_rank is not None and moon_cfg.tokens_per_rank <= 0:
+            raise ValueError("MoonEP tokens_per_rank must be positive when set.")
+        if moon_cfg.top_k is not None and moon_cfg.top_k <= 0:
+            raise ValueError("MoonEP top_k must be positive when set.")
+
+        quant_plan = self.quantization.quantization_plan
+        if quant_plan is not None and quant_plan.quant_recipe:
+            moe_converters = [name for name in (quant_plan.converters or []) if name.startswith("quantize.moe.")]
+            if moe_converters or quant_plan.quant_gmm:
+                offending = ", ".join(moe_converters) or "quant_gmm"
+                raise ValueError(
+                    "MoonEP requires BF16 expert weights and is incompatible with MoE "
+                    f"quantization. Remove {offending} or use another dispatcher."
+                )
 
     def validate_vp_config(self):
         """vocab parallelize plan

@@ -12,6 +12,11 @@ from fsdp_turbo.utils.log import log_warning_once
 from fsdp_turbo.ops.npu.engram import engram_backward_npu, engram_forward_npu, engram_wkv_npu
 from fsdp_turbo.ops.npu.grouped_matmul import grouped_matmul_npu, w4a16_grouped_matmul_npu
 from fsdp_turbo.ops.npu.grouped_matmul_mc2 import all2all_grouped_matmul_npu, grouped_matmul_all2all_npu
+from fsdp_turbo.ops.npu.moonep_grouped_matmul import (
+    moonep_grouped_matmul_npu,
+    moonep_grouped_matmul_dgrad_npu,
+    moonep_grouped_matmul_wgrad_npu,
+)
 from fsdp_turbo.ops.npu.mx_grouped_matmul import mx_grouped_matmul_npu
 from fsdp_turbo.ops.npu.mx_quant_matmul import mx_quant_matmul_npu, w4a16_quant_matmul_npu
 from fsdp_turbo.ops.npu.mx_quant import (
@@ -96,6 +101,9 @@ __all__ = [
     'w4a16_grouped_matmul_npu',
     'all2all_grouped_matmul_npu',
     'grouped_matmul_all2all_npu',
+    'moonep_grouped_matmul_npu',
+    'moonep_grouped_matmul_dgrad_npu',
+    'moonep_grouped_matmul_wgrad_npu',
     'mx_grouped_matmul_npu',
     'mx_quant_matmul_npu',
     'w4a16_quant_matmul_npu',

@@ -4,7 +4,7 @@
 
 This module provides decoupled, FSDP-aware gradient norm operations:
 - ``compute_grad_norm``: Compute the total gradient norm (L2 or L-inf) without clipping.
-``edp_efsdp``).
+- ``clip_grad_by_norm``: Clip gradients in-place given a pre-computed total norm.
 - ``clip_grad_norm``: Compute the gradient norm and clip in one call.
 
 DTensor (``torch.distributed.tensor.DTensor``) gradients are handled

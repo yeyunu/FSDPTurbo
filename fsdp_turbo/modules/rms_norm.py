@@ -5,12 +5,8 @@ from fsdp_turbo.ops.rms_norm import rms_norm
 
 
 class RMSNorm(nn.Module):
-
-    def __init__(self,
-                 dim: int,
-                 eps: float = 1e-6,
-                 sequence_parallel: bool = False):
-        nn.Module.__init__(self) 
+    def __init__(self, dim: int, eps: float = 1e-6, sequence_parallel: bool = False):
+        nn.Module.__init__(self)
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 

@@ -269,6 +269,12 @@ class BaseTrainer:
 
         print_rank(logger.info, f"Training complete. Total steps: {self._global_step}")
         self._monitor.summary()
+        self._release_model_resources()
+
+    def _release_model_resources(self):
+        close = getattr(self.model, "close", None)
+        if callable(close):
+            close()  # pylint: disable=not-callable
 
     # ------------------------------------------------------------------
     # Training loop hooks

@@ -11,6 +11,11 @@ from fsdp_turbo.ops.cpu.fused_attention import npu_fusion_attention_cpu
 from fsdp_turbo.ops.cpu.grouped_matmul import grouped_matmul_cpu, w4a16_grouped_matmul_cpu
 from fsdp_turbo.ops.cpu.grouped_matmul_mc2 import all2all_grouped_matmul_cpu, grouped_matmul_all2all_cpu
 from fsdp_turbo.ops.cpu.lightning_indexer_score import lightning_indexer_score_torch
+from fsdp_turbo.ops.cpu.moonep_grouped_matmul import (
+    moonep_grouped_matmul_cpu,
+    moonep_grouped_matmul_dgrad_cpu,
+    moonep_grouped_matmul_wgrad_cpu,
+)
 from fsdp_turbo.ops.cpu.mx_quant_matmul import mx_quant_matmul_cpu, w4a16_quant_matmul_cpu
 from fsdp_turbo.ops.cpu.mx_quant import (
     dynamic_mx_quant_cpu,
@@ -52,6 +57,9 @@ __all__ = [
     'all2all_grouped_matmul_cpu',
     'grouped_matmul_all2all_cpu',
     'lightning_indexer_score_torch',
+    'moonep_grouped_matmul_cpu',
+    'moonep_grouped_matmul_dgrad_cpu',
+    'moonep_grouped_matmul_wgrad_cpu',
     'mx_quant_matmul_cpu',
     'w4a16_quant_matmul_cpu',
     'dynamic_mx_quant_cpu',

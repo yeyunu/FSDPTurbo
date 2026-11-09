@@ -867,6 +867,12 @@ class KimiMoEGate(nn.Module):
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
+        from .router_debug import custom_routing, record_load
+
+        synthetic = custom_routing(self, hidden_states)
+        if synthetic is not None:
+            record_load(self, synthetic[0])
+            return synthetic
         bsz, seq_len, h = hidden_states.shape
         # compute gating score
         hidden_states = hidden_states.view(-1, h)
@@ -925,6 +931,8 @@ class KimiMoEGate(nn.Module):
             topk_weight = topk_weight / denominator
         # must multiply the scaling factor
         topk_weight = topk_weight * self.routed_scaling_factor
+
+        record_load(self, topk_idx)
 
         return topk_idx, topk_weight
 

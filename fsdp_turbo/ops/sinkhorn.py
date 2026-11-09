@@ -23,5 +23,6 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, ep
             - comb: [batch_size, seq_len, hc_mult, hc_mult]
     """
     device_type = 'cpu' if use_eager else None
-    return dispatch_op('hc_split_sinkhorn', mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps,
-                       device_type=device_type)
+    return dispatch_op(
+        'hc_split_sinkhorn', mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps, device_type=device_type
+    )

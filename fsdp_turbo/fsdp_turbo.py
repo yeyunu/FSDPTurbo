@@ -128,24 +128,39 @@ class FSDPTurbo(torch.nn.Module):
 
     def apply_ep_modules(self):
         if self.config.distributed.expert_parallel_size > 1:
+            plan = self.config.distributed.ep_plan
+            if plan.dispatcher == "moonep":
+                from fsdp_turbo.distributed.expert_parallel.moonep.plan import fill_moonep_static_shape
+
+                fill_moonep_static_shape(
+                    plan,
+                    self.model,
+                    batch_size=self.config.data.batch_size,
+                    max_seq_length=self.config.data.max_seq_length,
+                    ulysses_size=self.config.distributed.ulysses_parallel_size,
+                )
             # Rides on each expert container; dispatchers read per-module settings.
             dispatch_split_policy = DispatchSplitPolicy(
-                enabled=self.config.distributed.ep_plan.reuse_dispatch_splits,
-                cache_cap=self.config.distributed.ep_plan.dispatch_split_cache_cap,
+                enabled=plan.reuse_dispatch_splits,
+                cache_cap=plan.dispatch_split_cache_cap,
             )
             self.model = expert_parallelize_modules(
                 self.model,
                 self.parallel_state.get_ep_device_mesh(),
-                self.config.distributed.ep_plan,
+                plan,
+                edp_mesh=self.parallel_state.get_device_mesh("edp"),
                 dispatch_split_policy=dispatch_split_policy,
             )
-            self.model = expert_fully_shard_modules(
-                self.model,
-                self.parallel_state.get_device_mesh("edp_efsdp"),
-                self.config.distributed.ep_plan,
-                self.config.distributed.fsdp_plan,
-                enable_lp_all_gather=self.config.quantization.quantization_plan.enable_fsdp_low_precision_all_gather,
-            )
+            if plan.dispatcher != "moonep":
+                self.model = expert_fully_shard_modules(
+                    self.model,
+                    self.parallel_state.get_device_mesh("edp_efsdp"),
+                    plan,
+                    self.config.distributed.fsdp_plan,
+                    enable_lp_all_gather=(
+                        self.config.quantization.quantization_plan.enable_fsdp_low_precision_all_gather
+                    ),
+                )
 
     def apply_vp_modules(self):
         """Apply vocabulary parallelism, then V-FSDP on top of the VP shard.
@@ -266,3 +281,8 @@ class FSDPTurbo(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
+
+    def close(self):
+        runtime = getattr(self.model, "_moonep_runtime", None)
+        if runtime is not None:
+            runtime.close()

@@ -35,6 +35,7 @@ def expert_parallelize_modules(
     modules: torch.nn.Module,
     ep_mesh: DeviceMesh,
     plan: EPPlanConfig,
+    edp_mesh: Optional[DeviceMesh] = None,
     dispatch_split_policy: Optional[DispatchSplitPolicy] = None,
 ):
     ep_modules = get_ep_modules(modules, plan)
@@ -44,7 +45,6 @@ def expert_parallelize_modules(
     ep_size = torch.distributed.get_world_size(ep_group)
 
     for module in ep_modules:
-        # calculate local experts id
         module.num_global_experts = len(module) if not hasattr(module, 'num_experts') else module.num_experts
         if module.num_global_experts % ep_size != 0:
             raise AssertionError(
@@ -66,11 +66,14 @@ def expert_parallelize_modules(
         if plan.enable_ep_balance:
             initialize_ep_balance(module, ep_group, plan.max_dup_experts_num)
 
-        # distribute experts weights
-        distribute_experts_module(module, ep_mesh)
+    if plan.dispatcher == "moonep":
+        from fsdp_turbo.distributed.expert_parallel.moonep import parallelize_moonep_model
 
-        # Select the complete EP forward explicitly through the dispatcher plan.
-        # replace forward with ep forward
+        parallelize_moonep_model(modules, ep_modules, ep_mesh, plan, edp_mesh=edp_mesh)
+        return modules
+
+    for module in ep_modules:
+        distribute_experts_module(module, ep_mesh)
         experts_forward_fn = get_experts_forward_fn(ep_group=ep_group, ep_plan=plan, dispatcher=plan.dispatcher)
         module.forward = types.MethodType(experts_forward_fn, module)
     return modules

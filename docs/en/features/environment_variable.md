@@ -29,6 +29,8 @@ NNODES=2 GPUS_PER_NODE=16 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 bash run.sh
 | `ASCEND_LAUNCH_BLOCKING` | Switch for synchronous NPU execution (set to `1` in the example script for easier debugging) |
 | `ASCEND_SLOG_PRINT_TO_STDOUT` | Output NPU logs to standard output (for debugging; disabled by default) |
 
+Kimi routing diagnostics now live on `ep_plan.router_debug` (`apply_custom_router`, `target_max_vio`, `router_mode`, `record_load_balance`) and are off by default. See [Expert Parallel](./expert_parallel.md).
+
 > [!NOTE]
 >
 > In an NPU environment, the Ascend environment must be loaded correctly before training:
@@ -61,3 +63,7 @@ export ASCEND_LAUNCH_BLOCKING=1
 > [!NOTE]
 >
 > The NPU performance tuning variables above are recommended configurations; the actual effects vary with the model scale, hardware model, and parallelism strategy. It is recommended to tune them in conjunction with [performance data profiling](../tools/profiling.md).
+
+## MoonEP Debug
+
+`trace_enabled`, `trace_sync_enabled`, `vmm_probe_enabled`, and `npu_async_comm` now live on `ep_plan.moonep_config` and are off by default. See [Expert Parallel](./expert_parallel.md).

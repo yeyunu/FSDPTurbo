@@ -100,5 +100,36 @@ class TrainerContextParallelTests(unittest.TestCase):
         from_pretrained.assert_called_once_with("processor-source")
 
 
+class TrainerResourceReleaseTests(unittest.TestCase):
+    """The training loop has to give the model a chance to free device memory.
+
+    A backend holding memory outside the caching allocator must release it while
+    the process group is still up. MoonEP is the case that exists today: without
+    this call ``npu_patch`` reports its symmetric buffer as leaked.
+    """
+
+    def test_a_model_that_owns_resources_is_released(self):
+        trainer = BaseTrainer()
+        released = []
+        trainer.model = SimpleNamespace(close=lambda: released.append("close"))
+
+        trainer._release_model_resources()
+
+        self.assertEqual(released, ["close"])
+
+    def test_a_model_without_resources_is_left_alone(self):
+        trainer = BaseTrainer()
+        trainer.model = SimpleNamespace()
+
+        trainer._release_model_resources()
+
+    def test_a_close_attribute_that_is_not_callable_is_ignored(self):
+        """``close`` could be a submodule or a buffer on somebody's model."""
+        trainer = BaseTrainer()
+        trainer.model = SimpleNamespace(close=torch.zeros(1))
+
+        trainer._release_model_resources()
+
+
 if __name__ == "__main__":
     unittest.main()
