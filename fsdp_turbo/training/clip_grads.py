@@ -11,6 +11,11 @@ DTensor (``torch.distributed.tensor.DTensor``) gradients are handled
 transparently: they are converted to local shards via ``.to_local()``
 before computation, and the total norm is synchronized across the
 sharding group(s) via ``all_reduce``.
+
+Device-resident gradients are batched via ``torch._foreach_norm`` /
+``torch._foreach_mul_`` instead of one kernel per parameter; host-resident
+gradients (cpu_offload) are moved to the device one at a time so only a
+single gradient copy is resident at any moment.
 """
 
 from collections import defaultdict
@@ -66,9 +71,6 @@ def _get_shard_groups_if_dtensor(
 
     mesh = tensor.device_mesh
 
-    # Collect every mesh dimension that is Shard in the placements.
-    # Each such dimension splits the tensor across ranks and therefore
-    # requires an all-reduce for norm sync.
     groups = []
     for dim_idx, placement in enumerate(tensor.placements):
         is_shard = isinstance(placement, Shard)
@@ -79,6 +81,30 @@ def _get_shard_groups_if_dtensor(
     return groups
 
 
+def _batched_sum_of_squares(grads: list) -> torch.Tensor:
+    """Sum of squared L2 norms over a same-dtype list of tensors, batched.
+
+    One fused ``torch._foreach_norm`` launch instead of two kernels per
+    parameter; per-tensor norms are stored in the gradients' dtype, so
+    low-precision gradients round each scalar before squaring (well below
+    the gradients' own quantization noise).
+    """
+    norms = torch._foreach_norm(grads)
+    return torch.stack(norms).float().square().sum()
+
+
+def _reduction_device() -> torch.device:
+    """Return the accelerator device for norm reduction and clipping.
+
+    Normalizes the int ordinal from ``current_device_index()`` to a
+    ``torch.device`` so ``tensor.device != dev`` classification is valid.
+    """
+    dev = torch.accelerator.current_device_index()
+    if isinstance(dev, torch.device):
+        return dev
+    return torch.device(torch.accelerator.current_accelerator().type, int(dev))
+
+
 def compute_grad_norm(
     parameters: Union[list, torch.Tensor],
     norm_type: Union[int, float] = 2.0,
@@ -86,9 +112,10 @@ def compute_grad_norm(
 ) -> float:
     """Compute the total p-norm of gradients across parameters.
 
-    Gradients are transferred to the reduction device and cast to FP32 one
-    at a time to avoid retaining all converted gradients simultaneously and
-    to avoid precision loss with BF16/FP16 gradients.  DTensor gradients are
+    The L2 norm is batched via ``torch._foreach_norm`` (no full FP32 copy
+    of the gradients); other p-norms upcast to FP32 per parameter.
+    Host-resident gradients (cpu_offload) move to the reduction device and
+    FP32-upcast one gradient at a time.  DTensor gradients are
     converted to their local shards before computation.
 
     When *group* is provided (or DTensor gradients are found), the
@@ -110,54 +137,74 @@ def compute_grad_norm(
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
 
-    dev = torch.accelerator.current_device_index()
-    # Group parameters by their shard-group signature so that gradients
-    # sharing the same set of sharded mesh dimensions can be aggregated
-    # locally before a single all-reduce per group.  This is required
-    # because a parameter that is *Replicate* along a dimension must NOT
-    # be summed across that dimension (otherwise its contribution is
-    # multiplied by the group size).  Each group is reduced only along
-    # the dimensions its members are actually sharded on.
-    grouped_grads = defaultdict(list)
+    dev = _reduction_device()
+    # Gradients sharing the same set of sharded mesh dimensions are aggregated
+    # locally, then all-reduced once per group.  A *Replicate* dimension must
+    # NOT be summed across (its contribution would be multiplied by the group
+    # size), so each group reduces only along dimensions its members are
+    # actually sharded on.
+    grouped_grads = defaultdict(list)  # device-resident local shards
+    grouped_host_grads = defaultdict(list)  # host local shards (cpu_offload)
     grouped_groups = {}
     for p in parameters:
-        if p.grad is not None:
-            local_g = _to_local_if_dtensor(p.grad).detach()
-            shard_groups = _get_shard_groups_if_dtensor(p.grad, group)
-            sig = tuple(id(g) for g in shard_groups)
+        grad = p.grad
+        if grad is None:
+            continue
+        local_g = _to_local_if_dtensor(grad)
+        if local_g.requires_grad:
+            # create_graph makes grads require grad; detach stays read-only under autograd.
+            local_g = local_g.detach()
+        shard_groups = _get_shard_groups_if_dtensor(grad, group)
+        sig = tuple(id(g) for g in shard_groups)
+        if local_g.device != dev:
+            grouped_host_grads[sig].append(local_g)
+        else:
             grouped_grads[sig].append(local_g)
-            grouped_groups[sig] = shard_groups
+        grouped_groups[sig] = shard_groups
 
-    if not grouped_grads:
+    if not grouped_groups:
         return 0.0
 
     norm_type = float(norm_type)
 
     if norm_type == inf:
-        # For each group: local max over its members, all-reduce MAX across
-        # every sharded dimension, then take the global max across groups.
+        # Per group: local max over members, all-reduce MAX across every
+        # sharded dimension, then the global max across groups.
         global_max = torch.zeros((), dtype=torch.float, device=dev)
-        for sig, grads in grouped_grads.items():
-            local_max = max(local_gradient.to(dev, non_blocking=True).float().abs().max() for local_gradient in grads)
-            local_max_t = local_max.to(torch.float).reshape(())
-            for grp in grouped_groups[sig]:
-                torch.distributed.all_reduce(local_max_t, op=torch.distributed.ReduceOp.MAX, group=grp)
-            global_max = torch.max(global_max, local_max_t)
+        for sig, shard_groups in grouped_groups.items():
+            # Each .to() copy dies with the comprehension item: host grads still move one at a time.
+            max_per_grad = [g.abs().max() for g in grouped_grads.get(sig, [])]
+            max_per_grad += [g.to(dev, non_blocking=True).abs().max() for g in grouped_host_grads.get(sig, [])]
+            local_max = max(max_per_grad).float().reshape(())
+            for grp in shard_groups:
+                torch.distributed.all_reduce(local_max, op=torch.distributed.ReduceOp.MAX, group=grp)
+            global_max = torch.max(global_max, local_max)
         return global_max.item()
 
     # General p-norm: for each group, sum local ||grad||^p over its members,
     # all-reduce SUM across every sharded dimension, then accumulate across
     # groups.
     total_sum = torch.zeros((), dtype=torch.float, device=dev)
-    for sig, grads in grouped_grads.items():
+    for sig, shard_groups in grouped_groups.items():
+        local_grads = grouped_grads.get(sig, [])
+        host_grads = grouped_host_grads.get(sig, [])
         local_sum = torch.zeros((), dtype=torch.float, device=dev)
         if norm_type == 2.0:
-            for local_gradient in grads:
-                local_sum += local_gradient.to(dev, non_blocking=True).float().norm() ** 2
+            # Batch per dtype: mixed dtypes knock _foreach_norm off its fused fast path.
+            by_dtype = defaultdict(list)
+            for g in local_grads:
+                by_dtype[g.dtype].append(g)
+            for bucket in by_dtype.values():
+                local_sum += _batched_sum_of_squares(bucket)
+            # Host grads (cpu_offload): FP32-upcast one at a time.
+            for g in host_grads:
+                local_sum += g.to(dev, non_blocking=True).float().norm() ** 2
         else:
-            for local_gradient in grads:
-                local_sum += local_gradient.to(dev, non_blocking=True).float().norm(norm_type) ** norm_type
-        for grp in grouped_groups[sig]:
+            for g in local_grads:
+                local_sum += g.float().norm(norm_type) ** norm_type
+            for g in host_grads:
+                local_sum += g.to(dev, non_blocking=True).float().norm(norm_type) ** norm_type
+        for grp in shard_groups:
             torch.distributed.all_reduce(local_sum, op=torch.distributed.ReduceOp.SUM, group=grp)
         total_sum += local_sum
 
@@ -201,34 +248,41 @@ def clip_grad_by_norm(
     if clip_coeff >= 1.0:
         return
 
-    dev = torch.accelerator.current_device_index()
+    dev = _reduction_device()
+    device_grads = []  # device-resident local shards, scaled in place
+    host_grads = []  # (local_host_g, grad) for offloaded grads
 
     for p in parameters:
-        if p.grad is not None:
-            grad = p.grad
-            local_g = _to_local_if_dtensor(grad).detach()
-            if local_g.device != dev:
-                device_g = local_g.to(dev, non_blocking=True)
-                device_g.mul_(clip_coeff)
-                if keep_on_device:
-                    # Re-back the existing grad DTensor with the device copy.
-                    # Assigning ``p.grad = <npu dtensor>`` is rejected by the
-                    # autograd grad setter (the sharded param lives on host),
-                    # so mutate the DTensor in place instead: its ``_local_tensor``
-                    # is exactly what ``to_local()`` returns, so AdamWSwap then
-                    # sees an NPU-local grad and skips its H2D upload, while the
-                    # host gradient storage is released with the replacement.
-                    if _HAS_DTENSOR and isinstance(grad, DTensor):
-                        grad._local_tensor = device_g
-                    else:
-                        # Plain-tensor grads cannot be re-backed this way;
-                        # keep the host write-back so the grad stays usable.
-                        local_g.copy_(device_g, non_blocking=True)
-                else:
-                    # H2D -> clip on device -> D2H write back to original storage
-                    local_g.copy_(device_g, non_blocking=True)
+        if p.grad is None:
+            continue
+        grad = p.grad
+        local_g = _to_local_if_dtensor(grad)
+        if local_g.requires_grad:
+            # create_graph makes grads require grad; detach keeps the clip autograd-safe.
+            local_g = local_g.detach()
+        if local_g.device != dev:
+            host_grads.append((local_g, grad))
+        else:
+            device_grads.append(local_g)
+
+    if device_grads:
+        torch._foreach_mul_(device_grads, clip_coeff)
+
+    for local_g, grad in host_grads:
+        # cpu_offload: only one gradient copy on the device at a time.
+        device_g = local_g.to(dev, non_blocking=True)
+        device_g.mul_(clip_coeff)
+        if keep_on_device:
+            # p.grad cannot be assigned a device grad (host param), so re-back
+            # _local_tensor in place; AdamWSwap then skips its H2D upload.
+            if _HAS_DTENSOR and isinstance(grad, DTensor):
+                grad._local_tensor = device_g
             else:
-                local_g.mul_(clip_coeff)
+                # Plain-tensor grads cannot be re-backed; keep the host write-back.
+                local_g.copy_(device_g, non_blocking=True)
+        else:
+            # H2D -> clip on device -> D2H write back to original storage
+            local_g.copy_(device_g, non_blocking=True)
 
 
 def clip_grad_norm(
