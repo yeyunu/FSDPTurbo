@@ -36,7 +36,15 @@ def grouped_matmul(inputs, m_split, weights, use_eager=False, weights_layout="li
 
 
 def all2all_grouped_matmul(
-    inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None, use_eager=False
+    inputs,
+    weights,
+    group,
+    send_counts,
+    recv_counts,
+    shared_inputs=None,
+    shared_weight=None,
+    use_eager=False,
+    group_list_device=None,
 ):
     """
     All-to-all communication followed by grouped matrix multiplication.
@@ -51,6 +59,8 @@ def all2all_grouped_matmul(
         shared_weight: Optional shared expert weight
         use_eager: If False, use fused (optimized) implementation for current device.
                    If True, use CPU implementation.
+        group_list_device: Optional per-expert token totals ([E_local] int64, device)
+                           for backward wgrad group_list, avoiding pageable H2D sync.
 
     Returns:
         Output tensor(s) - expert output and optionally shared expert output
@@ -65,12 +75,21 @@ def all2all_grouped_matmul(
         recv_counts,
         shared_inputs,
         shared_weight,
+        group_list_device,
         device_type=device_type,
     )
 
 
 def grouped_matmul_all2all(
-    inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None, use_eager=False
+    inputs,
+    weights,
+    group,
+    send_counts,
+    recv_counts,
+    shared_inputs=None,
+    shared_weight=None,
+    use_eager=False,
+    group_list_device=None,
 ):
     """
     Grouped matrix multiplication followed by all-to-all communication.
@@ -85,6 +104,8 @@ def grouped_matmul_all2all(
         shared_weight: Optional shared expert weight
         use_eager: If False, use fused (optimized) implementation for current device.
                    If True, use CPU implementation.
+        group_list_device: Optional per-expert token totals ([E_local] int64, device)
+                           for backward wgrad group_list, avoiding pageable H2D sync.
 
     Returns:
         Output tensor(s) - expert output and optionally shared expert output
@@ -99,6 +120,7 @@ def grouped_matmul_all2all(
         recv_counts,
         shared_inputs,
         shared_weight,
+        group_list_device,
         device_type=device_type,
     )
 

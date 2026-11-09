@@ -5,7 +5,7 @@ from fsdp_turbo.ops.registry import register_op
 
 @register_op('all2all_grouped_matmul', 'cpu')
 def all2all_grouped_matmul_cpu(
-    inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None
+    inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None, group_list_device=None
 ):
     """
     CPU implementation of all2all_grouped_matmul.
@@ -79,7 +79,7 @@ def all2all_grouped_matmul_cpu(
 
 @register_op('grouped_matmul_all2all', 'cpu')
 def grouped_matmul_all2all_cpu(
-    inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None
+    inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None, group_list_device=None
 ):
     """
     CPU implementation of grouped_matmul_all2all.

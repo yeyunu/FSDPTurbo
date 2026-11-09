@@ -12,7 +12,11 @@ from fsdp_turbo.ops.clipped_swiglu import clipped_swiglu as clipped_swiglu_activ
 from fsdp_turbo.quantization.utils import quant_grouped_gemm
 from fsdp_turbo.quantization.qat.w4a16.w4a16_config import W4A16Config
 from fsdp_turbo.quantization.qat.w4a16.w4a16_gmm import mx_quant_group_gemm
-from fsdp_turbo.distributed.expert_parallel.utils import get_num_global_tokens_per_local_expert
+from fsdp_turbo.distributed.expert_parallel.utils import (
+    get_num_global_tokens_per_local_expert,
+    pop_dispatch_splits,
+    push_dispatch_splits,
+)
 from fsdp_turbo.distributed.expert_parallel.ep_balance import EPBalanceWeights
 
 if TYPE_CHECKING:
@@ -20,12 +24,36 @@ if TYPE_CHECKING:
     from fsdp_turbo.quantization.mxfp8_config import QuantBaseConfig as FP8QuantConfig
 
 
-def dispatch_preprocess(ep_group, top_k_index, num_global_experts, expert_ids_per_ep_rank):
+def dispatch_preprocess(
+    ep_group: torch.distributed.ProcessGroup,
+    top_k_index: torch.Tensor,
+    num_global_experts: int,
+    expert_ids_per_ep_rank: torch.Tensor,
+    expert_module: Optional[torch.nn.Module] = None,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    """Derive local/global permute indices and a2a split sizes from the routing.
+
+    Recompute reuses the forward-cached splits (keyed by ``expert_module``)
+    when the cached token total still matches this input, skipping the
+    counting op, the EP all-gather and the D2H syncs.
+    """
     ep_size = torch.distributed.get_world_size(ep_group)
     ep_rank = torch.distributed.get_rank(ep_group)
     num_local_experts = num_global_experts // ep_size
     local_experts_start_id = num_local_experts * ep_rank
     local_experts_end_id = local_experts_start_id + num_local_experts
+
+    # Recompute reuses the forward-cached splits; all EP ranks skip the
+    # collective symmetrically, so there is no deadlock risk.
+    cached_splits = pop_dispatch_splits(expert_module)
+    if cached_splits is not None and int(cached_splits[1].sum()) == top_k_index.numel():
+        num_global_tokens_per_expert, input_split, output_splits = cached_splits
+        num_global_tokens_per_local_expert = num_global_tokens_per_expert.reshape(ep_size, num_global_experts)[
+            :, local_experts_start_id:local_experts_end_id
+        ]
+        num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(axis=0)
+        global_indices = torch.repeat_interleave(expert_ids_per_ep_rank, num_global_tokens_per_local_expert.ravel())
+        return (num_tokens_per_local_expert, global_indices), (input_split, output_splits)
 
     # [B*S, K] --> [E]
     num_local_tokens_per_expert = get_num_global_tokens_per_local_expert(top_k_index, num_global_experts)
@@ -47,6 +75,7 @@ def dispatch_preprocess(ep_group, top_k_index, num_global_experts, expert_ids_pe
     output_splits = num_global_tokens_per_local_expert.sum(axis=-1).to(torch.device("cpu"), non_blocking=True)
     # [EP, local_E] --> [E*select]
     global_indices = torch.repeat_interleave(expert_ids_per_ep_rank, num_global_tokens_per_local_expert.ravel())
+    push_dispatch_splits(expert_module, (num_global_tokens_per_expert, input_split, output_splits))
     return (num_tokens_per_local_expert, global_indices), (input_split, output_splits)
 
 
@@ -201,7 +230,7 @@ def all2all_experts_forward_fn(
         ep_balance = EPBalanceWeights(ep_balance_strategy, gate_up_weights)
     else:
         permute_indices, split_sizes = dispatch_preprocess(
-            ep_group, top_k_index, num_global_experts, expert_ids_per_ep_rank
+            ep_group, top_k_index, num_global_experts, expert_ids_per_ep_rank, expert_module
         )
 
     if fused and (permute_indices[0] == 0).all():

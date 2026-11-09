@@ -2,7 +2,7 @@
 import logging
 import types
 from functools import partial
-from typing import Callable
+from typing import Callable, Optional
 import os
 
 import torch
@@ -17,6 +17,8 @@ from fsdp_turbo.distributed.expert_parallel.domino_dispatcher import get_domino_
 from fsdp_turbo.distributed.expert_parallel.dispatcher_chunkmoe import chunkmoe_experts_forward_fn
 from fsdp_turbo.distributed.expert_parallel.dispatcher_all_gather import all_gather_experts_forward_fn
 from fsdp_turbo.distributed.expert_parallel.utils import (
+    DISPATCH_SPLIT_POLICY_ATTR,
+    DispatchSplitPolicy,
     fixed_router_for_debug,
     normalize_expert_args,
 )
@@ -29,7 +31,12 @@ logger = logging.getLogger(__name__)
 SKIP_MOE_PAD_TOKENS = os.environ.get('SKIP_MOE_PAD_TOKENS', '0') == '1'
 
 
-def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, plan: EPPlanConfig):
+def expert_parallelize_modules(
+    modules: torch.nn.Module,
+    ep_mesh: DeviceMesh,
+    plan: EPPlanConfig,
+    dispatch_split_policy: Optional[DispatchSplitPolicy] = None,
+):
     ep_modules = get_ep_modules(modules, plan)
 
     ep_group = ep_mesh.get_group()
@@ -51,6 +58,10 @@ def expert_parallelize_modules(modules: torch.nn.Module, ep_mesh: DeviceMesh, pl
             dtype=torch.int32,
             device=ep_mesh.device_type,
         ).remainder(module.num_local_experts)
+
+        # Per-container a2a split-cache policy; left unset keeps the original paths.
+        if dispatch_split_policy is not None:
+            setattr(module, DISPATCH_SPLIT_POLICY_ATTR, dispatch_split_policy)
 
         if plan.enable_ep_balance:
             initialize_ep_balance(module, ep_group, plan.max_dup_experts_num)

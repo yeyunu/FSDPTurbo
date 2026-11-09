@@ -10,7 +10,9 @@ except ImportError:
 
 class AllToAllGroupedMatmul(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, inputs, weights, group, send_counts, recv_counts, shared_inputs, shared_weight):
+    def forward(
+        ctx, inputs, weights, group, send_counts, recv_counts, shared_inputs, shared_weight, group_list_device=None
+    ):
         rank = torch.distributed.get_rank(group)
         global_rank = torch.distributed.get_global_rank(group, rank)
         hcomm = group._get_backend(torch.device("npu")).get_hccl_comm_name(global_rank)
@@ -40,6 +42,10 @@ class AllToAllGroupedMatmul(torch.autograd.Function):
         ctx.ep_world_size = ep_world_size
         ctx.send_counts = send_counts
         ctx.recv_counts = recv_counts
+        # Device-side per-expert totals ([E_local] int64, KB-sized): reused
+        # directly as the backward wgrad group_list, skipping the host rebuild
+        # and the pageable H2D sync.
+        ctx.group_list_device = group_list_device
         return output, shared_output
 
     @staticmethod
@@ -51,10 +57,13 @@ class AllToAllGroupedMatmul(torch.autograd.Function):
         send_counts = ctx.send_counts
         recv_counts = ctx.recv_counts
 
-        num_cols = len(recv_counts) // ep_world_size
-        group_list_chunk = [recv_counts[i * num_cols : (i + 1) * num_cols] for i in range(ep_world_size)]
-        group_list = [sum(col) for col in zip(*group_list_chunk)]
-        group_list = torch.tensor(group_list, dtype=torch.int64, device=weights.device)
+        if ctx.group_list_device is not None:
+            group_list = ctx.group_list_device
+        else:
+            num_cols = len(recv_counts) // ep_world_size
+            group_list_chunk = [recv_counts[i * num_cols : (i + 1) * num_cols] for i in range(ep_world_size)]
+            group_list = [sum(col) for col in zip(*group_list_chunk)]
+            group_list = torch.tensor(group_list, dtype=torch.int64, device=weights.device)
 
         inputs_grad, shared_inputs_grad = torch_npu.npu_gmm_alltoallv(
             output_grad,
@@ -77,12 +86,14 @@ class AllToAllGroupedMatmul(torch.autograd.Function):
             group_list_type=1,
         )[0]
         shared_weight_grad = None if shared_inputs is None else torch.matmul(shared_inputs.T, shared_output_grad)
-        return inputs_grad, weights_grad, None, None, None, shared_inputs_grad, shared_weight_grad
+        return inputs_grad, weights_grad, None, None, None, shared_inputs_grad, shared_weight_grad, None
 
 
 class GroupedMatmulAllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, inputs, weights, group, send_counts, recv_counts, shared_inputs, shared_weight):
+    def forward(
+        ctx, inputs, weights, group, send_counts, recv_counts, shared_inputs, shared_weight, group_list_device=None
+    ):
         rank = torch.distributed.get_rank(group)
         global_rank = torch.distributed.get_global_rank(group, rank)
         hcomm = group._get_backend(torch.device("npu")).get_hccl_comm_name(global_rank)
@@ -111,6 +122,9 @@ class GroupedMatmulAllToAll(torch.autograd.Function):
         ctx.ep_world_size = ep_world_size
         ctx.send_counts = send_counts
         ctx.recv_counts = recv_counts
+        # Same as AllToAllGroupedMatmul: backward wgrad group_list skips the
+        # host rebuild and H2D sync.
+        ctx.group_list_device = group_list_device
         return output, shared_output
 
     @staticmethod
@@ -122,10 +136,13 @@ class GroupedMatmulAllToAll(torch.autograd.Function):
         send_counts = ctx.send_counts
         recv_counts = ctx.recv_counts
 
-        num_cols = len(send_counts) // ep_world_size
-        group_list_chunk = [send_counts[i * num_cols : (i + 1) * num_cols] for i in range(ep_world_size)]
-        group_list = [sum(col) for col in zip(*group_list_chunk)]
-        group_list = torch.tensor(group_list, dtype=torch.int64, device=weights.device)
+        if ctx.group_list_device is not None:
+            group_list = ctx.group_list_device
+        else:
+            num_cols = len(send_counts) // ep_world_size
+            group_list_chunk = [send_counts[i * num_cols : (i + 1) * num_cols] for i in range(ep_world_size)]
+            group_list = [sum(col) for col in zip(*group_list_chunk)]
+            group_list = torch.tensor(group_list, dtype=torch.int64, device=weights.device)
 
         inputs_grad, shared_inputs_grad, permute_grad = torch_npu.npu_alltoallv_gmm(
             output_grad,
@@ -143,14 +160,16 @@ class GroupedMatmulAllToAll(torch.autograd.Function):
             [permute_grad.T], [inputs], bias=None, group_list=group_list, split_item=3, group_type=2, group_list_type=1
         )[0]
         shared_weight_grad = None if shared_inputs is None else torch.matmul(shared_inputs.T, shared_output_grad)
-        return inputs_grad, weights_grad, None, None, None, shared_inputs_grad, shared_weight_grad
+        return inputs_grad, weights_grad, None, None, None, shared_inputs_grad, shared_weight_grad, None
 
 
 @register_op('all2all_grouped_matmul', 'npu')
 def all2all_grouped_matmul_npu(
-    inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None
+    inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None, group_list_device=None
 ):
-    output = AllToAllGroupedMatmul.apply(inputs, weights, group, send_counts, recv_counts, shared_inputs, shared_weight)
+    output = AllToAllGroupedMatmul.apply(
+        inputs, weights, group, send_counts, recv_counts, shared_inputs, shared_weight, group_list_device
+    )
     if shared_inputs is not None:
         return output[0], output[1]  # experts output and shared experts outputs
     return output[0]
@@ -158,9 +177,11 @@ def all2all_grouped_matmul_npu(
 
 @register_op('grouped_matmul_all2all', 'npu')
 def grouped_matmul_all2all_npu(
-    inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None
+    inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None, group_list_device=None
 ):
-    output = GroupedMatmulAllToAll.apply(inputs, weights, group, send_counts, recv_counts, shared_inputs, shared_weight)
+    output = GroupedMatmulAllToAll.apply(
+        inputs, weights, group, send_counts, recv_counts, shared_inputs, shared_weight, group_list_device
+    )
     if shared_inputs is not None:
         return output[0], output[1]  # experts output and shared experts outputs
     return output[0]

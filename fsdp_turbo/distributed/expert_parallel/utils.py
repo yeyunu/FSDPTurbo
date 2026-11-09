@@ -2,6 +2,7 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import os
 import torch
+from typing import NamedTuple, Optional
 
 # `torch.bincount` is used for counting expert assignments in EP. This is slower than `torch.histc` but more stable.
 # `torch.histc` is not a deterministic operation and `torch.bincount` is deterministic.
@@ -20,6 +21,79 @@ def get_num_global_tokens_per_local_expert(
             selected_experts.reshape(-1), bins=num_global_experts, min=0, max=num_global_experts
         )
     return num_local_tokens_per_expert
+
+
+# ---------------------------------------------------------------------------
+# MoE a2a split-size cache: activation checkpointing re-runs dispatch_preprocess
+# during recompute (the counting op, the EP all-gather and the blocking D2H
+# copies), so the forward caches the split sizes and recompute reuses them.
+# Recompute detection matches FSDP2 _fsdp_common.is_bw:
+# torch._C._current_graph_task_id() != -1.
+_DISPATCH_SPLIT_CACHE_ATTR = "_fsdp_turbo_a2a_split_cache"
+# Eager and mc2 payloads have different shapes, and mc2 may fall back to eager
+# within one forward, so they must not share one stack.
+MC2_DISPATCH_SPLIT_CACHE_ATTR = "_fsdp_turbo_a2a_split_cache_mc2"
+# Attached by expert_parallelize_modules at EP init; absent means disabled.
+DISPATCH_SPLIT_POLICY_ATTR = "_fsdp_turbo_a2a_split_policy"
+
+
+class DispatchSplitPolicy(NamedTuple):
+    """a2a split-cache settings carried by each expert container."""
+
+    enabled: bool = False
+    cache_cap: int = 8
+
+
+def is_backward_recompute() -> bool:
+    return torch._C._current_graph_task_id() != -1
+
+
+def is_dispatch_split_reuse_enabled(expert_module: Optional[torch.nn.Module]) -> bool:
+    """Whether this expert container carries an enabled a2a split-reuse policy."""
+    if expert_module is None:
+        return False
+    policy = getattr(expert_module, DISPATCH_SPLIT_POLICY_ATTR, None)
+    return policy is not None and policy.enabled
+
+
+def push_dispatch_splits(
+    expert_module: Optional[torch.nn.Module],
+    splits: tuple,
+    cache_attr: str = _DISPATCH_SPLIT_CACHE_ATTR,
+) -> None:
+    """Cache this expert module's a2a split sizes (normal grad-enabled forward only)."""
+    if expert_module is None or not torch.is_grad_enabled() or is_backward_recompute():
+        return
+    policy = getattr(expert_module, DISPATCH_SPLIT_POLICY_ATTR, None)
+    if policy is None or not policy.enabled:
+        return
+    cache = getattr(expert_module, cache_attr, None)
+    if cache is None:
+        cache = []
+        setattr(expert_module, cache_attr, cache)
+    if len(cache) >= policy.cache_cap:
+        cache.clear()
+    cache.append(splits)
+
+
+def pop_dispatch_splits(
+    expert_module: Optional[torch.nn.Module],
+    cache_attr: str = _DISPATCH_SPLIT_CACHE_ATTR,
+) -> Optional[tuple]:
+    """Take the forward-cached a2a split sizes during recompute; None otherwise.
+
+    Returns None when nothing is cached (abnormal paths); the caller then
+    falls back to the original computation, preserving semantics.
+    """
+    if expert_module is None or not is_backward_recompute():
+        return None
+    policy = getattr(expert_module, DISPATCH_SPLIT_POLICY_ATTR, None)
+    if policy is None or not policy.enabled:
+        return None
+    cache = getattr(expert_module, cache_attr, None)
+    if not cache:
+        return None
+    return cache.pop()
 
 
 def normalize_expert_args(top_k_index, top_k_weights):

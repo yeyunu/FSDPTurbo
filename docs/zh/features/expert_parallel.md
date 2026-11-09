@@ -82,6 +82,7 @@ FSDPTurbo的EP路径要求experts模块持有**3D张量参数**，而非ModuleLi
 - **并行度组合约束**：`expert_parallel_size`需能整除每层专家总数，且`expert_parallel_size × expert_fully_shard_parallel_size ≤ 总设备数`。
 - **专家负载均衡**：训练中可观察路由分布（top-k选择的专家频率），若出现严重不均，可考虑调整模型侧路由温度，或使用`fixed_router`（调试手段：以固定均匀路由替代实际路由，避免负载不均带来的性能与精度问题，仅在`expert_parallel_size > 1`时生效）。
 - **EFSDP**：当专家参数量较大时，开启`apply_efsdp_modules`对专家参数进一步做FSDP2全分片，降低单卡显存占用。
+- **a2a同步点缓存**：`all2all`与`mc2` dispatcher在前向缓存a2a split sizes。激活重计算的重放路径直接复用缓存（跳过计数、EP all-gather与D2H同步），`mc2`的backward权重梯度GMM复用device侧每专家token总数作为`group_list`（免去host求和与pageable H2D同步）。由`distributed.ep_plan.reuse_dispatch_splits`控制（默认关闭），详见[激活重计算](recompute.md)。`ep_balance`开启时`all2all`路径的preprocess走负载均衡接口，不经过该缓存。
 
 ## 负载均衡接口
 

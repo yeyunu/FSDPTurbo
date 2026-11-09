@@ -241,6 +241,13 @@ class EPPlanConfig:
     gradient_divide_factor: Optional[float] = None
     use_fused_ops: bool = True
     use_swiglu: bool = True
+    # Reuse the forward's MoE a2a split sizes in recompute and the backward
+    # wgrad group_list, skipping host-sync points; defaults to False.
+    reuse_dispatch_splits: bool = False
+    # Max entries per expert-module split-cache stack; steady-state depth
+    # equals the number of in-flight micro-batches. Evicted entries fall
+    # back to the original recompute path (perf only).
+    dispatch_split_cache_cap: int = 8
     # Fixed chunk count takes precedence over token-based chunk size. Zero
     # disables that mode; with both zero, execute one chunk.
     moe_chunk_size: int = field(
@@ -273,6 +280,9 @@ class EPPlanConfig:
             )
         if self.max_dup_experts_num < 0:
             raise ValueError("max_dup_experts_num must be non-negative.")
+        cap = self.dispatch_split_cache_cap
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise ValueError("ep_plan.dispatch_split_cache_cap must be an integer >= 1.")
         if self.enable_ep_balance and self.dispatcher not in ("all2all", "allgather"):
             raise ValueError("EP balance only supports all2all, allgather dispatchers.")
 

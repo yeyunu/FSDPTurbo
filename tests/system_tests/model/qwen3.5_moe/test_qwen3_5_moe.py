@@ -200,6 +200,7 @@ def get_complete_custom_config():
                 apply_modules=['model.language_model.layers.{*}.mlp.experts'],
                 dispatcher='all2all',
                 use_fused_ops=True,
+                reuse_dispatch_splits=True,
                 apply_efsdp_modules=['model.language_model.layers.{*}.mlp.experts'],
             ),
         ),

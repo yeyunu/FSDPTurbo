@@ -20,6 +20,8 @@ memory:
 |---|---|
 | `recompute` | 激活重计算总开关 |
 | `recompute_plan` | 重计算作用模块列表，支持`model.layers.{*}`层级通配符，可只对部分层开启以平衡显存与耗时 |
+| `distributed.ep_plan.reuse_dispatch_splits` | MoE a2a同步点缓存开关，默认`false`；详见[MoE a2a同步点缓存](#moe-a2a同步点缓存) |
+| `distributed.ep_plan.dispatch_split_cache_cap` | 缓存栈每模块深度上限，默认`8`；梯度累积步数大于该值时建议调大以保持缓存全命中 |
 
 YAML 的`recompute_plan`只支持模块 pattern 列表。更细的控制可由代码直接传入
 `RecomputePlanConfig`：
@@ -52,6 +54,27 @@ YAML 的`recompute_plan`只支持模块 pattern 列表。更细的控制可由�
 - **方法级条目**：`module.pattern.method_name`只包装匹配模块上的同名方法，向 factory 传`None`。
 - **去重与嵌套**：多个 pattern 命中同一模块或方法时只包装一次；`reject_nested=True`时在接线期拒绝
   模块间的祖先/后代嵌套。方法相关的动态嵌套仅告警，需由调用方排除。
+
+## MoE a2a同步点缓存
+
+重计算会整段重跑MoE forward，`dispatch_preprocess`中的专家计数、EP
+all-gather与D2H拷贝（`tolist` / `.to("cpu")`）会全部重新执行，
+其中D2H是host阻塞同步点。重算重跑router与前向同输入同算子，
+split计数必然相同，因此前向侧缓存、重算侧直接复用：
+
+- **重算复用**：正常前向把a2a split sizes缓存在专家模块上
+  （按模块配对的栈，深度上限默认8、由`dispatch_split_cache_cap`控制，
+  兜底未backward的前向残留）；重算路径命中缓存后直接跳过计数、
+  EP all-gather与D2H同步，device侧indices由缓存的EP级专家计数重建。
+  所有EP rank对称跳过集合通信，无死锁风险。
+- **反向wgrad复用**（`mc2` dispatcher）：backward权重梯度GMM的`group_list`直接复用前向算好的
+  device侧每专家token总数（`[E_local]` int64，KB级），免去host求和
+  与pageable H2D同步；该优化不依赖重计算，每步backward均生效。
+- **重算检测**：与FSDP2 `_fsdp_common.is_bw`同源，
+  使用`torch._C._current_graph_task_id() != -1`判断当前forward是否运行在backward
+  graph task内（checkpoint重算的forward在saved-tensor unpack中执行）。
+- **开关**：`distributed.ep_plan.reuse_dispatch_splits`默认关闭；设为`true`后重算与反向均走缓存优化，
+  关闭时回退原有路径，语义不变。
 
 ## 注意事项
 

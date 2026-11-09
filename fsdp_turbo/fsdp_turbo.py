@@ -4,6 +4,7 @@ import torch
 from fsdp_turbo.distributed.expert_parallel.expert_fully_shard_parallel import (
     expert_fully_shard_modules,
 )
+from fsdp_turbo.distributed.expert_parallel.utils import DispatchSplitPolicy
 from fsdp_turbo.distributed.fully_shard_parallel.fully_shard_parallel import (
     fully_shard_parallel_modules,
 )
@@ -127,10 +128,16 @@ class FSDPTurbo(torch.nn.Module):
 
     def apply_ep_modules(self):
         if self.config.distributed.expert_parallel_size > 1:
+            # Rides on each expert container; dispatchers read per-module settings.
+            dispatch_split_policy = DispatchSplitPolicy(
+                enabled=self.config.distributed.ep_plan.reuse_dispatch_splits,
+                cache_cap=self.config.distributed.ep_plan.dispatch_split_cache_cap,
+            )
             self.model = expert_parallelize_modules(
                 self.model,
                 self.parallel_state.get_ep_device_mesh(),
                 self.config.distributed.ep_plan,
+                dispatch_split_policy=dispatch_split_policy,
             )
             self.model = expert_fully_shard_modules(
                 self.model,
