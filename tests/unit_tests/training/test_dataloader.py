@@ -8,7 +8,12 @@ import torch
 from torch.utils.data import Dataset
 
 from fsdp_turbo.fsdp_turbo_config import DataConfig, FSDPTurboConfig
-from fsdp_turbo.training.dataloader import _MultimodalCollator, _process_multimodal_dataset, build_dataloader
+from fsdp_turbo.training.dataloader import (
+    _MultimodalCollator,
+    _process_multimodal_dataset,
+    _process_text_dataset,
+    build_dataloader,
+)
 
 
 class _Dataset(Dataset):
@@ -56,6 +61,31 @@ class _Processor:
 
 
 class DataloaderTests(unittest.TestCase):
+    def test_text_dataset_masks_padding_without_masking_eos_or_input_ids(self):
+        try:
+            from datasets import Dataset as HFDataset
+        except ModuleNotFoundError as error:
+            if error.name != "datasets":
+                raise
+            self.skipTest("datasets is not installed")
+
+        dataset = HFDataset.from_dict({"text": ["short", "full"]})
+
+        def tokenize(texts, **_kwargs):
+            self.assertEqual(texts, ["short", "full"])
+            # Token 1 is both EOS and padding; attention_mask distinguishes them.
+            return {
+                "input_ids": [[4, 1, 1, 1], [4, 5, 6, 1]],
+                "attention_mask": [[1, 1, 0, 0], [1, 1, 1, 1]],
+            }
+
+        result = _process_text_dataset(dataset, DataConfig(text_column="text", max_seq_length=4), tokenize)
+
+        self.assertEqual(len(result), 2)
+        torch.testing.assert_close(result[0]["input_ids"], torch.tensor([4, 1, 1, 1]))
+        torch.testing.assert_close(result[0]["labels"], torch.tensor([4, 1, -100, -100]))
+        torch.testing.assert_close(result[1]["labels"], torch.tensor([4, 5, 6, 1]))
+
     def test_packed_record_layout_comes_from_shared_data_config(self):
         processor = _Processor()
         dataset = _MappedDataset([{"documents": [{"dialogue": [], "pictures": []}]}])

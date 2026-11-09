@@ -157,7 +157,7 @@ def _process_text_dataset(dataset, data_cfg, tokenizer):
     dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
 
     def add_labels(examples):
-        examples["labels"] = examples["input_ids"].clone()
+        examples["labels"] = examples["input_ids"].masked_fill(examples["attention_mask"] == 0, -100)
         return examples
 
     return dataset.map(add_labels)
