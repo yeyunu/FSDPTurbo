@@ -93,6 +93,21 @@ class OptimizerConfig:
     # is kept. Only effective when cpu_offload and swap_optimizer are both
     # enabled.
     clip_grad_keep_on_device: Optional[bool] = False
+    # Swap optimizer (AdamWSwap) only: module name pattern whose backward pre-hook
+    # triggers states prefetch during backward; None = H2D inside step().
+    prefetch_states_at_backward: Optional[str] = None
+    # Swap optimizer (AdamWSwap) only: chunk budget cap in numel; effective
+    # budget is min(swap_chunk_numel, swap_numel // 2) under ping-pong. Default 4M.
+    swap_chunk_numel: Optional[int] = None
+    # Swap optimizer (AdamWSwap) only: smallest params (ascending numel) keep
+    # their states permanently on device; 0 disables.
+    resident_states_ratio: Optional[float] = None
+    # Swap optimizer (AdamWSwap) only: fraction of free memory at the backward
+    # prefetch trigger point used for prefetching. Default 0.7.
+    swap_prefetch_budget_ratio: Optional[float] = None
+    # Swap optimizer (AdamWSwap) only: number of ordered sub-batches the backward
+    # prefetch is split into. Default 8.
+    swap_prefetch_batches: Optional[int] = None
 
 
 @dataclass
@@ -463,6 +478,38 @@ class FSDPTurboConfig:
         self.validate_fsdp_config()
         self.validate_vp_config()
         self.validate_memory_snapshot_config()
+        self.validate_optimizer_config()
+
+    def validate_optimizer_config(self):
+        """Validate swap-optimizer (AdamWSwap) specific fields."""
+        chunk_numel = self.optimizer.swap_chunk_numel
+        if isinstance(chunk_numel, bool) or (
+            chunk_numel is not None and (not isinstance(chunk_numel, int) or chunk_numel <= 0)
+        ):
+            raise ValueError("optimizer.swap_chunk_numel must be a positive integer when provided.")
+        pattern = self.optimizer.prefetch_states_at_backward
+        if pattern is not None and (not isinstance(pattern, str) or not pattern.strip()):
+            raise ValueError("optimizer.prefetch_states_at_backward must be a non-empty string when provided.")
+        ratio = self.optimizer.resident_states_ratio
+        if ratio is not None and (
+            isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not 0.0 <= ratio <= 1.0
+        ):
+            raise ValueError("optimizer.resident_states_ratio must be a number within [0.0, 1.0] when provided.")
+        fsdp_plan = self.distributed.fsdp_plan if self.distributed is not None else None
+        if ratio is not None and ratio > 0 and fsdp_plan is not None and fsdp_plan.cpu_offload:
+            raise ValueError(
+                "optimizer.resident_states_ratio cannot be combined with fsdp_plan.cpu_offload: "
+                "resident states assume params live on device. Disable cpu_offload or set "
+                "resident_states_ratio to null."
+            )
+        ratio = self.optimizer.swap_prefetch_budget_ratio
+        if ratio is not None and (
+            isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not 0.0 < ratio <= 1.0
+        ):
+            raise ValueError("optimizer.swap_prefetch_budget_ratio must be a number within (0.0, 1.0] when provided.")
+        batches = self.optimizer.swap_prefetch_batches
+        if isinstance(batches, bool) or (batches is not None and (not isinstance(batches, int) or batches <= 0)):
+            raise ValueError("optimizer.swap_prefetch_batches must be a positive integer when provided.")
 
     def validate_chunk_loss_config(self):
         if not isinstance(self.memory.chunk_loss, bool):

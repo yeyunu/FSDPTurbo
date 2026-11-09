@@ -64,7 +64,7 @@ def accelerator_getattr(module, fallback_module):
     return __getattr__
 
 
-def set_accelerator_compatible():
+def set_accelerator_compatible() -> str:
     """Set up ``torch.accelerator`` to delegate to the detected device backend.
 
     Automatically detects the available accelerator in the following order:
@@ -92,10 +92,20 @@ def set_accelerator_compatible():
 
     accelerator_module = types.ModuleType('torch.accelerator')
     accelerator_module.__doc__ = f'Fallback accelerator module that delegates to {fallback_module}'
+    # Bind fallback (torch.npu / torch.cuda) implementations first; torch.accelerator
+    # attributes are only used when the fallback lacks them (e.g. current_accelerator).
+    # Why: torch 2.9+ native torch.accelerator goes through torch._C._accelerator_*
+    # C bindings that transfer_to_npu cannot patch; under torch_npu those paths
+    # crash Event.record, silently no-op wait_event (unread data -> NaN) and trip
+    # memory_allocated(). Pre-binding the fallback makes every call a direct
+    # torch.npu call with zero overhead.
     for attr in dir(torch.accelerator):
         if attr.startswith('__'):
             continue
-        setattr(accelerator_module, attr, getattr(torch.accelerator, attr))
+        if hasattr(fallback_module, attr):
+            setattr(accelerator_module, attr, getattr(fallback_module, attr))
+        else:
+            setattr(accelerator_module, attr, getattr(torch.accelerator, attr))
 
     accelerator_module.__getattr__ = accelerator_getattr(accelerator_module, fallback_module)
     torch.accelerator = accelerator_module

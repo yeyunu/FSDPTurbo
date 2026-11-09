@@ -7,7 +7,6 @@ try:
     import torch_npu
 except ImportError:
     torch_npu = None
-from torch.optim import AdamW
 from transformers import AutoConfig, AutoModel
 
 from fsdp_turbo.fsdp_turbo import FSDPTurbo
@@ -21,12 +20,14 @@ from fsdp_turbo.fsdp_turbo_config import (
     ModelConfig,
     TPPlanConfig,
 )
+from fsdp_turbo.memory.swap_optimizer.swap_optimizer import AdamWSwap
 from fsdp_turbo.quantization.cache import clear_weight_cache
 from fsdp_turbo.training.clip_grads import compute_grad_norm
 from fsdp_turbo.utils.device import set_accelerator_compatible
 from fsdp_turbo.utils.log import set_log_level
 from fsdp_turbo.utils.model import init_submodule_weights, set_num_hidden_layers
 from fsdp_turbo.utils.random import set_seed
+from fsdp_turbo.utils.str_match import module_name_match
 
 
 # ============================================================
@@ -245,6 +246,26 @@ def train_step(model, batch, optimizer):
     return loss, grad_norm
 
 
+def get_states_prefetch_pattern(model):
+    """Pattern of the vision tower's backward-first block: at its backward start,
+    the language-tower backward has freed its activations, leaving a large
+    free-memory window for the states H2D.
+    """
+    last_block = len(model.model.vision_tower.encoder.blocks) - 1
+    return f'vision_tower.encoder.blocks.{{{last_block}-{last_block}}}'
+
+
+def register_states_prefetch(model, optimizer, pattern):
+    """Trigger optimizer-states prefetch on the backward pre-hook of the matching module."""
+    for name, module in model.model.named_modules():
+        if module_name_match(pattern, name):
+            module.register_full_backward_pre_hook(lambda _module, _grad_output: optimizer.prefetch_states_to_device())
+            if torch.accelerator.current_device_index() == 0:
+                print(f'States prefetch trigger at <{name}> (backward pre-hook)')
+            return
+    raise RuntimeError(f'States prefetch trigger module <{pattern}> not found.')
+
+
 def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, enable_profiler=False):
     """Train Kimi-K3 for a few steps with the supplied configuration."""
     initialization()
@@ -271,7 +292,8 @@ def trainer_with_config(config, config_name, description, num_steps=NUM_STEPS, e
     if torch.accelerator.current_device_index() == 0:
         print(model)
     model.model.train(True)
-    optimizer = AdamW(model.model.parameters(), lr=LR)
+    optimizer = AdamWSwap(model.model.parameters(), lr=LR)
+    register_states_prefetch(model, optimizer, get_states_prefetch_pattern(model))
 
     if enable_profiler:
         if torch_npu is None:
@@ -333,8 +355,9 @@ def test_kimi_k3():
         config=get_complete_custom_config(),
         config_name='complete_custom',
         description=(
-            'FSDP + EP + TP + Recompute + Mixed Precision + Hook Module + Prefetch (Native)'
-            f' + EP={EXPERT_PARALLEL_SIZE}, EFP={EXPERT_FULLY_SHARD_PARALLEL_SIZE}'
+            'FSDP + EP + TP + Recompute + Mixed Precision + Hook Module + Prefetch (Native) '
+            '+ Swap Optimizer + States Backward Prefetch '
+            f'+ EP={EXPERT_PARALLEL_SIZE}, EFP={EXPERT_FULLY_SHARD_PARALLEL_SIZE}'
         ),
         enable_profiler=ENABLE_PROFILER,
     )

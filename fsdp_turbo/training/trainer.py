@@ -208,6 +208,8 @@ class BaseTrainer:
                 for step, batch in enumerate(self.dataloader):
                     if epoch == start_epoch and step < skip_batches:
                         continue
+                    # Marks the last micro-batch of the accumulation group; the prefetch hook defers to it
+                    self._is_last_micro_step = (step + 1) % self.config.run.gradient_accumulation_steps == 0
                     self._monitor.on_step_start()
                     memory_tracker.on_step_start()
                     try:
@@ -474,6 +476,14 @@ class BaseTrainer:
                 kwargs["state_keys"] = self.config.optimizer.state_keys
             if self.config.optimizer.param_prefetch is not None:
                 kwargs["param_prefetch"] = self.config.optimizer.param_prefetch
+            if self.config.optimizer.swap_chunk_numel is not None:
+                kwargs["chunk_numel"] = self.config.optimizer.swap_chunk_numel
+            if self.config.optimizer.resident_states_ratio is not None:
+                kwargs["resident_states_ratio"] = self.config.optimizer.resident_states_ratio
+            if self.config.optimizer.swap_prefetch_budget_ratio is not None:
+                kwargs["prefetch_budget_ratio"] = self.config.optimizer.swap_prefetch_budget_ratio
+            if self.config.optimizer.swap_prefetch_batches is not None:
+                kwargs["prefetch_batches"] = self.config.optimizer.swap_prefetch_batches
 
         # ignored_modules (e.g. vision_tower.encoder.blocks, mm_projector) keep
         # plain nn.Parameter while FSDP-sharded language layers hold DTensor.
@@ -499,7 +509,54 @@ class BaseTrainer:
             **kwargs,
         )
         hook_optimizer_step(self.model, optimizer)
+        self._register_optimizer_states_prefetch(optimizer)
         return optimizer
+
+    def _register_optimizer_states_prefetch(self, optimizer):
+        """Trigger optimizer states prefetch on the backward pre-hook of a configured layer."""
+        pattern = self.config.optimizer.prefetch_states_at_backward
+        if not pattern:
+            return
+        if not hasattr(optimizer, "prefetch_states_to_device"):
+            print_rank(
+                logger.warning,
+                "[Swap Optimizer] prefetch_states_at_backward ignored: "
+                "optimizer %s does not support states prefetch" % type(optimizer).__name__,
+            )
+            return
+
+        # Lazy import: a module-level import would be circular (fsdp_turbo top level depends back on training)
+        from fsdp_turbo.fsdp_turbo import FSDPTurbo
+        from fsdp_turbo.utils.str_match import module_name_match
+
+        # Unwrap the FSDPTurbo wrapper so module names share the namespace of the pattern
+        search_root = self.model
+        if isinstance(search_root, FSDPTurbo):
+            search_root = search_root.model
+        for name, module in search_root.named_modules():
+            if module_name_match(pattern, name):
+
+                def _backward_pre_hook(_module, _grad_output, _optimizer=optimizer, _trainer=self):
+                    # Gradient accumulation: defer to the last micro-batch's backward
+                    if getattr(_trainer, "_is_last_micro_step", True):
+                        _optimizer.prefetch_states_to_device()
+
+                module.register_full_backward_pre_hook(_backward_pre_hook)
+                print_rank(
+                    logger.info,
+                    "[Swap Optimizer] states prefetch trigger at <%s> (backward pre-hook%s)"
+                    % (
+                        name,
+                        ", deferred to the last micro-batch under gradient accumulation"
+                        if self.config.run.gradient_accumulation_steps > 1
+                        else "",
+                    ),
+                )
+                return
+        print_rank(
+            logger.warning,
+            "[Swap Optimizer] WARNING: trigger module <%s> not found, states will still be H2D inside step()" % pattern,
+        )
 
     def build_scheduler(self):
         """Build LR scheduler using SchedulerFactory."""
