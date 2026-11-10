@@ -362,20 +362,22 @@ Host Engram 始终先在 meta 上创建表，无需在构造模型时传入 mesh
 只搬运 buffer 并保留其值和 dtype，不把完整模型参数搬到设备。
 随后 `FSDPTurbo` 根据 EP/FSDP mesh 分片参数并分配本地 Engram 权重，
 未加载已有权重时，`initialize_deepseek_v41_model` 统一物化各 rank 的本地参数 shard 并随机初始化；
+加载已有权重时，先调用 `initialize_deepseek_v41_model(..., initialize_weights=False)` 只物化本地参数，再调用 `from_pretrained`。
 初始化逻辑在 `adapter.py` 中按职责分为三层：
 
 - `_materialize_parameters` 只为尚未物化的本地参数 shard 分配存储，保留共享参数别名和所有 buffer。
 - `_init_weights` 只初始化当前模块的直属参数，集中维护 DeepSeek 的 embedding、head、视觉投影、mHC 和按层深度缩放的专家初始化规则；
   专家 `gate_up_proj` 按全局行偏移仅缩放本地 shard 中的 up 部分，无需重新分片。
   视觉投影和归一化类型每个模块只判断一次；完整参数路径仅在 gate/shared-expert 后缀匹配时构造。
-- 公共入口 `initialize_deepseek_v41_model` 先物化，再按父模块先于子模块的原有顺序调用 `_init_weights`，
+- 公共入口 `initialize_deepseek_v41_model` 先物化；`initialize_weights=True` 时再按父模块先于子模块的原有顺序调用 `_init_weights`，
   保持固定种子、固定并行拓扑下的随机采样顺序。Host Engram 仍由自身的 hook 分配和初始化。
 
 初始化采用“先切分、后物化”的流程，不采用整模型 `to_empty()`，并保留 DeepSeek 专用的权重初始化规则。
 `_materialize_parameters` 和 `_init_weights` 为内部实现，使用方仍调用原有公共入口。
 
-`device` 仅用于物化 meta 参数；已物化的参数不重新分配，共享参数保持同一对象。初始化函数始终执行随机初始化。
-加载已有权重时直接调用 `from_pretrained`。
+`device` 仅用于物化 meta 参数；已物化的参数不重新分配，共享参数保持同一对象。
+加载已有权重时设置 `initialize_weights=False`，只分配存储，不随机初始化或覆盖已有值，
+避免 HF checkpoint 复制到 meta 参数成为 no-op。
 CPU Offload 开启时，本地参数 shard 在 CPU 物化；buffer 仍在计算设备上。
 示例的 `build_model` 已采用此流程：
 
@@ -387,13 +389,13 @@ model = prepare_deepseek_v41_model_for_fsdp(
     model, device=device, parameter_dtype=torch.bfloat16,
 )
 model = FSDPTurbo(config, model)
+initialize_deepseek_v41_model(
+    model.model,
+    device=torch.device("cpu") if config.distributed.fsdp_plan.cpu_offload else device,
+    initialize_weights=not config.model.load_pretrained_weights,
+)
 if config.model.load_pretrained_weights:
     model.model.from_pretrained(config.model.model_name_or_path)
-else:
-    initialize_deepseek_v41_model(
-        model.model,
-        device=torch.device("cpu") if config.distributed.fsdp_plan.cpu_offload else device,
-    )
 ```
 
 不要在切分前对 meta 表调用普通 `model.to()` 或整模型 `to_empty()`；请使用上面的
@@ -404,7 +406,7 @@ Host Engram 表不会被 initialize 清空。模型构造入口不接收 mesh，
 在固定拓扑、相同初始种子下可复现；
 不保证与先初始化完整表再切分的随机值逐元素一致。
 
-加载已反量化为 BF16 的 HuggingFace safetensors 权重时，同样必须先应用并行：
+加载已反量化为 BF16 的 HuggingFace safetensors 权重时，必须先应用并行并物化本地参数：
 
 ```yaml
 model:
@@ -425,6 +427,11 @@ compressor/indexer source 拓扑，
 
 ```python
 model = FSDPTurbo(config, model)
+initialize_deepseek_v41_model(
+    model.model,
+    device=torch.device("cpu") if config.distributed.fsdp_plan.cpu_offload else device,
+    initialize_weights=False,
+)
 model.model.from_pretrained(
     config.model.model_name_or_path,
     strict=config.model.pretrained_strict,

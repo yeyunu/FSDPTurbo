@@ -85,6 +85,18 @@ fsdp_plan:
   pin_memory: true
 ```
 
+### 分片后物化参数
+
+DeepSeek-V4.1 示例先通过 `prepare_deepseek_v41_model_for_fsdp` 将普通参数转为 meta，
+再应用 EP/FSDP 切分。加载 HF 初始权重前，调用 `initialize_deepseek_v41_model(..., initialize_weights=False)`
+只分配本地参数 shard 的真实存储，不进行随机初始化，避免权重复制到 meta 参数成为 no-op。
+随机初始化路径使用默认的 `initialize_weights=True`，完成物化与随机初始化。
+
+CPU Offload 开启时本地参数在 CPU 物化，否则在当前加速器物化；共享参数别名、已有参数值
+和 buffer 保持不变。Host Engram 表仍由自己的 EP hook 分配本地行段。
+优化器在物化和权重加载完成后创建，完整调用示例见
+[DeepSeek-V4.1 README](../../../examples/deepseek_v41/README.md)。
+
 ### 选择性分片
 
 - `apply_modules`：仅对指定模块做FSDP2分片，支持`model.layers.{*}`层级通配符。

@@ -570,17 +570,22 @@ def initialize_deepseek_v41_model(
     standard_deviation: float = 0.02,
     *,
     device: torch.device | None = None,
+    initialize_weights: bool = True,
 ) -> None:
-    """Materialize local parameter shards, then initialize each module's weights.
+    """Materialize local parameter shards and optionally initialize their values.
 
     After EP/FSDP sharding, pass ``device`` to allocate meta parameters on the
     compute device, or CPU with CPU Offload. Omit it for an already materialized
-    model. Real buffers and shared parameter aliases are preserved; Host Engram
-    tables own their initialization. Parent-before-child traversal preserves
+    model. Set ``initialize_weights=False`` before loading pretrained weights to
+    allocate storage without random initialization. Real buffers and shared
+    parameter aliases are preserved; Host Engram tables own their initialization.
+    Parent-before-child traversal preserves
     the existing random sampling order for a fixed seed and parallel topology.
     """
     if device is not None:
         _materialize_parameters(model, device)
+    if not initialize_weights:
+        return
 
     layer_ids = {
         id(module): layer.layer_id
