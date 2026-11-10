@@ -27,7 +27,7 @@ distributed:
 | `ep_plan.apply_modules` | 应用EP的模块列表，支持`model.language_model.layers.{*}.mlp.experts`通配符 |
 | `ep_plan.dispatcher` | 专家计算dispatcher，见下表 |
 | `ep_plan.fixed_router` | 是否使用固定路由 |
-| `ep_plan.apply_efsdp_modules` | 应用EFSDP的模块列表 |
+| `ep_plan.apply_efsdp_modules` | 应用EFSDP的模块列表，要求`expert_parallel_size > 1`；未显式配置时自动取`apply_modules`中以`.experts`结尾的项 |
 | `ep_plan.gradient_divide_factor` | 专家梯度除法因子（特殊并行组合下需手动指定） |
 | `ep_plan.moonep_config` | `dispatcher: moonep` 时的通信、显存与静态形状调优（`MoonEPConfig`），见 [MoonEP dispatcher](#moonep-dispatcher) |
 | `ep_plan.use_fused_ops` | 使能昇腾融合算子：GEMM、Permute、Unpermute、Swiglu |

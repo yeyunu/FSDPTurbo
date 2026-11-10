@@ -13,6 +13,7 @@ from fsdp_turbo.distributed.expert_parallel.utils import (
     is_dispatch_split_reuse_enabled,
     pop_dispatch_splits,
     push_dispatch_splits,
+    record_last_expert_a2a_event,
 )
 from fsdp_turbo.ops.clipped_swiglu import clipped_swiglu
 
@@ -102,6 +103,8 @@ def mc2_experts_forward_fn(
         group_list_device=recv_totals if splits_reuse else None,
     )
     hidden_states = unpermute(hidden_states, unpermute_indices1, top_k_weights)
+    if expert_module is not None:
+        record_last_expert_a2a_event(expert_module, torch.accelerator.current_stream().record_event())
     return hidden_states
 
 

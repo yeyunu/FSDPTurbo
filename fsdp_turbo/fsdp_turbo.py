@@ -68,6 +68,7 @@ class FSDPTurbo(torch.nn.Module):
             self.model,
             self.parallel_state.get_device_mesh("dp_fsdp"),
             self.config.distributed.fsdp_plan,
+            self.config.distributed.ep_plan,
         )
 
     def apply_pre_fsdp_module_hooks(self):

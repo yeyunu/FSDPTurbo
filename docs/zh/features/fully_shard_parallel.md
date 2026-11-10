@@ -53,9 +53,12 @@ distributed:
 ### 通信预取
 
 - `num_to_forward_prefetch`：前向时提前预取后续N层的全量参数，隐藏AllGather通信。
-- `num_to_backward_prefetch`：反向时提前预取后续N层参数，隐藏通信。设为 `0` 时关闭反向预取，包括 FSDP2 自带的一层默认预取。
+- `num_to_backward_prefetch`：反向时提前预取后续N层参数，隐藏通信。设为`0`时关闭反向预取，包括FSDP2自带的一层默认预取。
+- 专家参数前向预取：`num_to_forward_prefetch > 0`且配置`ep_plan.apply_efsdp_modules`时，每层forward入口除预取后续层外，还会预取本层及后续层的experts参数，使专家AllGather与attention计算重叠，无需额外开关；experts单元自身不持有forward预取列表，避免激活重算期从experts的pre-forward带出错误方向的预取。`custom`实现还通过`hook_modules`在层入口发射本层experts。
 - `prefetch_modules`：可选，按前向实际执行顺序排列的`apply_modules`模式列表，须将每个模式恰好列出一次。配置初始化时检查列表类型及模式是否完整、无重复；校验不会改变用户指定的顺序。模式内按模块注册顺序展开，重叠匹配的模块只保留首次出现；反向使用展开列表的逆序。未配置时沿用模块注册顺序。
 - `hook_modules`：指定通信挂钩模块（如`model.language_model.layers.{*}`），实现细粒度通信调度。
+- `prefetch_wait_a2a`（默认`false`）：将每层forward预取的AllGather（含上述层入口发射的专家参数AllGather）排到上一层专家a2a（dispatch/combine）完成事件之后，避免预取AG与专家a2a抢占带宽。要求配置`ep_plan.apply_efsdp_modules`；未开启`backward_prefetch_on_moe_input`时还要求`num_to_forward_prefetch > 0`。
+- `backward_prefetch_on_moe_input`（默认`false`）：MoE层的反向参数预取发射点从FSDP pre-backward hook挪到MoE forward输入tensor的grad hook——该梯度就绪即本层dispatch a2a反向刚完成，预取AllGather与层内纯计算反向重叠，不再与a2a冲突；dense层与专家单元通过`[self]`占位阻断FSDP2默认反向预取。仅支持`fsdp_implementation: native`，且要求`num_to_backward_prefetch > 0`并配置`ep_plan.apply_efsdp_modules`。与`prefetch_wait_a2a`组合使用时，预取AllGather流会先等待本层a2a反向完成事件。当前仅支持粗粒度切分：layer整体作为一个FSDP单元（如`model.layers.{*}`）、experts由`apply_efsdp_modules`独立包裹；层内`self_attn`、`mlp`等子单元独立包裹的细粒度配置不支持。
 
 多模态模型的执行顺序可能与模块注册顺序不同。例如DeepSeek-V4.1先运行视觉塔和对齐器，再进入语言层，应在其`fsdp_plan`中配置：
 

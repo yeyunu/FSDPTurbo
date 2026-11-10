@@ -3,11 +3,59 @@
 import os
 import torch
 from typing import NamedTuple, Optional
+from torch.distributed._composable_state import _get_module_state
 
 # `torch.bincount` is used for counting expert assignments in EP. This is slower than `torch.histc` but more stable.
 # `torch.histc` is not a deterministic operation and `torch.bincount` is deterministic.
 # Set environment variable export MM_EP_BINCOUNT_DISPATCH=1 to activate.
 EP_BINCOUNT_DISPATCH = os.environ.get('EP_BINCOUNT_DISPATCH', '0') == '1'
+
+_last_expert_a2a_event: tuple = (None, None)
+
+
+def record_last_expert_a2a_event(experts_module: torch.nn.Module, event) -> None:
+    global _last_expert_a2a_event
+    _last_expert_a2a_event = (experts_module, event)
+
+
+def get_last_expert_a2a_event() -> tuple:
+    return _last_expert_a2a_event
+
+
+def _get_fsdp_comm_ctx(hook_module):
+    """Return the shared FSDP comm context.
+
+    Custom and native fully_shard both share the root's comm streams, so any
+    state found at/under the module exposes the shared context.
+    """
+    state = _get_module_state(hook_module)
+    if state is None:
+        for submodule in hook_module.modules():
+            state = _get_module_state(submodule)
+            if state is not None:
+                break
+    return getattr(state, "_comm_ctx", None) if state is not None else None
+
+
+def wait_last_expert_a2a_before_prefetch(hook_module) -> None:
+    """Order the FSDP forward-prefetch all-gather behind the latest expert a2a.
+
+    Gate on ``all_gather_stream`` (not copy-in: that D2D copy is NIC-free and
+    meant to run early). Skip events issued by the current layer's own
+    subtree (its a2a depends on this layer's all-gathers; waiting deadlocks).
+    """
+    experts_module, a2a_event = get_last_expert_a2a_event()
+    if experts_module is None or a2a_event is None:
+        return
+    if hook_module is None:
+        return
+    if any(submodule is experts_module for submodule in hook_module.modules()):
+        return
+    comm_ctx = _get_fsdp_comm_ctx(hook_module)
+    all_gather_stream = getattr(comm_ctx, 'all_gather_stream', None)
+    if all_gather_stream is None:
+        return
+    all_gather_stream.wait_event(a2a_event)
 
 
 def get_num_global_tokens_per_local_expert(

@@ -674,7 +674,8 @@ class PatchKimiMoeExperts(nn.Module):
             intermediate = hidden_states @ gate_up_proj.sum(dim=0)
             hidden_states = self._apply_activation(intermediate) @ down_proj.sum(dim=0) * 0.0
 
-        return alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes, fused)
+        out = alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes, fused)
+        return out
 
     @torch.no_grad()
     def load_one_external_expert_weight(

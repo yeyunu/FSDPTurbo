@@ -211,6 +211,8 @@ class FSDPPlanConfig:
     # prefetch settings
     num_to_forward_prefetch: Optional[int] = 0
     num_to_backward_prefetch: Optional[int] = 0
+    prefetch_wait_a2a: bool = False
+    backward_prefetch_on_moe_input: bool = False
 
     # fsdp2 hook manager
     hook_modules: Optional[List[str]] = None
@@ -713,6 +715,40 @@ class FSDPTurboConfig:
                 raise ValueError(
                     "distributed.fsdp_plan.prefetch_modules must contain every apply_modules pattern exactly once."
                 )
+        if fsdp_plan.backward_prefetch_on_moe_input:
+            if fsdp_plan.fsdp_implementation != "native":
+                raise ValueError(
+                    "distributed.fsdp_plan.backward_prefetch_on_moe_input requires fsdp_implementation='native'."
+                )
+            if self.distributed.expert_parallel_size <= 1:
+                raise ValueError(
+                    "distributed.fsdp_plan.backward_prefetch_on_moe_input requires expert_parallel_size > 1 "
+                    "(no expert a2a to overlap with when experts are not EP-sharded)."
+                )
+            if fsdp_plan.num_to_backward_prefetch <= 0:
+                raise ValueError(
+                    "distributed.fsdp_plan.backward_prefetch_on_moe_input requires num_to_backward_prefetch > 0."
+                )
+            if not self.distributed.ep_plan.apply_efsdp_modules:
+                raise ValueError(
+                    "distributed.fsdp_plan.backward_prefetch_on_moe_input "
+                    "requires ep_plan.apply_efsdp_modules to wrap experts."
+                )
+        if fsdp_plan.prefetch_wait_a2a:
+            if fsdp_plan.num_to_forward_prefetch <= 0 and not fsdp_plan.backward_prefetch_on_moe_input:
+                raise ValueError(
+                    "distributed.fsdp_plan.prefetch_wait_a2a requires num_to_forward_prefetch > 0 "
+                    "or backward_prefetch_on_moe_input."
+                )
+            if self.distributed.expert_parallel_size <= 1:
+                raise ValueError(
+                    "distributed.fsdp_plan.prefetch_wait_a2a requires expert_parallel_size > 1 "
+                    "(no expert a2a is issued with EP=1)."
+                )
+            if not self.distributed.ep_plan.apply_efsdp_modules:
+                raise ValueError(
+                    "distributed.fsdp_plan.prefetch_wait_a2a requires ep_plan.apply_efsdp_modules for a2a event sources."
+                )
         if self.distributed.fully_shard_parallel_size > 1:
             if self.distributed.expert_parallel_size > 1:
                 self.distributed.fsdp_plan.ignored_modules.extend(self.distributed.ep_plan.apply_modules)
@@ -996,10 +1032,23 @@ class FSDPTurboConfig:
             )
         if not self.distributed.ep_plan.apply_efsdp_modules:
             self.distributed.ep_plan.apply_efsdp_modules = []
-            if self.distributed.ep_plan.dispatcher != "moonep":
-                for ep_module in self.distributed.ep_plan.apply_modules:
-                    if ep_module.endswith(".experts"):
-                        self.distributed.ep_plan.apply_efsdp_modules.append(ep_module)
+            # EP=1 never calls expert_fully_shard_modules, so auto-filled
+            # selections would put unwrapped units into prefetch lists.
+            if self.distributed.ep_plan.dispatcher != "moonep" and self.distributed.expert_parallel_size > 1:
+                self.distributed.ep_plan.apply_efsdp_modules = [
+                    ep_module for ep_module in self.distributed.ep_plan.apply_modules if ep_module.endswith(".experts")
+                ]
+        elif self.distributed.expert_parallel_size <= 1:
+            # Expert FSDP only wraps experts into a separate expert mesh; with
+            # EP=1 experts stay inside their layer's FSDP unit, so the explicit
+            # selection never takes effect. Keep the value for compatibility
+            # and warn instead of raising.
+            print_rank(
+                logger.warning,
+                "distributed.ep_plan.apply_efsdp_modules has no effect with "
+                "expert_parallel_size <= 1 (experts stay inside their layer's "
+                "FSDP unit and are never wrapped).",
+            )
 
     def validate_moonep_config(self) -> None:
         ep_plan = self.distributed.ep_plan

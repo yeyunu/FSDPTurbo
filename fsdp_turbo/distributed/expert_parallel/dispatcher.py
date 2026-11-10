@@ -16,6 +16,7 @@ from fsdp_turbo.distributed.expert_parallel.utils import (
     get_num_global_tokens_per_local_expert,
     pop_dispatch_splits,
     push_dispatch_splits,
+    record_last_expert_a2a_event,
 )
 from fsdp_turbo.distributed.expert_parallel.ep_balance import EPBalanceWeights
 
@@ -260,4 +261,6 @@ def all2all_experts_forward_fn(
 
     hidden_states = alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes, fused)
 
+    if expert_module is not None:
+        record_last_expert_a2a_event(expert_module, torch.accelerator.current_stream().record_event())
     return hidden_states

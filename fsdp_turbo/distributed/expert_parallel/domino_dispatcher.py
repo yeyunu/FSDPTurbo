@@ -13,6 +13,7 @@ from fsdp_turbo.ops.clipped_swiglu import clipped_swiglu
 from fsdp_turbo.distributed.expert_parallel.utils import (
     fixed_router_for_debug,
     normalize_expert_args,
+    record_last_expert_a2a_event,
 )
 
 _DOMINO_NUM_SLICES = 2
@@ -111,6 +112,7 @@ def get_domino_experts_forward_fn(
             expert_ids_per_ep_rank,
             comm_stream,
             use_fused_clipped_swiglu=getattr(self, "use_fused_clipped_swiglu", False),
+            expert_module=self,
         )
         hidden_states = torch.cat(hidden_states_list, dim=0)
         return hidden_states.view(*hidden_states_shape)
@@ -131,6 +133,7 @@ def dispatch_mlp_combine(
     expert_ids_per_ep_rank: torch.Tensor,
     comm_stream: Optional[torch.accelerator.Stream] = None,
     use_fused_clipped_swiglu: bool = False,
+    expert_module: Optional[torch.nn.Module] = None,
 ) -> list[torch.Tensor]:
     """Overlap two dispatch/combine slices while selecting the requested expert activation."""
     if not (len(hidden_states_list) == len(top_k_index_list) == len(top_k_weights_list) == _DOMINO_NUM_SLICES):
@@ -247,6 +250,9 @@ def dispatch_mlp_combine(
         torch.accelerator.current_stream().wait_event(combine_fwd_events[i])
         up_idx1, _ = unpermute_indices_list[i]
         output_list[i] = unpermute(combine_buf[i], up_idx1, top_k_weights_list[i], use_eager=not fused)
+
+    if expert_module is not None and combine_fwd_events[-1] is not None:
+        record_last_expert_a2a_event(expert_module, combine_fwd_events[-1])
 
     return output_list
 

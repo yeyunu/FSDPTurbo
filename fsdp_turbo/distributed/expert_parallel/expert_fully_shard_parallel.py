@@ -22,22 +22,25 @@ logger = logging.getLogger(__name__)
 def set_modules_to_prefetch_efsdp(
     model: torch.nn.Module, efsdp_modules: list[torch.nn.Module], fsdp_plan: FSDPPlanConfig
 ):
-    """Configure forward and backward prefetching."""
+    """Configure backward prefetching for efsdp units.
+
+    No forward lists: expert all-gathers are issued at the layer's forward
+    entry; expert-held forward lists would fire wrong-direction all-gathers
+    during activation recompute. With backward_prefetch_on_moe_input, units
+    get [self] placeholders; real targets come from the MoE input grad hook
+    in fully_shard_parallel.
+    """
     wrapped_modules_in_order: list[torch.nn.Module] = []
     for sub_module in model.modules():  # pre-order
         if any(sub_module is target_module for target_module in efsdp_modules):
             wrapped_modules_in_order.append(sub_module)
 
-    if fsdp_plan.num_to_forward_prefetch > 0:
-        for i, layer in enumerate(wrapped_modules_in_order):
-            j_end = min(len(wrapped_modules_in_order), i + 1 + fsdp_plan.num_to_forward_prefetch)
-            layers_to_prefetch = wrapped_modules_in_order[i + 1 : j_end]
-            if layers_to_prefetch:
-                layer.set_modules_to_forward_prefetch(layers_to_prefetch)
-
     if fsdp_plan.num_to_backward_prefetch > 0:
         rev_wrapped_modules_in_order = list(reversed(wrapped_modules_in_order))
         for i, layer in enumerate(rev_wrapped_modules_in_order):
+            if fsdp_plan.backward_prefetch_on_moe_input:
+                layer.set_modules_to_backward_prefetch([layer])
+                continue
             j_end = min(len(rev_wrapped_modules_in_order), i + 1 + fsdp_plan.num_to_backward_prefetch)
             layers_to_prefetch = rev_wrapped_modules_in_order[i + 1 : j_end]
             if layers_to_prefetch:

@@ -197,6 +197,11 @@ def get_complete_custom_config():
                 fsdp_implementation='native',
                 num_to_forward_prefetch=1,
                 num_to_backward_prefetch=1,
+                # a2a-gated prefetch guards: forward-prefetch AG waits for the
+                # previous layer's trailing expert a2a; MoE backward prefetch
+                # fires from the MoE input grad hook.
+                prefetch_wait_a2a=True,
+                backward_prefetch_on_moe_input=True,
             ),
             tensor_parallel_size=TENSOR_PARALLEL_SIZE,
             tp_plan=TPPlanConfig(
@@ -356,7 +361,7 @@ def test_kimi_k3():
         config_name='complete_custom',
         description=(
             'FSDP + EP + TP + Recompute + Mixed Precision + Hook Module + Prefetch (Native) '
-            '+ Swap Optimizer + States Backward Prefetch '
+            '+ Swap Optimizer + States Backward Prefetch + a2a-gated prefetch '
             f'+ EP={EXPERT_PARALLEL_SIZE}, EFP={EXPERT_FULLY_SHARD_PARALLEL_SIZE}'
         ),
         enable_profiler=ENABLE_PROFILER,

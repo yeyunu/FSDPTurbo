@@ -21,6 +21,7 @@ from fsdp_turbo.distributed.expert_parallel.utils import (
     DispatchSplitPolicy,
     fixed_router_for_debug,
     normalize_expert_args,
+    record_last_expert_a2a_event,
 )
 from fsdp_turbo.fsdp_turbo_config import EPPlanConfig
 from fsdp_turbo.utils.log import print_rank
@@ -213,13 +214,15 @@ def get_experts_forward_fn(
                 raise RuntimeError(
                     f'EP dispatcher requires {type(self).__name__}.{method_name} to be a callable method.'
                 )
-            return method(
+            out = method(
                 hidden_states,
                 top_k_index,
                 top_k_weights,
                 ep_group=ep_group,
                 fixed_router=ep_plan.fixed_router,
             )
+            record_last_expert_a2a_event(self, torch.accelerator.current_stream().record_event())
+            return out
 
         forward_fn = custom_ep_forward
     elif isinstance(dispatcher, str) and dispatcher == 'domino':
