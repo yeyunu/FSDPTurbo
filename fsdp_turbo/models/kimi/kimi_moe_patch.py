@@ -677,6 +677,81 @@ class PatchKimiMoeExperts(nn.Module):
         out = alltoall_combine(ep_group, hidden_states, top_k_weights, unpermute_indices, split_sizes, fused)
         return out
 
+    def ep_forward_mc2(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        ep_group: Any,
+        fixed_router: bool,
+    ) -> torch.Tensor:
+        """Run Kimi's custom EP path on the Ascend MC2 comm-compute fused ops.
+
+        MC2 fuses the dispatch All-to-All with the gate/up grouped matmul and
+        the down grouped matmul with the combine All-to-All.  Kimi's SiTU
+        transforms the complete gate/up projection, so the fused GEMM output
+        is passed to ``_apply_activation`` as a whole instead of the generic
+        GLU split used by the built-in ``mc2`` dispatcher.
+
+        Like the built-in ``mc2`` dispatcher, an all-empty-source rank set
+        falls back to the plain all-to-all path, and the forward-cached split
+        sizes feed the backward wgrad group lists when split reuse is enabled.
+        """
+        from fsdp_turbo.distributed.expert_parallel.dispatcher_mc2 import dispatch_preprocess
+        from fsdp_turbo.distributed.expert_parallel.utils import (
+            fixed_router_for_debug,
+            is_dispatch_split_reuse_enabled,
+            normalize_expert_args,
+        )
+        from fsdp_turbo.ops.moe import all2all_grouped_matmul, grouped_matmul_all2all
+
+        hidden_states_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
+        if fixed_router:
+            top_k_index, top_k_weights = fixed_router_for_debug(top_k_index, top_k_weights, self.num_global_experts)
+
+        gate_up_proj = self.gate_up_proj.to_local() if isinstance(self.gate_up_proj, DTensor) else self.gate_up_proj
+        down_proj = self.down_proj.to_local() if isinstance(self.down_proj, DTensor) else self.down_proj
+        # MC2 grouped GEMM follows the linear-layer [out_dim, in_dim] layout,
+        # while Kimi stores expert weights as [in_dim, out_dim].
+        gate_up_weights = gate_up_proj.transpose(1, 2).contiguous()
+        down_weights = down_proj.transpose(1, 2).contiguous()
+
+        send_counts, recv_counts, recv_totals, has_empty_source = dispatch_preprocess(
+            ep_group, top_k_index, self.num_global_experts, self
+        )
+        if has_empty_source:
+            # MC2 requires nonempty source buffers; mirror the built-in mc2
+            # dispatcher and fall back to the plain all-to-all path.
+            return self._ep_forward(
+                hidden_states,
+                top_k_index,
+                top_k_weights,
+                ep_group=ep_group,
+                fixed_router=fixed_router,
+                fused=True,
+            )
+
+        # Both wgrad GMMs group by local-expert token counts (the dispatcher
+        # recv_counts), so both reuse recv_totals.
+        group_list_device = recv_totals if is_dispatch_split_reuse_enabled(self) else None
+        hidden_states, unpermute_indices = permute(hidden_states, top_k_index)
+        hidden_states = all2all_grouped_matmul(
+            hidden_states, gate_up_weights, ep_group, send_counts, recv_counts, group_list_device=group_list_device
+        )
+
+        hidden_states = grouped_matmul_all2all(
+            self._apply_activation(hidden_states, fused=True),
+            down_weights,
+            ep_group,
+            recv_counts,
+            send_counts,
+            group_list_device=group_list_device,
+        )
+        hidden_states = unpermute(hidden_states, unpermute_indices, top_k_weights)
+        return hidden_states.view(*hidden_states_shape)
+
     @torch.no_grad()
     def load_one_external_expert_weight(
         self,
