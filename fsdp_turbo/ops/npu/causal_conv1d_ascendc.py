@@ -263,6 +263,13 @@ def causal_conv1d_ascendc(
     output_final_state: bool = False,
     head_num: int = 1,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Run AscendC convolution with activation-dtype copies of AMP parameters.
+
+    Casts stay outside the custom Function so autograd returns gradients to the
+    original FP32 master parameters when autocast produces BF16 activations.
+    """
+    weight = weight.to(dtype=x.dtype)
+    bias = None if bias is None else bias.to(dtype=x.dtype)
     output, final_state = AscendCCausalConv1dFunction.apply(
         x,
         weight.transpose(0, 1),

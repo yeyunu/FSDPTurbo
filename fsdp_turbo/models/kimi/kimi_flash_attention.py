@@ -48,17 +48,7 @@ def _active_context_parallel_size():
 
         if not ParallelState._instances:
             return 1
-        parallel_state = get_parallel_state()
-        kcp_size = getattr(parallel_state, "kcp_parallel_size", 1) or 1
-        try:
-            ulysses_size = parallel_state.get_ulysses_group_size()
-        except Exception:
-            ulysses_size = 1
-        try:
-            kv_allgather_size = parallel_state.get_kvallgather_group_size()
-        except Exception:
-            kv_allgather_size = 1
-        return max(kcp_size, ulysses_size or 1, kv_allgather_size or 1)
+        return get_parallel_state().get_cp_group_size()
     except Exception:
         return 1
 

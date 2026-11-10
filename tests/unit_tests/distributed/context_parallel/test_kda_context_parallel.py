@@ -3,7 +3,7 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from fsdp_turbo.modules.kda import _sliced_short_convolution
+from fsdp_turbo.distributed.context_parallel.ulysses.kda import _sliced_short_convolution
 
 
 class _ShortConv(torch.nn.Conv1d):

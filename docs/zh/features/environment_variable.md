@@ -25,6 +25,7 @@ NNODES=2 GPUS_PER_NODE=16 MASTER_ADDR=10.0.0.1 MASTER_PORT=29500 bash run.sh
 
 | 环境变量 | 说明 |
 |---|---|
+| `LOCAL_RANK` | torchrun设置的本机进程序号，启动时由utils.env.get_local_rank()读取；未设置时返回-1 |
 | `HCCL_NPU_SOCKET_SOCKET_PORT_RANGE` / `HCCL_NPU_SOCKET_PORT_RANGE` | NPU通信socket端口范围（示例脚本中设置为`auto`） |
 | `ASCEND_LAUNCH_BLOCKING` | NPU同步执行开关（示例脚本中设置为`1`，便于调试定位） |
 | `ASCEND_SLOG_PRINT_TO_STDOUT` | NPU日志输出到标准输出（调试用，默认关闭） |

@@ -73,13 +73,13 @@ class ContextParallelConfigTests(unittest.TestCase):
         config = FSDPTurboConfig(distributed=DistributedConfig(kv_allgather_parallel_size=2))
         # validate_cp_config normalizes the unset Ulysses plan to an empty list;
         # the None/[] distinction only matters while checking Ulysses sizes.
-        self.assertEqual(config.distributed.cp_plan, CPPlanConfig(ulysses_function_patches=[]))
+        self.assertEqual(config.distributed.cp_plan, CPPlanConfig(ulysses_function_patches=[], mla_backend="ulysses"))
         checkpointed = FSDPTurboConfig(
             distributed=DistributedConfig(kv_allgather_parallel_size=2),
             memory=MemoryConfig(recompute=True, recompute_plan=["model.layers.{*}"]),
         )
         self.assertTrue(checkpointed.memory.recompute)
-        with self.assertRaisesRegex(ValueError, "cannot be combined with context parallelism"):
+        with self.assertRaisesRegex(ValueError, "chunk_batch"):
             FSDPTurboConfig(
                 distributed=DistributedConfig(kv_allgather_parallel_size=2),
                 memory=MemoryConfig(chunk_batch=True),
@@ -594,8 +594,7 @@ class ContextParallelPatchTests(unittest.TestCase):
                     "type": "kda",
                 }
             ]
-            with mock.patch("fsdp_turbo.modules.kda.get_ulysses_kda_forward", side_effect=factory):
-                apply_function_patch_specs(specs, object(), {}, label="Ulysses", model=model)
+            apply_function_patch_specs(specs, object(), {"kda": factory}, label="Ulysses", model=model)
             torch.testing.assert_close(model.attention(torch.tensor(2)), torch.tensor(5))
         finally:
             sys.modules.pop(dynamic_name, None)

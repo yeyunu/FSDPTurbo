@@ -1,6 +1,9 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Ulysses context parallelism for Kimi Delta Attention (KDA)."""
 
+from __future__ import annotations
+
+from collections.abc import Callable
 from functools import wraps
 import importlib
 
@@ -74,8 +77,15 @@ def _get_chunk_kda(module):
     return chunk_kda
 
 
-def get_ulysses_kda_forward(original_forward, group):
-    """Build a KimiDeltaAttention forward using sequence/head all-to-all."""
+def get_ulysses_kda_forward(
+    original_forward: Callable[..., torch.Tensor], group: dist.ProcessGroup
+) -> Callable[..., torch.Tensor]:
+    """Build sequence/head all-to-all for an ordinary KDA instance forward.
+
+    The CP installer owns the group and binds the returned function to instances.
+    A singleton group delegates to the original forward. Cached and packed input
+    remain unsupported, and the group size must divide the model's head count.
+    """
 
     @wraps(original_forward)
     def forward(

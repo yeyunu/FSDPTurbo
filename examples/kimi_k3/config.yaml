@@ -1,5 +1,7 @@
 # ============================================================
 # Kimi K3 MOE Training Configuration
+# Shared entry for Ulysses/KCP and Hybrid P2P.
+# Default parallelism is unchanged; see README.md for complete CP mode switches.
 # ============================================================
 
 # --- Model Configuration ---
@@ -73,7 +75,6 @@ data:
   text_column: "text"
   image_column: "images"
   media_key: "medias"  # codespell:ignore
-  use_data_balance: false
   conversation_column: "messages"
   split: "train"
   batch_size: 1
@@ -88,10 +89,9 @@ distributed:
   data_parallel_size: 1
   fully_shard_parallel_size: 16
   tensor_parallel_size: 1
-  ulysses_parallel_size: 2  # Ulysses CP: split sequence across 2 ranks
-  # KCP is disabled by default. To enable it, set this value above 1 and
-  # set ulysses_parallel_size to 1 because KCP and Ulysses are mutually exclusive.
-  kcp_parallel_size: 1
+  ulysses_parallel_size: 2  # U: Ulysses parallel size
+  kcp_parallel_size: 1     # KCP state group size. Keep 1 for Hybrid P2P.
+  kda_p2p_parallel_size: 1  # K: Hybrid P2P state axis (CP=U*K).
   expert_parallel_size: 16
   expert_fully_shard_parallel_size: 1
   expert_data_parallel_size: 1
@@ -136,6 +136,10 @@ distributed:
 
   # --- Context Parallel Plan ---
   cp_plan:
+    kda_backend: kcp       # hybrid_p2p selects Hybrid P2P
+    mla_backend: ulysses   # hybrid_p2p also supports kv_allgather (front/back shards)
+    # Legacy mode applies the patch set for its active axis. For hybrid_p2p,
+    # replace all four function patch lists and module_patches with [] (README).
     # Only the patch set whose parallel size is greater than 1 is applied.
     # CP runs switch to the flash kernel inside the model; single-rank runs keep
     # the upstream model.attn_implementation path untouched. Every CP kernel
@@ -157,12 +161,14 @@ distributed:
       - target_functions:
           - modeling_kimi_linear.KimiDeltaAttention.forward
         type: kda
+    kv_allgather_function_patches: []
     loss_function_patches:
       - target_functions:
           - transformers.loss.loss_utils.ForCausalLMLoss
         type: causal_lm_loss
 
 # --- Module Patch Plan ---
+# Legacy fused-input CP entry; set module_patches: [] for hybrid_p2p.
 module_patches:
   - target: modeling_kimi_k3.KimiK3ForConditionalGeneration.forward
     replacement: fsdp_turbo.models.kimi.kimi_k3_cp.kimi_k3_model_forward

@@ -51,7 +51,7 @@ Linear-attention strategy
 -------------------------
 
 ``Glm5NextTextLinearAttention`` differs from the Kimi K3 ``KimiDeltaAttention``
-targeted by :mod:`fsdp_turbo.modules.kda`: GLM-5.3-Flash fuses the q/k/v
+targeted by :mod:`fsdp_turbo.distributed.context_parallel.ulysses.kda`: GLM-5.3-Flash fuses the q/k/v
 projections into one ``qkv_proj`` and the causal short convolutions into one
 grouped ``conv1d`` over the concatenated channels, and keeps the forget gate in
 a ``forget_gate`` sub-module. The dedicated forward:
@@ -66,7 +66,7 @@ a ``forget_gate`` sub-module. The dedicated forward:
 The recurrent state never crosses ranks: every head sees every token, so the
 per-head delta-rule recursion stays mathematically identical to the non-CP run.
 
-The mask/sequence-exchange helpers are shared with :mod:`fsdp_turbo.modules.kda`
+The mask/sequence-exchange helpers are shared with :mod:`fsdp_turbo.distributed.context_parallel.ulysses.kda`
 (identical Ulysses padding-mask semantics).
 """
 
@@ -78,7 +78,7 @@ import torch.distributed as dist
 from torch.distributed.nn.functional import all_gather
 
 from fsdp_turbo.distributed.context_parallel.ulysses.utils import ulysses_all_to_all
-from fsdp_turbo.modules.kda import (
+from fsdp_turbo.distributed.context_parallel.ulysses.kda import (
     _local_attention_mask,
     _local_channels_to_sequence,
     _sequence_to_local_channels,

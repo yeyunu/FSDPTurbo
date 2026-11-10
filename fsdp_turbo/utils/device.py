@@ -107,6 +107,22 @@ def set_accelerator_compatible() -> str:
         else:
             setattr(accelerator_module, attr, getattr(torch.accelerator, attr))
 
+    # torch_npu uses its own allocator rather than PyTorch's DeviceAllocator.
+    # Existing generic memory functions therefore also need backend delegation.
+    if backend == "hccl":
+        for name in (
+            "empty_cache",
+            "memory_allocated",
+            "memory_reserved",
+            "max_memory_allocated",
+            "max_memory_reserved",
+            "memory_stats",
+            "reset_peak_memory_stats",
+            "reset_accumulated_memory_stats",
+        ):
+            if hasattr(fallback_module, name):
+                setattr(accelerator_module, name, getattr(fallback_module, name))
+
     accelerator_module.__getattr__ = accelerator_getattr(accelerator_module, fallback_module)
     torch.accelerator = accelerator_module
     sys.modules['torch.accelerator'] = accelerator_module

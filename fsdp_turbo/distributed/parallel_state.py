@@ -1,5 +1,4 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
-import os
 import types
 import logging
 from dataclasses import dataclass, asdict, fields
@@ -13,6 +12,7 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.device import get_accelerator_name
+from fsdp_turbo.utils.env import get_local_rank
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,7 @@ class ParallelState(metaclass=Singleton):
 
     device_mesh_map: dict[str, DeviceMesh] = None
     split_com_groups: bool = False
+    kda_p2p_parallel_size: int = 1
 
     def __post_init__(self):
         from fsdp_turbo.utils.device import set_accelerator_compatible
@@ -96,27 +97,34 @@ class ParallelState(metaclass=Singleton):
             (self.vocab_fully_shard_parallel_size, self.vocab_parallel_size),
         )
 
-        if self.kcp_parallel_size > 1 and self.ulysses_parallel_size > 1:
-            raise ValueError("KCP and Ulysses cannot be enabled together.")
-        if self.kcp_parallel_size > 1 and self.kv_allgather_parallel_size > 1:
-            raise ValueError("KCP and KV-AllGather cannot be enabled together.")
+        state_size = max(self.kcp_parallel_size, self.kda_p2p_parallel_size)
+        state_axis = "kda_p2p" if self.kda_p2p_parallel_size > 1 else "kcp_state"
+        if state_size > 1 and self.kv_allgather_parallel_size > 1:
+            raise ValueError("KDA state CP and KV-AllGather cannot be enabled together.")
 
-        if self.kcp_parallel_size > 1:
-            cp_mesh_name = 'kcp'
-            cp_parallel_size = self.kcp_parallel_size
-            cp_mesh_dims = ('kcp',)
+        if state_size > 1:
+            # U is the inner axis: cp_rank = k_rank * U + u_rank.
+            self.context_data_parallel_size = self._create_mesh(
+                ('data', 'kvallgather', state_axis, 'ulysses', 'ctp'),
+                (
+                    self.kv_allgather_parallel_size,
+                    state_size,
+                    self.ulysses_parallel_size,
+                    self.tensor_parallel_size,
+                ),
+            )
+            self.add_sub_device_mesh((state_axis, 'ulysses'), 'cp_2d', flatten=False)
+            self.add_sub_device_mesh((state_axis, 'ulysses'), 'cp')
+            if self.kcp_parallel_size > 1:
+                # Model input sharding uses the complete KCP strategy domain.
+                self.device_mesh_map['kcp'] = self.device_mesh_map['cp']
+                self.add_method('kcp')
         else:
-            cp_mesh_name = 'ulysses'
-            cp_parallel_size = self.ulysses_parallel_size
-            cp_mesh_dims = ('kvallgather', 'ulysses')
-
-        # Create CDP and the active CP strategy as a separate device mesh.
-        self.context_data_parallel_size = self._create_mesh(
-            ('data', 'kvallgather', cp_mesh_name, 'ctp'),
-            (self.kv_allgather_parallel_size, cp_parallel_size, self.tensor_parallel_size),
-        )
-
-        self.add_sub_device_mesh(cp_mesh_dims, 'cp')
+            self.context_data_parallel_size = self._create_mesh(
+                ('data', 'kvallgather', 'ulysses', 'ctp'),
+                (self.kv_allgather_parallel_size, self.ulysses_parallel_size, self.tensor_parallel_size),
+            )
+            self.add_sub_device_mesh(('kvallgather', 'ulysses'), 'cp')
         # Flatten the HSDP sub-mesh to 1D when the replicate dim (dp/edp) is
         # 1, so FSDP2 takes the pure FSDP path and avoids HSDP's extra memory.
         self.add_sub_device_mesh(('dp', 'fsdp'), 'dp_fsdp', flatten=self.data_parallel_size == 1)
@@ -172,7 +180,7 @@ class ParallelState(metaclass=Singleton):
 
     @property
     def local_rank(self) -> int:
-        return int(os.getenv("LOCAL_RANK", "-1"))
+        return get_local_rank()
 
     @property
     def global_rank(self) -> int:
@@ -188,7 +196,7 @@ class ParallelState(metaclass=Singleton):
         else:
             return False
 
-    def get_group(self, mesh_name: str):
+    def get_group(self, mesh_name: str) -> torch.distributed.ProcessGroup | list[torch.distributed.ProcessGroup]:
         """Return the process group(s) of a registered mesh.
 
         For meshes registered under their own dimension name (e.g. 'tp',
@@ -196,17 +204,21 @@ class ParallelState(metaclass=Singleton):
         their original dimensions (e.g. the 2D 'dp_fsdp'/'edp_efsdp' mesh)
         one group per dimension is returned in a list, i.e. the group the
         current rank belongs to along each dimension (dp group, fsdp group,
-        ...).
+        ...). The legacy 'kcp' alias covers the complete CP domain; the
+        'kcp_state' dimension is its state group. Hybrid P2P uses the
+        independent 'kda_p2p' dimension for its P2P state group.
         """
         if mesh_name in self.device_mesh_map:
             mesh = self.device_mesh_map[mesh_name]
+            if mesh.ndim == 1:
+                return mesh.get_group()
             if mesh_name in mesh.mesh_dim_names:
                 return mesh.get_group(mesh_name)
             return [mesh.get_group(dim) for dim in mesh.mesh_dim_names]
         else:
             raise RuntimeError(f"Mesh group {mesh_name} not found.")
 
-    def get_group_size(self, mesh_name: str):
+    def get_group_size(self, mesh_name: str) -> int | list[int]:
         """Return the group size(s) of a registered mesh.
 
         Mirrors ``get_group``: a single int for meshes registered under
@@ -215,13 +227,15 @@ class ParallelState(metaclass=Singleton):
         """
         if mesh_name in self.device_mesh_map:
             mesh = self.device_mesh_map[mesh_name]
+            if mesh.ndim == 1:
+                return mesh.size()
             if mesh_name in mesh.mesh_dim_names:
                 return torch.distributed.get_world_size(mesh.get_group(mesh_name))
             return [mesh.size(dim) for dim in range(mesh.ndim)]
         else:
             raise RuntimeError(f"Mesh group {mesh_name} not found.")
 
-    def get_rank(self, mesh_name: str):
+    def get_rank(self, mesh_name: str) -> int | list[int]:
         """Return the local rank(s) of a registered mesh.
 
         Mirrors ``get_group``: a single int for meshes registered under
@@ -230,6 +244,8 @@ class ParallelState(metaclass=Singleton):
         """
         if mesh_name in self.device_mesh_map:
             mesh = self.device_mesh_map[mesh_name]
+            if mesh.ndim == 1:
+                return mesh.get_local_rank()
             if mesh_name in mesh.mesh_dim_names:
                 return mesh.get_local_rank(mesh_name)
             return [mesh.get_local_rank(dim) for dim in range(mesh.ndim)]

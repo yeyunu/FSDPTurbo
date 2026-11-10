@@ -12,11 +12,11 @@ def chunk_kda(
     v: torch.Tensor,
     g: torch.Tensor,
     beta: torch.Tensor,
-    *args,
-    **kwargs,
-):
+    *args: object,
+    **kwargs: object,
+) -> tuple[torch.Tensor | None, ...]:
     """Apply chunked Kimi Delta Attention using the active device backend."""
-    return dispatch_op('chunk_kda', q, k, v, g, beta, *args, **kwargs)
+    return dispatch_op('chunk_kda', q, k, v, g, beta, *args, device_type=q.device.type, **kwargs)
 
 
 __all__ = ['chunk_kda']

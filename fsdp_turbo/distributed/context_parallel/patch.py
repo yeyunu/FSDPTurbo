@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 import types
-from functools import wraps
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -14,7 +14,12 @@ import torch.distributed as dist
 from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import kv_allgather
 from fsdp_turbo.distributed.context_parallel.loss import get_cp_causal_lm_loss_fn
 from fsdp_turbo.utils.log import print_rank
-from fsdp_turbo.utils.patch import patch_namespace_members, resolve_callable, resolve_class_member
+from fsdp_turbo.utils.patch import (
+    patch_namespace_members,
+    resolve_callable,
+    resolve_class_member,
+    resolve_namespace_member,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -52,9 +57,11 @@ def apply_function_patch_specs(
 ) -> None:
     """Build and install direct replacements for configured CP patch specs.
 
-    ``type: qsa``, ``type: gated_delta_net`` and ``type: kda`` specs are class-method patches deferred to
-    architecture-aware helpers (they require ``model``); all other types are
-    installed as module-level function wrappers via ``patch_types``.
+    ``type: kda`` requires an entry in ``patch_types`` and is installed on model
+    instances through the same binding and idempotence checks as other methods.
+    Its caller selects the algorithm; ``label`` only namespaces patch markers and
+    diagnostics. GDN and QSA retain their existing helpers. Other factories may target
+    module-level functions or instance methods. Class definitions stay unchanged.
     """
     for spec in specs:
         patch_type = spec["type"]
@@ -64,15 +71,20 @@ def apply_function_patch_specs(
         if patch_type == GATED_DELTA_NET:
             apply_gdn_patches(model, spec, label)
             continue
-        if patch_type == KDA_TYPE:
-            apply_kda_patches(model, spec, group, label)
-            continue
         if patch_type not in patch_types:
+            if patch_type == KDA_TYPE:
+                raise ValueError(f"{label} KDA function patches require a forward factory in patch_types['kda'].")
             raise ValueError(f"Unknown {label} function patch type {patch_type!r}.")
         wrapper = patch_types[patch_type]
+        if patch_type == KDA_TYPE:
+            apply_kda_patches(model, spec, group, label, forward_factory=wrapper)
+            continue
         patch_key = f"{label}:{patch_type}"
 
         for target in spec["target_functions"]:
+            if resolve_namespace_member(target) is None:
+                _apply_instance_wrapper(model, target, wrapper, group, patch_key)
+                continue
             original = resolve_callable(target)
             if patch_key in getattr(original, CP_PATCHES_ATTR, ()):
                 continue
@@ -277,12 +289,17 @@ def install_model_context_parallel(
         setattr(module, _CONTEXT_PARALLEL_ATTR, (mode, group))
 
 
-def apply_cp_loss_patches(specs, group):
+def apply_cp_loss_patches(
+    specs: Sequence[FunctionPatchSpec],
+    group: ProcessGroup,
+    *,
+    zigzag: bool = False,
+) -> None:
     """Install causal-LM loss targets once on the complete CP group."""
     apply_function_patch_specs(
         specs,
         group,
-        {CAUSAL_LM_LOSS: get_cp_causal_lm_loss_fn},
+        {CAUSAL_LM_LOSS: partial(get_cp_causal_lm_loss_fn, zigzag=zigzag)},
         label="CP",
     )
 
@@ -307,32 +324,23 @@ def apply_gdn_patches(model, spec, label):
         print_rank(logger.info, f"[Context Parallel/{label}] Patched gdn: {target}")
 
 
-def apply_kda_patches(model: nn.Module, spec: FunctionPatchSpec, group: ProcessGroup, label: str) -> None:
-    """Install the group-bound forward selected by the patch field."""
-    if model is None:
-        raise RuntimeError(f"[Context Parallel/{label}] KDA patches require a model.")
+def apply_kda_patches(
+    model: nn.Module | None,
+    spec: FunctionPatchSpec,
+    group: ProcessGroup | None,
+    label: str,
+    *,
+    forward_factory: Callable[[Callable[..., object], ProcessGroup | None], Callable[..., object]],
+) -> None:
+    """Bind the caller-selected KDA forward without changing config or classes.
 
-    from fsdp_turbo.utils.patch import patch_model_members
-
-    if label == "Ulysses":
-        from fsdp_turbo.modules.kda import get_ulysses_kda_forward
-
-        forward_factory = get_ulysses_kda_forward
-    elif label == "KCP":
-        from fsdp_turbo.distributed.context_parallel.kcp.kda_state import get_fla_state_kda_forward
-
-        forward_factory = get_fla_state_kda_forward
-    else:
-        raise ValueError(f"KDA patches are not supported in the {label!r} patch field.")
-
+    KDA forwards use each layer's parameters, so this entry only installs ordinary
+    instance methods and bypasses the generic module-level replacement path.
+    Reinstalling the same patch/group is a no-op; a different group is rejected.
+    Backend changes require a new model, rather than repeated installation.
+    """
     for target in spec["target_functions"]:
-        target_class, member_name = resolve_class_member(target)
-        original = getattr(target_class, member_name)
-        replacement = forward_factory(original, group)
-        matched = patch_model_members(model, target, replacement)
-        if not matched:
-            raise RuntimeError(f"[Context Parallel/{label}] KDA patch target did not match any module: {target!r}.")
-        print_rank(logger.info, f"[Context Parallel/{label}] Patched kda: {target}")
+        _apply_instance_wrapper(model, target, forward_factory, group, f"{label}:{KDA_TYPE}")
 
 
 def apply_qsa_patches(model: nn.Module, spec: FunctionPatchSpec, group: ProcessGroup, label: str) -> None:

@@ -1,29 +1,43 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Configuration-driven Ulysses function patching."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from fsdp_turbo.distributed.context_parallel.patch import (
     apply_function_patch_specs,
     install_model_context_parallel,
 )
+from fsdp_turbo.distributed.context_parallel.ulysses.kda import get_ulysses_kda_forward
 from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_attention import (
     get_ulysses_attention_fn,
     get_ulysses_compressor_attention_fn,
     get_ulysses_transposed_compressor_attention_fn,
 )
 
+if TYPE_CHECKING:
+    from torch import nn
+    from torch.distributed import ProcessGroup
+
+    from fsdp_turbo.fsdp_turbo_config import CPPlanConfig
+
 _ULYSSES_FUNCTION_PATCH_TYPES = {
+    "kda": get_ulysses_kda_forward,
     "full_attention": get_ulysses_attention_fn,
     "compressor_full_attention": get_ulysses_compressor_attention_fn,
     "compressor_full_attention_transposed": get_ulysses_transposed_compressor_attention_fn,
 }
 
 
-def ulysses_context_parallelize_modules(model, ulysses_group, cp_plan):
+def ulysses_context_parallelize_modules(
+    model: nn.Module, ulysses_group: ProcessGroup, cp_plan: CPPlanConfig
+) -> nn.Module:
     """Install Ulysses attention wrappers and recurrent-attention forwards.
 
-    GDN (``type: gated_delta_net``) and KDA (``type: kda``) specs live alongside attention specs in
-    ``ulysses_function_patches`` but are class-method patches routed inside
-    :func:`apply_function_patch_specs` (hence ``model`` is forwarded).
+    KDA uses the registered Ulysses forward factory and the shared instance
+    installer. GDN retains its existing specialized handler. Both require the
+    model, while attention entries may target module-level functions.
     """
     apply_function_patch_specs(
         cp_plan.ulysses_function_patches,

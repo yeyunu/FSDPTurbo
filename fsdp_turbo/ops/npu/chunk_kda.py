@@ -50,8 +50,22 @@ print_rank(print, f"[chunk_kda] backend={_CHUNK_KDA_BACKEND}")
 
 
 @register_op('chunk_kda', 'npu')
-def chunk_kda_npu(q, k, v, g, beta, *args, **kwargs):
+def chunk_kda_npu(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    *args: object,
+    **kwargs: object,
+) -> tuple[torch.Tensor | None, ...]:
     """Run KDA with the selected NPU implementation."""
+    if kwargs.get("cp_context") is not None:
+        from fsdp_turbo.ops.kcp import _ensure_triton_driver
+        from triton_ascend_kernels.attention.fla.kda import chunk_kda as chunk_kda_cp
+
+        _ensure_triton_driver()
+        return chunk_kda_cp(q, k, v, g, beta, *args, **kwargs)
     if _CHUNK_KDA_BACKEND == 'triton' and kwargs.get('use_beta_sigmoid_in_kernel', False):
         beta = torch.sigmoid(beta)
         kwargs['use_beta_sigmoid_in_kernel'] = False

@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+from dataclasses import replace
 
 import torch
 from transformers import AutoConfig
@@ -36,29 +37,31 @@ class KimiK3Trainer(BaseTrainer):
         else:
             return super().build_tokenizer()
 
-    def build_model(self):
-        from fsdp_turbo.modules.kcp import _ensure_triton_driver
-
-        _ensure_triton_driver()
-
-        from transformers import AutoModel
+    def build_model(self) -> torch.nn.Module:
+        """Load one repository-local K3 reference family, then attach parallelism."""
         from fsdp_turbo.models.kimi import register_kimi_k3
+        from fsdp_turbo.models.kimi.modeling_kimi_k3 import (
+            KimiK3ForConditionalGeneration,
+            build_kimi_k3_model_class,
+        )
+        from fsdp_turbo.models.kimi.modeling_kimi_linear import KimiDeltaAttention, KimiMLAAttention
 
         register_kimi_k3()
-
         print_rank(logger.info, "> Building KimiK3 Model...")
         model_config = AutoConfig.from_pretrained(self.config.model.model_name_or_path, trust_remote_code=False)
-        # Layer reduction must happen before from_pretrained so the model is
-        # built shallow; the checkpoint then fills the first-N layer weights
-        # (remaining keys are reported as unexpected, which is expected).
         set_num_hidden_layers(model_config, self.config.model.num_hidden_layers)
         set_attn_implementation(model_config, self.config.model.attn_implementation)
-        # The multimodal image-text merge reads this off its own config (see
-        # fsdp_turbo/models/kimi/modeling_kimi_k3.py); stamp it before load so
-        # every merge call sees it. 0 keeps the single-shot assignment.
         if self.config.memory.mm_merge_chunk_tokens > 0:
             model_config.mm_merge_chunk_tokens = self.config.memory.mm_merge_chunk_tokens
-        model = AutoModel.from_pretrained(
+        cp_plan = self.config.distributed.cp_plan
+        model_class = build_kimi_k3_model_class(
+            KimiK3ForConditionalGeneration,
+            KimiDeltaAttention,
+            KimiMLAAttention,
+            kda_backend=cp_plan.kda_backend,
+            mla_backend=cp_plan.mla_backend,
+        )
+        model = model_class.from_pretrained(
             self.config.model.model_name_or_path,
             config=model_config,
             attn_implementation=self.config.model.attn_implementation,
@@ -106,21 +109,26 @@ class KimiK3Trainer(BaseTrainer):
         return loss, aux_loss
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """Parse the YAML path and optional language-model layer count."""
     parser = argparse.ArgumentParser(description="Kimi K3 MoE Training with Ulysses Context Parallel")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to YAML config file")
     parser.add_argument("--num-hidden-layers", type=int, default=None, help="Override language model layer count")
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
+    """Load the YAML configuration and launch Kimi K3 training."""
     args = parse_args()
 
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.config)
     config = load_config_from_yaml(config_path)
 
     if args.num_hidden_layers is not None:
-        config.model.num_hidden_layers = args.num_hidden_layers
+        config = replace(
+            config,
+            model=replace(config.model, num_hidden_layers=args.num_hidden_layers),
+        )
 
     trainer = KimiK3Trainer(config=config)
     trainer.setup()

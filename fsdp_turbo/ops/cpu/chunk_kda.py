@@ -240,8 +240,8 @@ def chunk_kda_cpu(
     return_intermediate_states: bool = False,
     state_v_first: bool = False,
     chunk_size: int = 64,
-    **kwargs,
-):
+    **kwargs: object,
+) -> tuple[torch.Tensor | None, ...]:
     r"""
     A small-operator (pure PyTorch) implementation of chunk_kda, with the
     same interface and semantics as ``fla.ops.kda.chunk_kda``
@@ -288,6 +288,9 @@ def chunk_kda_cpu(
         state_v_first (bool): Use the transposed state layout
             `[N, H, V, K]`.
         chunk_size (int): Chunk size, default 64 (same as the triton version).
+        cp_context: Optional contiguous CP metadata. The CPU reference gathers
+            full inputs, reconstructs packed boundaries, and returns the local slice.
+            This is a correctness fallback, not a scalable distributed kernel.
 
     Returns:
         - `return_intermediate_states=False`: (o, final_state)
@@ -301,6 +304,35 @@ def chunk_kda_cpu(
             In varlen mode B == 1 and NT is the total number of chunks across
             all sequences.
     """
+    cp_context = kwargs.pop("cp_context", None)
+    if cp_context is not None:
+        return _chunk_kda_cp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cp_context,
+            dict(
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                use_gate_in_kernel=use_gate_in_kernel,
+                use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+                allow_neg_eigval=allow_neg_eigval,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                safe_gate=safe_gate,
+                lower_bound=lower_bound,
+                disable_recompute=disable_recompute,
+                return_intermediate_states=return_intermediate_states,
+                state_v_first=state_v_first,
+                chunk_size=chunk_size,
+                **kwargs,
+            ),
+        )
+
     if 'transpose_state_layout' in kwargs:
         if state_v_first:
             raise ValueError("Cannot pass both `state_v_first` and the deprecated `transpose_state_layout`.")
@@ -401,6 +433,40 @@ def chunk_kda_cpu(
     if return_intermediate_states:
         return o, final_state, h
     return o, final_state
+
+
+def _chunk_kda_cp(q, k, v, g, beta, context, options):
+    """Portable reference only: gather full inputs, then return the local output."""
+    import torch.distributed as dist
+
+    from fsdp_turbo.ops.kcp import gather_cp_tensor
+
+    if options["initial_state"] is not None or options["output_final_state"] or options["return_intermediate_states"]:
+        raise ValueError("CP does not support explicit or returned recurrent states.")
+    if q.shape[0] != 1:
+        raise ValueError("CP expects flattened inputs with batch size 1.")
+    inputs = (q, k, v, g, beta)
+    widths = [tensor.flatten(2).shape[-1] for tensor in inputs]
+    packed = torch.cat([tensor.flatten(2) for tensor in inputs], dim=-1)
+    shards = gather_cp_tensor(packed, context.group)
+    complete = torch.cat(tuple(shards.unbind(0)), dim=1)
+    restored = [
+        part.reshape(1, -1, *original.shape[2:]).to(original.dtype)
+        for part, original in zip(complete.split(widths, dim=-1), inputs)
+    ]
+    metadata = [None] * dist.get_world_size(context.group)
+    dist.all_gather_object(metadata, (context.cu_seqlens_cpu.tolist(), context.is_last_rank), group=context.group)
+    local_length = q.shape[1]
+    boundaries = [0]
+    for rank, (local_boundaries, is_last_rank) in enumerate(metadata):
+        boundaries.extend(rank * local_length + offset for offset in local_boundaries[1:-1])
+        if is_last_rank:
+            boundaries.append((rank + 1) * local_length)
+    options["cu_seqlens"] = torch.tensor(boundaries, dtype=torch.long, device=q.device)
+    options["cu_seqlens_cpu"] = options["cu_seqlens"].cpu()
+    output, _ = chunk_kda_cpu(*restored, **options)
+    start = dist.get_rank(context.group) * local_length
+    return output[:, start : start + local_length], None
 
 
 __all__ = ['chunk_kda_cpu']

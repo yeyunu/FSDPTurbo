@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
-from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
+from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig, uses_hybrid_cp_zigzag_layout
 from fsdp_turbo.ops.indexer_kl_metric import collect_indexer_kl_metrics
 from fsdp_turbo.utils.dtype import get_dtype
 from fsdp_turbo.utils.log import set_log_level, print_rank
@@ -685,11 +685,13 @@ class BaseTrainer:
 
         from fsdp_turbo.distributed.context_parallel.batch import split_sequence_batch
 
+        cp_plan = self.config.distributed.cp_plan if self.config is not None else None
         return split_sequence_batch(
             batch,
             group=parallel_state.get_cp_group(),
             sequence_keys=("input_ids", "attention_mask", "mm_token_type_ids"),
             build_position_ids=True,
+            zigzag=uses_hybrid_cp_zigzag_layout(cp_plan),
         )
 
     def _clip_grad_norm(self):

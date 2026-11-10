@@ -65,3 +65,8 @@ FSDPTurbo与HuggingFace Transformers原生训练的主要差异：
 EP 通信方式通过 `distributed.ep_plan.dispatcher` 选择（默认 `all2all`）；融合算子通过
 `use_fused_ops` 控制（默认 `true`）。
 无效 dispatcher 在配置初始化时直接报错，详细用法见 [专家并行](../features/expert_parallel.md)。
+
+Kimi K3的Hybrid P2P通过`distributed.cp_plan.kda_backend: hybrid_p2p`开启，
+`distributed.ulysses_parallel_size`与`distributed.kda_p2p_parallel_size`分别设置Ulysses和P2P并行度，完整CP大小为两者之积。
+`kda_p2p_parallel_size`默认为1，Hybrid P2P的`kcp_parallel_size`保持1。
+使用Ulysses或KCP时，`kda_p2p_parallel_size`保持1，配置示例见 [上下文并行](../features/context_parallel.md)。

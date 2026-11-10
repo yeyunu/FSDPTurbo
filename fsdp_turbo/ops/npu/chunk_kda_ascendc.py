@@ -282,7 +282,9 @@ class ChunkKDAFunction(torch.autograd.Function):
             k, k_rstd = l2norm_fwd(k)
 
         beta_raw = beta
-        if use_beta_sigmoid_in_kernel and external_norm:
+        # The public A5 V2 backward reserves fused beta sigmoid, so beta stays
+        # external on both platforms even when A5 handles Q/K normalization.
+        if use_beta_sigmoid_in_kernel:
             beta = fused_beta_sigmoid(beta_raw, scale=2.0 if allow_neg_eigval else 1.0)
 
         chunk_indices = None
@@ -381,17 +383,13 @@ class ChunkKDAFunction(torch.autograd.Function):
                 if use_qk_l2norm_in_kernel and platform == "a5"
                 else None
             )
-            be = (
-                torch.empty(scalar_shape, dtype=torch.float32, device=beta.device)
-                if use_beta_sigmoid_in_kernel and platform == "a5"
-                else None
-            )
+            be = None
             v2_aux = (qh, kh, qr, kr, be)
             fwd_norm_kwargs = (
                 dict(
                     use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-                    use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
-                    allow_neg_eigval=allow_neg_eigval,
+                    use_beta_sigmoid_in_kernel=False,
+                    allow_neg_eigval=False,
                     q_hat_out=qh,
                     k_hat_out=kh,
                     q_rstd_out=qr,
@@ -531,7 +529,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             v2_kh,
             v2_qr,
             v2_kr,
-            v2_be,
+            _v2_be,
         ) = ctx.saved_tensors
 
         if ctx.use_fused_kda_bwd:
@@ -543,9 +541,9 @@ class ChunkKDAFunction(torch.autograd.Function):
                 q_head = None if ctx.use_qk_l2norm_in_kernel else _bsnd_to_ntd(q)
                 k_head = None if ctx.use_qk_l2norm_in_kernel else _bsnd_to_ntd(k)
                 v_head = _bsnd_to_ntd(v)
-                beta_head = None if ctx.use_beta_sigmoid_in_kernel else _bsh_to_nt(beta)
-                do_head = _bsnd_to_ntd(do)
-                raw_g_head = _bsnd_to_ntd(g_input) if ctx.use_gate_in_kernel else None
+                beta_head = beta.squeeze(0).contiguous()
+                do_head = do.squeeze(0).contiguous()
+                raw_g_head = g_input.squeeze(0).contiguous() if ctx.use_gate_in_kernel else None
                 gk_head = _varlen_saved_tensor(g_cumsum)
                 Aqk_head = _varlen_saved_tensor(Aqk)
                 Akk_head = _varlen_saved_tensor(Akk)
@@ -558,9 +556,9 @@ class ChunkKDAFunction(torch.autograd.Function):
                 q_head = None if ctx.use_qk_l2norm_in_kernel else _bsnd_to_bnsd(q)
                 k_head = None if ctx.use_qk_l2norm_in_kernel else _bsnd_to_bnsd(k)
                 v_head = _bsnd_to_bnsd(v)
-                beta_head = None if ctx.use_beta_sigmoid_in_kernel else _bsh_to_bhs(beta)
-                do_head = _bsnd_to_bnsd(do)
-                raw_g_head = _bsnd_to_bnsd(g_input) if ctx.use_gate_in_kernel else None
+                beta_head = beta.contiguous()
+                do_head = do.contiguous()
+                raw_g_head = g_input.contiguous() if ctx.use_gate_in_kernel else None
                 gk_head, Aqk_head, Akk_head = g_cumsum, Aqk, Akk
                 w_head, qg_head, kg_head = w, qg, kg
                 v_new_head, h_head = v_new, h
@@ -573,8 +571,6 @@ class ChunkKDAFunction(torch.autograd.Function):
             if ctx.use_qk_l2norm_in_kernel and ctx.platform == "a5":
                 q_head, k_head = saved_head(v2_qh), saved_head(v2_kh)
                 norm_kwargs = dict(q_rstd=saved_head(v2_qr), k_rstd=saved_head(v2_kr))
-            if ctx.use_beta_sigmoid_in_kernel and ctx.platform == "a5":
-                beta_head = saved_head(v2_be)
             gate_A_log = A_log if ctx.use_gate_in_kernel else None
             gate_dt_bias = None
             if ctx.use_gate_in_kernel and dt_bias is not None:
@@ -584,7 +580,6 @@ class ChunkKDAFunction(torch.autograd.Function):
                 # q/k/beta already contain the external preprocessing results.
                 q_head = _bsnd_to_ntd(q) if is_varlen else _bsnd_to_bnsd(q)
                 k_head = _bsnd_to_ntd(k) if is_varlen else _bsnd_to_bnsd(k)
-                beta_head = _bsh_to_nt(beta) if is_varlen else _bsh_to_bhs(beta)
                 if not ctx.disable_recompute:
                     # Small operators take rank-4 BNSD even for packed inputs;
                     # the fused backward takes rank-3 HTD for packed inputs.
@@ -637,16 +632,17 @@ class ChunkKDAFunction(torch.autograd.Function):
                 disable_recompute=True if ctx.platform == "a2a3" else ctx.disable_recompute,
                 use_exp2=True,
                 state_v_first=False,
+                layout="NTD" if is_varlen else "BNSD",
                 **bwd_kwargs,
                 **norm_kwargs,
             )
 
             if is_varlen:
                 dq, dk, dv = map(_ntd_to_bsnd, (dq_head, dk_head, dv_head))
-                db, dg = _nt_to_bsh(db_head), _ntd_to_bsnd(dg_head)
+                db, dg = db_head.unsqueeze(0), dg_head.unsqueeze(0)
             else:
                 dq, dk, dv = map(_bnsd_to_bsnd, (dq_head, dk_head, dv_head))
-                db, dg = _bhs_to_bsh(db_head), _bnsd_to_bsnd(dg_head)
+                db, dg = db_head, dg_head
             if dbias is not None:
                 dbias = dbias.reshape(dt_bias.shape)
         else:

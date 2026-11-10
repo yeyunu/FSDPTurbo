@@ -10,6 +10,7 @@ Query/key/value arrive in **BNSD** layout ``[B, H, S, D]``.
 """
 
 import logging
+import torch
 
 from fsdp_turbo.ops.registry import dispatch_op
 from fsdp_turbo.utils.device import get_accelerator_name
@@ -20,7 +21,15 @@ logger = logging.getLogger(__name__)
 __all__ = ["causal_flash_attention", "flash_attention_forward", "register_flash_attention"]
 
 
-def causal_flash_attention(query, key, value, *, scaling=None, dropout=0.0, is_causal=True):
+def causal_flash_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    scaling: float | None = None,
+    dropout: float = 0.0,
+    is_causal: bool = True,
+) -> torch.Tensor:
     """Native-causal flash attention for BNSD tensors, dispatched by device.
 
     Causality comes from the kernel itself -- NPU ``npu_fusion_attention`` with
@@ -28,7 +37,8 @@ def causal_flash_attention(query, key, value, *, scaling=None, dropout=0.0, is_c
     ``[B, 1, S, S]`` mask is ever materialized. When the query block is shorter
     than the K/V prefix, causality stays bottom-right aligned (row ``i``
     attends ``K[0, i + kv_len - q_len)``). Inputs must already have matching
-    head counts and head dims. Returns the output in BNSD layout.
+    head counts and head dims. Dispatch uses the input tensor's device, including
+    CPU tensors on an accelerator host. Returns the output in BNSD layout.
     """
     return dispatch_op(
         "causal_flash_attention",
@@ -38,21 +48,22 @@ def causal_flash_attention(query, key, value, *, scaling=None, dropout=0.0, is_c
         scaling=scaling,
         dropout=dropout,
         is_causal=is_causal,
+        device_type=query.device.type,
     )
 
 
 def flash_attention_forward(
-    module,
-    query,
-    key,
-    value,
-    attention_mask=None,
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
     *,
-    scaling=None,
-    dropout=0.0,
-    is_causal=True,
-    **kwargs,
-):
+    scaling: float | None = None,
+    dropout: float = 0.0,
+    is_causal: bool = True,
+    **kwargs: object,
+) -> tuple[torch.Tensor, None]:
     """Compute attention via device-dispatched fused op or eager fallback.
 
     Args:
@@ -76,6 +87,7 @@ def flash_attention_forward(
         scaling=scaling,
         dropout=dropout,
         is_causal=is_causal,
+        device_type=query.device.type,
         **kwargs,
     )
 

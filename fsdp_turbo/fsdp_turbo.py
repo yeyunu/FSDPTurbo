@@ -24,7 +24,7 @@ from fsdp_turbo.distributed.context_parallel.kcp.kcp_context_parallel import (
 )
 from fsdp_turbo.distributed.context_parallel.patch import apply_cp_loss_patches
 from fsdp_turbo.memory.recompute.recompute import recompute_modules
-from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig
+from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig, uses_hybrid_cp_zigzag_layout
 from fsdp_turbo.distributed.expert_parallel.expert_parallel import (
     expert_parallelize_modules,
 )
@@ -92,8 +92,24 @@ class FSDPTurbo(torch.nn.Module):
         )
 
     def apply_cp_modules(self) -> None:
-        """Configure native CP groups or the selected legacy attention/loss wrappers."""
+        """Configure native CP, 2D KDA/MLA adapters or legacy attention/loss wrappers."""
         cp_plan = self.config.distributed.cp_plan
+        if cp_plan.kda_backend == "hybrid_p2p":
+            from fsdp_turbo.distributed.context_parallel.hybrid_cp import HybridCPRuntime, bind_hybrid_cp
+
+            runtime = HybridCPRuntime(
+                self.parallel_state.get_cp_group(),
+                self.parallel_state.get_ulysses_group(),
+                self.parallel_state.get_kda_p2p_group() if self.config.distributed.kda_p2p_parallel_size > 1 else None,
+            )
+            bind_hybrid_cp(self.model, runtime, required_roles=("kda",))
+            if self.parallel_state.get_cp_group_size() > 1:
+                apply_cp_loss_patches(
+                    cp_plan.loss_function_patches,
+                    runtime.cp_group,
+                    zigzag=uses_hybrid_cp_zigzag_layout(cp_plan),
+                )
+            return
         ulysses_enabled = self.config.distributed.ulysses_parallel_size > 1
         kcp_enabled = self.config.distributed.kcp_parallel_size > 1
         # Qwen4-Exp class-forward patches own both the QSA/Ulysses layout and
@@ -108,7 +124,7 @@ class FSDPTurbo(torch.nn.Module):
                 cp_plan,
             )
 
-        if ulysses_enabled or (cp_enabled and cp_plan.ulysses_function_patches):
+        if not kcp_enabled and (ulysses_enabled or (cp_enabled and cp_plan.ulysses_function_patches)):
             self.model = ulysses_context_parallelize_modules(
                 self.model,
                 self.parallel_state.get_ulysses_group(),
@@ -118,8 +134,10 @@ class FSDPTurbo(torch.nn.Module):
         if kcp_enabled:
             self.model = kcp_context_parallelize_modules(
                 self.model,
-                self.parallel_state.get_kcp_group(),
+                self.parallel_state.get_cp_group(),
                 cp_plan,
+                kcp_state_group=self.parallel_state.get_kcp_state_group(),
+                ulysses_group=self.parallel_state.get_ulysses_group(),
             )
 
         # Attention wrappers compose on their own axes. A causal-LM loss must

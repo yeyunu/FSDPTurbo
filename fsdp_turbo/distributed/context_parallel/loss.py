@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
-"""Causal-LM loss helpers for contiguous context-parallel sequence shards."""
+"""Causal-LM loss helpers for contiguous or front/back CP sequence shards."""
 
 from functools import wraps
 from inspect import Parameter, signature
@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from fsdp_turbo.distributed.context_parallel.batch import pad_tensor_to_group, split_tensor_to_group
+from .sequence_partition import SequencePartitionPlan, pad_tensor_to_length
 
 
 # Inspect once; CP supplies these four arguments explicitly.
@@ -75,7 +75,9 @@ def cp_fixed_cross_entropy(
     return loss_sum / total_items.clamp_min(1)
 
 
-def _shift_and_shard_labels(labels: torch.Tensor, group, ignore_index: int) -> torch.Tensor:
+def _shift_and_shard_labels(
+    labels: torch.Tensor, group: dist.ProcessGroup | None, ignore_index: int, *, zigzag: bool = False
+) -> torch.Tensor:
     """Shift complete labels globally and split them onto the local CP shard.
 
     With ``group=None`` (no context parallelism) the labels are only shifted,
@@ -85,9 +87,10 @@ def _shift_and_shard_labels(labels: torch.Tensor, group, ignore_index: int) -> t
     shifted_labels[..., :-1] = labels[..., 1:]
     if group is None:
         return shifted_labels
-    seq_dim = shifted_labels.dim() - 1
-    shifted_labels = pad_tensor_to_group(shifted_labels, group, dim=seq_dim, pad_value=ignore_index)
-    return split_tensor_to_group(shifted_labels, group, dim=seq_dim)
+    partition = SequencePartitionPlan(
+        shifted_labels.shape[-1], dist.get_world_size(group), dist.get_rank(group), zigzag
+    )
+    return partition.pad_and_shard_tensor(shifted_labels, dim=shifted_labels.dim() - 1, pad_value=ignore_index)
 
 
 def cp_compute_lm_loss(
@@ -96,6 +99,7 @@ def cp_compute_lm_loss(
     group: dist.ProcessGroup,
     num_items_in_batch: torch.Tensor | int | None = None,
     ignore_index: int = -100,
+    zigzag: bool = False,
     *,
     shift_labels: Optional[torch.Tensor] = None,
     **kwargs: object,
@@ -117,14 +121,11 @@ def cp_compute_lm_loss(
         )
 
     if shift_labels is None:
-        # Complete unshifted labels: shift globally first so tokens at CP shard
-        # boundaries keep the same next-token target, then pad and split.
-        labels = _shift_and_shard_labels(labels, group, ignore_index)
-    else:
-        # Pre-shifted complete labels (HF may pass them): only pad and split.
-        seq_dim = shift_labels.dim() - 1
-        shift_labels = pad_tensor_to_group(shift_labels, group, dim=seq_dim, pad_value=ignore_index)
-        labels = split_tensor_to_group(shift_labels, group, dim=seq_dim)
+        # Shift on the complete sequence before padding to the model's length.
+        shift_labels = _shift_and_shard_labels(labels, None, ignore_index)
+    shift_labels = pad_tensor_to_length(shift_labels, seq_dim, global_logits_length, ignore_index)
+    partition = SequencePartitionPlan(global_logits_length, dist.get_world_size(group), dist.get_rank(group), zigzag)
+    labels = partition.pad_and_shard_tensor(shift_labels, dim=seq_dim, pad_value=ignore_index)
     if labels.shape != logits.shape[:-1]:
         raise ValueError(
             "CP loss label/logit shape mismatch after complete-sequence shift and split: "
@@ -219,7 +220,9 @@ def cp_chunk_lm_loss(
     return loss_sum / total_items.clamp_min(1)
 
 
-def get_cp_causal_lm_loss_fn(fn: Callable[..., torch.Tensor], group: dist.ProcessGroup) -> Callable[..., torch.Tensor]:
+def get_cp_causal_lm_loss_fn(
+    fn: Callable[..., torch.Tensor], group: dist.ProcessGroup, *, zigzag: bool = False
+) -> Callable[..., torch.Tensor]:
     """Wrap a Transformers-style loss for CP-local logits and complete labels."""
 
     @wraps(fn)
@@ -238,6 +241,7 @@ def get_cp_causal_lm_loss_fn(fn: Callable[..., torch.Tensor], group: dist.Proces
             group=group,
             num_items_in_batch=num_items_in_batch,
             ignore_index=ignore_index,
+            zigzag=zigzag,
             shift_labels=shift_labels,
             **kwargs,
         )

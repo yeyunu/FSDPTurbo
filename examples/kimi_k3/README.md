@@ -3,6 +3,7 @@
 本目录提供 Kimi K3 多模态 MoE 模型的训练示例。默认的
 [`config.yaml`](./config.yaml) 已开启 Ulysses Context Parallel（CP），CP
 并行度为 2。
+同时支持Hybrid P2P，配置见本文末尾。
 
 ## 模型文件准备
 
@@ -19,8 +20,8 @@ cp "${HF_PATH}/media_utils.py" "${TURBO_PATH}/fsdp_turbo/models/kimi/"
 ```
 
 请保留仓库内已适配的 `modeling_kimi_k3.py`、`modeling_kimi_linear.py`
-等实现文件。模型权重、tokenizer、processor 配置等资源仍由
-`config.yaml` 中的 `model_name_or_path` 指定。
+等实现文件。模型配置和权重由`config.yaml`中的`model.model_name_or_path`指定，
+tokenizer与processor资源由`model.tokenizer_name_or_path`指定。
 
 ## 模型代码加载
 
@@ -111,6 +112,7 @@ python -c "import fla_npu; from fla_npu.ops.ascendc import chunk_kda_fwd, chunk_
 KDA 和 causal conv1d 不需要配置 `module_patches`。模型统一调用 FSDPTurbo 算子注册入口，
 运行时依次选择 AscendC、Triton 和 eager 实现；回退到 eager 时会输出 warning。
 当前 AscendC KDA 路径用于 `use_cache=False` 的训练，不支持 generation/cache。
+Hybrid P2P需要匹配的分阶段KDA接口，不使用上述自动回退路径。
 
 ## 并行度约束
 
@@ -204,8 +206,11 @@ Chunk loss 已支持与 CP 同时开启（见下文"长序列（100k+/1M）训�
 示例的 `train_step` 已设置 `use_cache=False`。如果使用自定义训练入口，也需要保持该
 设置。若模型 remote-code 中的模块路径发生变化，还需要同步修改 `target_functions`
 和 `module_patches.target`，否则配置校验或 patch 匹配会直接报错。
+Hybrid P2P的使用限制见[Hybrid P2P](#hybrid-p2p二维cp)。
 
 ## 长序列（100k+/1M）训练
+
+本节适用于Ulysses/KCP。Hybrid P2P不支持chunk loss。
 
 超长序列有三个硬性显存瓶颈，各有对应开关（第三个仅多模态）：
 
@@ -284,9 +289,8 @@ KCP 和 Ulysses 是互斥模式，`kcp_parallel_size` 与 `ulysses_parallel_size
 大于 1。KCP 在同一个 CP 通信组上为两类层分别选择策略：
 
 - **MLA（全注意力）**：`full_attention`（Ulysses all-to-all，与 Ulysses 模式同一
-  实现，仅通信组不同）。Kimi K3 有 96 个 head，a2a 每 rank 的 KV 随 cp 缩小，是
-  1M 的唯一可行解。
-- **KDA（线性注意力）**：按 rank 顺序传递递推状态，不为 KDA 在每个 rank 重建完整序列。
+  实现，仅通信组不同）。Kimi K3有96个head，a2a每rank的KV随cp缩小。
+- **KDA（线性注意力）**：本地归并状态摘要，经AllGather和前缀计算获得各分片初始状态，无需收集完整Q/K/V。
 
 KCP 的 world size 约束为：
 
@@ -303,3 +307,44 @@ world_size % (kcp_parallel_size * tensor_parallel_size) == 0
 - 不支持 generation/cache 输入（chunk loss 已支持，见上文）。
 - KDA key head dimension 不能超过 256；启用 safe gate 时，`lower_bound` 必须位于
   `[-5, 0)`。
+
+## Hybrid P2P（二维CP）
+
+KDA在U组通过Ulysses切分head，在K组通过P2P归并状态，完整CP大小为`P=U*K`。
+其中U=`ulysses_parallel_size`、K=`kda_p2p_parallel_size`，`kcp_parallel_size`保持1。
+在同一份`config.yaml`中完整设置以下`cp_plan`和`module_patches`：
+
+```yaml
+model:
+  attn_implementation: eager
+distributed:
+  tensor_parallel_size: 1
+  kv_allgather_parallel_size: 1
+  ulysses_parallel_size: 2
+  kcp_parallel_size: 1
+  kda_p2p_parallel_size: 4
+  cp_plan:
+    kda_backend: hybrid_p2p
+    mla_backend: ulysses
+    ulysses_function_patches: []
+    kcp_function_patches: []
+    kv_allgather_function_patches: []
+    loss_function_patches: []
+module_patches: []
+data:
+  batch_size: 1
+memory:
+  chunk_loss: false
+  chunk_batch: false
+```
+
+- `mla_backend: ulysses`使用顺序切分；`kv_allgather`使用首尾切分。MLA均在完整P域通信，独立`kv_allgather_parallel_size`保持1；Ring暂不支持。
+- U、K须为2的幂（含1）。TP=1，二维CP要求`world_size % (U*K) == 0`，并分别满足FSDP、EP的整除约束。
+- KDA head数须能被U整除；MLA使用Ulysses时，其query head数须能被P整除。
+- U=1退化为P2P，K=1退化为Ulysses，U=K=1无跨进程CP通信。
+- 仅支持单个连续有效token区间的padding，不支持packed/cache、chunk batch或chunk loss。
+- NPU要求匹配的`fla_npu`分阶段接口、BF16 Q/K/V、head_dim=128、chunk_size=64，以及模型已有`gate_lower_bound`位于`[-5,0)`。不得修改已训练模型门控来绕过限制。
+
+切回Ulysses/KCP时，将`kda_p2p_parallel_size`设为1、`kda_backend`设为`kcp`、`mla_backend`设为`ulysses`，恢复相应的函数及模型入口patch；Ulysses的`kcp_parallel_size=1`，KCP的U=1。
+
+更多CP配置说明见[上下文并行](../../docs/zh/features/context_parallel.md)。

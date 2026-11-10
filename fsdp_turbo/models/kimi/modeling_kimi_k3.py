@@ -1,4 +1,5 @@
 # coding=utf-8
+# Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright 2025-2026 The Moonshot AI Team and HuggingFace Inc. team. All rights reserved.
 # Copyright c) 2026 Tenstorrent AI
 # 2025-2026 The Moonshot AI Team DeepSeek-AI and HuggingFace Inc. team. All rights reserved
@@ -43,6 +44,8 @@
 # SOFTWARE.
 # pylint: disable=relative-beyond-top-level,consider-using-from-import,no-name-in-module,too-many-lines,useless-parent-delegation,consider-merging-isinstance,redefined-outer-name,attribute-defined-outside-init
 
+from __future__ import annotations
+
 import math
 from collections.abc import Sequence
 from copy import deepcopy
@@ -50,6 +53,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import activations
@@ -79,6 +83,18 @@ from fsdp_turbo.memory.chunk_loss.chunk_loss import calculate_lm_loss, chunk_los
 from .kimi_flash_attention import context_parallel_active
 from fsdp_turbo.utils.device import get_accelerator_name
 from ..utils import register_model
+
+from fsdp_turbo.distributed.context_parallel.batch import shard_fused_sequence_inputs
+from fsdp_turbo.distributed.context_parallel.loss import cp_compute_lm_loss
+from fsdp_turbo.distributed.context_parallel.hybrid_cp import HybridCPRuntime
+from fsdp_turbo.distributed.context_parallel.kda_hybrid.p2p import (
+    KdaCPContext,
+    exchange_causal_history,
+)
+from fsdp_turbo.distributed.context_parallel.ulysses.utils import ulysses_all_to_all
+from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import kv_allgather
+from fsdp_turbo.ops.kda_p2p import chunk_kda_p2p
+from fsdp_turbo.ops.flash_attn import flash_attention_forward
 
 if get_accelerator_name() == "npu":
     import torch_npu
@@ -1411,3 +1427,370 @@ class KimiK3ForConditionalGeneration(KimiK3PreTrainedModel):
 
     def _reorder_cache(self, *args, **kwargs):
         return self.language_model._reorder_cache(*args, **kwargs)
+
+
+# Hybrid CP model selection and subclass composition.
+
+
+def build_kimi_k3_model_class(
+    model_base: type[PreTrainedModel],
+    kda_base: type[nn.Module],
+    mla_base: type[nn.Module],
+    *,
+    kda_backend: str = "kcp",
+    mla_backend: str = "ulysses",
+) -> type[PreTrainedModel]:
+    """Select a model class before weights are loaded, using one reference family.
+
+    Backends must come from the validated CP configuration. Legacy modes return
+    model_base; hybrid_p2p constructs its Hybrid CP subclasses. This function performs
+    no checkpoint I/O, registration, config mutation or process-group setup.
+    The application owns reference imports and weight loading in every mode.
+    """
+    if kda_backend == "hybrid_p2p":
+        return build_kimi_k3_hybrid_cp_class(model_base, kda_base, mla_base, mla_backend=mla_backend)
+    return model_base
+
+
+def build_kimi_k3_hybrid_cp_class(
+    model_base: type[PreTrainedModel],
+    kda_base: type[nn.Module],
+    mla_base: type[nn.Module],
+    *,
+    mla_backend: str = "ulysses",
+) -> type[PreTrainedModel]:
+    """Subclass application-supplied Transformers/remote-code Kimi classes.
+
+    The caller owns reference-code loading. Construct this class *before* loading
+    weights so component subclasses retain the original checkpoint parameter names.
+    ``mla_backend`` comes from the validated CP configuration: Ulysses selects
+    contiguous input shards; KV-AllGather selects front/back shards. The same
+    choice is shared by model input, attention and loss. Build a class for the
+    selected backend before loading weights. No imports from sibling model
+    directories and no mutation of reference classes.
+    """
+
+    zigzag = mla_backend != "ulysses"
+
+    class KimiHybridCPDeltaAttention(kda_base):
+        """KDA subclass whose configured path exchanges heads and affine states."""
+
+        def configure_hybrid_cp(self, runtime: HybridCPRuntime) -> str:
+            """Validate head splitting before any model collective and bind groups."""
+            size = dist.get_world_size(runtime.ulysses_group)
+            if (
+                self.num_heads % size
+                or self.head_dim != self.head_k_dim
+                or getattr(self, "num_k_heads", self.num_heads) != self.num_heads
+            ):
+                raise ValueError("Ulysses size must divide KDA num_heads; K/V head dimensions must agree.")
+            self.cp_runtime = runtime
+            return "kda"
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            cache_params: object | None = None,
+            **kwargs: object,
+        ) -> torch.Tensor:
+            """Run CP training; cache and pre-packed sequences are excluded."""
+            if cache_params is not None or kwargs.get("cu_seqlens") is not None or kwargs.get("use_cache"):
+                raise ValueError("Hybrid P2P KDA supports training without cache or packed cu_seqlens.")
+            attention_mask = kwargs.get("cp_padding_mask", attention_mask)
+            runtime = self.cp_runtime
+            if hidden_states.ndim != 3 or hidden_states.shape[0] != 1:
+                raise ValueError("Hybrid P2P KDA requires [1, local_sequence, hidden].")
+            if attention_mask is not None and attention_mask.shape != hidden_states.shape[:2]:
+                raise ValueError("KDA attention_mask must be the local [batch, sequence] padding mask.")
+            original = hidden_states
+            if attention_mask is not None:
+                hidden_states = hidden_states * attention_mask[..., None]
+            local_length = hidden_states.shape[1]
+            partition = runtime.layout(local_length, zigzag=zigzag)
+            ulysses_size = dist.get_world_size(runtime.ulysses_group)
+            ulysses_rank = dist.get_rank(runtime.ulysses_group)
+            local_heads = self.num_heads // ulysses_size
+            head_start, head_end = ulysses_rank * local_heads, (ulysses_rank + 1) * local_heads
+            state_size = partition.cp_size // ulysses_size
+            state_rank = partition.rank // ulysses_size
+            if partition.zigzag and local_length % 2:
+                raise ValueError("Zigzag local sequence must contain two equal intervals; pad before sharding.")
+            state_length = local_length * ulysses_size
+            context = KdaCPContext(
+                runtime.state_group,
+                state_rank,
+                state_size,
+                state_length // (2 if partition.zigzag else 1),
+                partition.zigzag,
+            )
+            query, key, value = (projection(hidden_states) for projection in (self.q_proj, self.k_proj, self.v_proj))
+            decay = self.f_b_proj(self.f_a_proj(hidden_states))
+            beta = self.b_proj(hidden_states).float().sigmoid()
+            query, key, value, decay, beta = (
+                partition.reorder_ulysses(ulysses_all_to_all(tensor, runtime.ulysses_group, 2, 1), ulysses_size)
+                for tensor in (query, key, value, decay, beta)
+            )
+            query, key, value = (
+                self._cp_convolution(
+                    tensor,
+                    conv,
+                    context,
+                    head_start * self.head_dim,
+                    head_end * self.head_dim,
+                )
+                for tensor, conv in (
+                    (query, self.q_conv1d),
+                    (key, self.k_conv1d),
+                    (value, self.v_conv1d),
+                )
+            )
+            shape = (1, state_length, local_heads, self.head_dim)
+            output = chunk_kda_p2p(
+                query.reshape(shape),
+                key.reshape(shape),
+                value.reshape(shape),
+                decay.reshape(shape),
+                beta,
+                self.A_log[head_start:head_end],
+                self.dt_bias.reshape(self.num_heads, -1)[head_start:head_end].reshape(-1),
+                state_context=context,
+                lower_bound=self.gate_lower_bound,
+            ).flatten(2)
+            output = partition.reorder_ulysses(output, ulysses_size, inverse=True)
+            output = ulysses_all_to_all(output, runtime.ulysses_group, 1, 2).reshape(
+                1, local_length, self.num_heads, self.head_dim
+            )
+            gate = (
+                self.g_proj(hidden_states) if self.use_full_rank_gate else self.g_b_proj(self.g_a_proj(hidden_states))
+            )
+            output = self.o_proj(self.o_norm(output, gate.reshape_as(output)).flatten(2))
+            return output if attention_mask is None else output * attention_mask[..., None].to(original.dtype)
+
+        def _cp_convolution(
+            self,
+            projected: torch.Tensor,
+            conv: nn.Module,
+            context: KdaCPContext,
+            start: int,
+            end: int,
+        ) -> torch.Tensor:
+            """Apply this model convolution to intervals with exchanged history."""
+            weight = conv.weight[start:end].squeeze(1)
+            bias = None if conv.bias is None else conv.bias[start:end]
+            parts = torch.stack(projected[0].chunk(len(context.slots)))
+            prefix = exchange_causal_history(parts, weight.shape[-1] - 1, context)
+            inputs = torch.cat((prefix, parts), dim=1) if prefix.shape[1] else parts
+            output = F.conv1d(inputs.transpose(1, 2), weight.unsqueeze(1), bias, groups=weight.shape[0]).transpose(1, 2)
+            if conv.activation in ("silu", "swish"):
+                output = F.silu(output)
+            return output.flatten(0, 1).unsqueeze(0)
+
+    class KimiHybridCPMLAAttention(mla_base):
+        """MLA subclass using the complete CP domain and shared token coordinates."""
+
+        def configure_hybrid_cp(self, runtime: HybridCPRuntime) -> str:
+            """Bind the selected implemented MLA backend."""
+            if mla_backend == "ulysses" and self.num_heads % dist.get_world_size(runtime.cp_group):
+                raise ValueError("MLA Ulysses requires num_attention_heads divisible by the complete CP size.")
+            self.cp_runtime = runtime
+            return "mla"
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor | None = None,
+            past_key_values: object | None = None,
+            **kwargs: object,
+        ) -> torch.Tensor:
+            """Compute global causal MLA attention from locally projected Q/K/V."""
+            if past_key_values is not None:
+                raise ValueError("Hybrid P2P MLA does not support cached decoding.")
+            padding_mask = kwargs.get("cp_padding_mask")
+            runtime = self.cp_runtime
+            batch, length = hidden_states.shape[:2]
+            partition = runtime.layout(length, zigzag=zigzag)
+            query = (
+                self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+                if self.q_lora_rank is not None
+                else self.q_proj(hidden_states)
+            )
+            query = query.reshape(batch, length, self.num_heads, self.q_head_dim).transpose(1, 2)
+            compressed = self.kv_a_proj_with_mqa(hidden_states)
+            compressed, rotary_key = compressed.split((self.kv_lora_rank, self.qk_rope_head_dim), -1)
+            expanded = (
+                self.kv_b_proj(self.kv_a_layernorm(compressed))
+                .reshape(batch, length, self.num_heads, -1)
+                .transpose(1, 2)
+            )
+            key, value = expanded.split((self.qk_nope_head_dim, self.v_head_dim), -1)
+            key = torch.cat((key, rotary_key[:, None].expand(-1, self.num_heads, -1, -1)), -1)
+            if padding_mask is None:
+                padding_mask = torch.ones((batch, length), device=hidden_states.device, dtype=torch.bool)
+            masks = [torch.empty_like(padding_mask) for _ in range(partition.cp_size)]
+            dist.all_gather(masks, padding_mask.contiguous(), group=runtime.cp_group)
+            global_valid = partition.restore_gathered(torch.cat(masks, 1), 1).bool()
+            if mla_backend == "ulysses":
+                query, key, value = (
+                    ulysses_all_to_all(tensor, runtime.cp_group, 1, 2) for tensor in (query, key, value)
+                )
+                query_positions = torch.arange(partition.padded_length, device=hidden_states.device)
+            else:
+                key, value = (
+                    partition.restore_gathered(kv_allgather(tensor, runtime.cp_group, 2), 2) for tensor in (key, value)
+                )
+                query_positions = torch.cat(
+                    [torch.arange(lo, hi, device=hidden_states.device) for lo, hi in partition.owned_intervals]
+                )
+            causal_fast_path = mla_backend == "ulysses" and bool(global_valid.all())
+            mask = None
+            if not causal_fast_path:
+                key_positions = torch.arange(partition.padded_length, device=hidden_states.device)
+                allowed = (query_positions[:, None] >= key_positions[None, :])[None, None] & global_valid[
+                    :, None, None, :
+                ]
+                mask = torch.zeros(allowed.shape, device=query.device, dtype=query.dtype).masked_fill(
+                    ~allowed, torch.finfo(query.dtype).min
+                )
+            original_value_dim = value.shape[-1]
+            if value.shape[-1] < query.shape[-1]:
+                value = F.pad(value, (0, query.shape[-1] - value.shape[-1]))
+            output = flash_attention_forward(
+                self,
+                query,
+                key,
+                value,
+                mask,
+                scaling=self.scaling,
+                dropout=self.attention_dropout if self.training else 0.0,
+                is_causal=causal_fast_path,
+            )[0][..., :original_value_dim]
+            if mla_backend == "ulysses":
+                output = ulysses_all_to_all(output, runtime.cp_group, 1, 2)
+            output = output.reshape(batch, length, -1)
+            if self.use_output_gate:
+                output = output * self.g_proj(hidden_states).sigmoid()
+            return self.o_proj(output) * padding_mask[..., None]
+
+    class KimiK3HybridCP(model_base):
+        """Fuse globally, shard once, and run KDA/MLA subclasses with CP loss."""
+
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            for layer in self.language_model.model.layers:
+                attention = layer.self_attn
+                adapter = KimiHybridCPDeltaAttention if isinstance(attention, kda_base) else KimiHybridCPMLAAttention
+                layer.self_attn = adapter(config.text_config, attention.layer_idx)
+
+        def configure_hybrid_cp(self, runtime: HybridCPRuntime) -> str:
+            """Bind post-fusion input sharding and locally normalized model loss."""
+            if getattr(self, "enable_chunk_loss", False):
+                raise ValueError("Hybrid P2P Kimi K3 does not support chunk loss.")
+            self.cp_runtime = runtime
+            return "model"
+
+        def forward(
+            self,
+            input_ids: torch.Tensor | None = None,
+            pixel_values: torch.Tensor | list[torch.Tensor] | None = None,
+            grid_thws: torch.Tensor | None = None,
+            attention_mask: torch.Tensor | None = None,
+            position_ids: torch.Tensor | None = None,
+            past_key_values: object | None = None,
+            inputs_embeds: torch.Tensor | None = None,
+            labels: torch.Tensor | None = None,
+            use_cache: bool | None = None,
+            output_attentions: bool | None = None,
+            output_hidden_states: bool | None = None,
+            return_dict: bool | None = None,
+            cache_position: torch.Tensor | None = None,
+            num_items_in_batch: torch.Tensor | None = None,
+            **kwargs: object,
+        ) -> LlavaCausalLMOutputWithPast | tuple:
+            """Fuse images before CP; labels stay global until shifted in the loss."""
+            if past_key_values is not None or cache_position is not None or use_cache:
+                raise ValueError("Hybrid P2P Kimi K3 supports training without cache inputs.")
+            if kwargs.get("cu_seqlens") is not None:
+                raise ValueError("Packed input sequences are not supported by this adapter.")
+            if inputs_embeds is None:
+                inputs_embeds = self.get_input_embeddings()(input_ids)
+                if pixel_values is not None and len(pixel_values):
+                    features = self._extract_image_features(pixel_values, grid_thws)
+                    if self.mm_projector:
+                        features = self.mm_projector(features)
+                    inputs_embeds, attention_mask, labels, position_ids = self._merge_input_ids_with_image_features(
+                        features,
+                        inputs_embeds.to(features[0].dtype),
+                        input_ids,
+                        attention_mask,
+                        labels,
+                    )
+            elif pixel_values is not None and len(pixel_values):
+                raise ValueError("pixel_values cannot be merged with supplied inputs_embeds.")
+            if inputs_embeds.shape[0] != 1:
+                raise ValueError("Hybrid P2P Kimi K3 requires batch size 1.")
+            if attention_mask is None:
+                attention_mask = torch.ones(
+                    inputs_embeds.shape[:2],
+                    device=inputs_embeds.device,
+                    dtype=torch.long,
+                )
+            valid_mask = attention_mask[0].bool()
+            valid_segments = valid_mask[0].int() + (valid_mask[1:] & ~valid_mask[:-1]).sum()
+            if valid_segments > 1:
+                raise ValueError(
+                    "KDA P2P supports a single valid token interval with left/right padding, not interior holes."
+                )
+            if labels is not None:
+                labels = labels.masked_fill(attention_mask.to(labels.device) == 0, self.config.ignore_index)
+            if position_ids is None:
+                position_ids = (attention_mask.long().cumsum(-1) - 1).masked_fill(attention_mask == 0, 0)
+            runtime = self.cp_runtime
+            inputs_embeds, position_ids, attention_mask = shard_fused_sequence_inputs(
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                group=runtime.cp_group,
+                zigzag=zigzag,
+            )
+            # Call the backbone directly: the reference LM wrapper drops **kwargs.
+            outputs = self.language_model.model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                cp_padding_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+            )
+            logits = self.language_model.lm_head(outputs.last_hidden_state).float()
+            loss = (
+                None
+                if labels is None
+                else cp_compute_lm_loss(
+                    logits,
+                    labels,
+                    runtime.cp_group,
+                    num_items_in_batch=num_items_in_batch,
+                    ignore_index=self.config.ignore_index,
+                    zigzag=zigzag,
+                )
+            )
+            if return_dict is False:
+                result = (
+                    logits,
+                    outputs.past_key_values,
+                    outputs.hidden_states,
+                    outputs.attentions,
+                )
+                return (loss,) + result if loss is not None else result
+            return LlavaCausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
+
+    return KimiK3HybridCP

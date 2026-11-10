@@ -236,6 +236,8 @@ class TPPlanConfig:
 
 @dataclass
 class CPPlanConfig:
+    """Legacy CP targets and KDA/MLA backend selection."""
+
     # None means the key is not provided; an explicit empty list opts out of
     # patching for models whose Ulysses forwards are built into the modeling
     # classes (validate_cp_config keeps the two cases apart).
@@ -243,8 +245,19 @@ class CPPlanConfig:
     kcp_function_patches: List[Dict[str, Any]] = field(default_factory=list)
     kv_allgather_function_patches: List[Dict[str, Any]] = field(default_factory=list)
     loss_function_patches: List[Dict[str, Any]] = field(default_factory=list)
+    kda_backend: str = "kcp"  # hybrid_p2p selects the Hybrid P2P subclass path.
+    mla_backend: str | None = None
     qsa_cp_query_chunk_size: Optional[int] = None
     qsa_sparse_gather: Optional[bool] = None
+
+
+def uses_hybrid_cp_zigzag_layout(cp_plan: CPPlanConfig | None) -> bool:
+    """Return whether a normalized CP plan selects Hybrid CP front/back shards.
+
+    A missing plan selects contiguous shards. Non-empty plans must have passed
+    FSDPTurboConfig validation; this query neither normalizes nor mutates them.
+    """
+    return cp_plan is not None and cp_plan.kda_backend == "hybrid_p2p" and cp_plan.mla_backend != "ulysses"
 
 
 @dataclass
@@ -442,6 +455,7 @@ class DistributedConfig:
     vp_plan: VPPlanConfig = None
     # Give independent parallel dimensions separate communication groups.
     split_com_groups: bool = False
+    kda_p2p_parallel_size: int = 1
 
 
 @dataclass
@@ -810,10 +824,12 @@ class FSDPTurboConfig:
     def validate_cp_config(self) -> None:
         """Validate native CP or normalize function patches and parallel constraints."""
         kcp_parallel_size = self.distributed.kcp_parallel_size
+        kda_p2p_parallel_size = self.distributed.kda_p2p_parallel_size
         ulysses_parallel_size = self.distributed.ulysses_parallel_size
         for field_name, size in (
             ("kv_allgather_parallel_size", self.distributed.kv_allgather_parallel_size),
             ("kcp_parallel_size", kcp_parallel_size),
+            ("kda_p2p_parallel_size", kda_p2p_parallel_size),
             ("ulysses_parallel_size", ulysses_parallel_size),
         ):
             if isinstance(size, bool) or not isinstance(size, int) or size < 1:
@@ -885,8 +901,10 @@ class FSDPTurboConfig:
             for spec in getattr(self.distributed.cp_plan, f"{axis}_function_patches")
             if spec["type"] in {"compressor_full_attention", "compressor_full_attention_transposed"}
         ]
-        if deepseek_compressor_specs and kcp_parallel_size > 1:
-            raise ValueError("DeepSeek-V4 compressor attention CP is not supported on the KCP axis.")
+        if deepseek_compressor_specs and (kcp_parallel_size > 1 or kda_p2p_parallel_size > 1):
+            raise ValueError(
+                "DeepSeek-V4 compressor attention CP is not supported on the KCP axis or the KDA P2P axis."
+            )
         if deepseek_compressor_specs and self.distributed.kv_allgather_parallel_size > 1 and ulysses_parallel_size > 1:
             raise ValueError(
                 "DeepSeek-V4 compressor CP supports only one sequence-parallel axis at a time: "
@@ -916,20 +934,20 @@ class FSDPTurboConfig:
                 )
             ):
                 raise ValueError(
+                    "distributed.kv_allgather_parallel_size > 1: "
                     "Native KV-AllGather CP without kv_allgather_function_patches "
                     "cannot be combined with function or module patches."
                 )
-
-        compressor_sparse_patches = [
-            spec
-            for spec in self.distributed.cp_plan.kv_allgather_function_patches
-            if spec["type"] == "compressor_sparse_attention"
-        ]
-        if compressor_sparse_patches:
-            if len(self.distributed.cp_plan.kv_allgather_function_patches) != 1:
-                raise ValueError("DeepSeek-V4.1 CP requires exactly one compressor sparse attention patch.")
-            if ulysses_parallel_size != 1 or kcp_parallel_size != 1 or self.distributed.tensor_parallel_size != 1:
-                raise ValueError("DeepSeek-V4.1 KV-AllGather requires Ulysses=KCP=TP=1.")
+            if any(
+                size != 1
+                for size in (
+                    ulysses_parallel_size,
+                    kcp_parallel_size,
+                    kda_p2p_parallel_size,
+                    self.distributed.tensor_parallel_size,
+                )
+            ):
+                raise ValueError("DeepSeek-V4.1 KV-AllGather requires Ulysses=KCP=TP=1 and kda_p2p_parallel_size=1.")
             if self.memory.chunk_batch:
                 raise ValueError("DeepSeek-V4.1 CP does not support chunk_batch.")
             if self.data.sfa_layout == "TND":
@@ -950,32 +968,16 @@ class FSDPTurboConfig:
             ):
                 raise ValueError("DeepSeek-V4.1 CP requires all fused flags and Triton RoPE disabled.")
 
-        if kcp_parallel_size > 1 and ulysses_parallel_size > 1:
-            raise ValueError(
-                "distributed.kcp_parallel_size and distributed.ulysses_parallel_size "
-                "cannot be enabled together; KCP already applies Ulysses to MLA on "
-                "the KCP sequence group."
-            )
-        if kcp_parallel_size > 1:
-            if not self.distributed.cp_plan.kcp_function_patches:
-                raise ValueError("distributed.cp_plan.kcp_function_patches must be set when KCP is enabled.")
-            if self.distributed.tensor_parallel_size != 1:
-                raise ValueError(
-                    "KDA state context parallelism requires distributed.tensor_parallel_size == 1; "
-                    f"got {self.distributed.tensor_parallel_size}."
-                )
-            if self.distributed.kv_allgather_parallel_size != 1:
-                raise ValueError(
-                    "KDA state context parallelism requires distributed.kv_allgather_parallel_size == 1; "
-                    f"got {self.distributed.kv_allgather_parallel_size}."
-                )
-            if self.data.batch_size != 1:
-                raise ValueError(
-                    "KDA state context parallelism requires micro batch size 1 "
-                    f"(data.batch_size == 1); got {self.data.batch_size}."
-                )
-        ulysses_patches = self.distributed.cp_plan.ulysses_function_patches
-        if ulysses_parallel_size > 1 and not ulysses_patches and not ulysses_patches_specified:
+        self._validate_kda_cp_config()
+        plan = self.distributed.cp_plan
+        hybrid_cp_enabled = plan.kda_backend == "hybrid_p2p"
+        if (
+            not hybrid_cp_enabled
+            and kcp_parallel_size == 1
+            and ulysses_parallel_size > 1
+            and not plan.ulysses_function_patches
+            and not ulysses_patches_specified
+        ):
             raise ValueError(
                 "distributed.cp_plan.ulysses_function_patches must be set when Ulysses is enabled; "
                 "set it to [] only when the model's Ulysses forwards are built into the modeling classes."
@@ -992,15 +994,76 @@ class FSDPTurboConfig:
                 )
 
         context_parallel_active = (
-            kcp_parallel_size > 1 or ulysses_parallel_size > 1 or self.distributed.kv_allgather_parallel_size > 1
+            kcp_parallel_size > 1
+            or kda_p2p_parallel_size > 1
+            or ulysses_parallel_size > 1
+            or self.distributed.kv_allgather_parallel_size > 1
         )
-        if context_parallel_active and self.memory.chunk_batch:
+        if self.memory.chunk_batch and (context_parallel_active or hybrid_cp_enabled):
+            if hybrid_cp_enabled:
+                raise ValueError("Hybrid P2P does not support memory.chunk_batch.")
             raise ValueError(
                 "memory.chunk_batch cannot be combined with context parallelism "
-                "(kcp_parallel_size/ulysses_parallel_size/kv_allgather_parallel_size > 1): "
+                "(kcp_parallel_size/kda_p2p_parallel_size/ulysses_parallel_size/kv_allgather_parallel_size > 1): "
                 "both features take over module forwards on the same sequence and the "
                 "combination is undefined."
             )
+
+    def _validate_kda_cp_config(self) -> None:
+        """Normalize KDA/MLA backends and validate state-CP combinations.
+
+        Called after common CP axes and function patches have been normalized.
+        Generic Ulysses patch and chunk-batch checks stay in validate_cp_config.
+        """
+        kcp_parallel_size = self.distributed.kcp_parallel_size
+        kda_p2p_parallel_size = self.distributed.kda_p2p_parallel_size
+        ulysses_parallel_size = self.distributed.ulysses_parallel_size
+        plan = self.distributed.cp_plan
+        plan.mla_backend = "ulysses" if plan.mla_backend is None else plan.mla_backend
+        if plan.mla_backend not in ("ulysses", "kv_allgather"):
+            raise ValueError(
+                "distributed.cp_plan.mla_backend must be ulysses or kv_allgather; ring is not implemented."
+            )
+
+        hybrid_cp_enabled = plan.kda_backend == "hybrid_p2p"
+        if hybrid_cp_enabled:
+            if kcp_parallel_size != 1:
+                raise ValueError(
+                    "Hybrid P2P requires distributed.kcp_parallel_size == 1; "
+                    "set distributed.kda_p2p_parallel_size for its P2P axis."
+                )
+            # Only the supported Hybrid P2P combinations differ from legacy CP.
+            if self.memory.chunk_loss:
+                raise ValueError("Hybrid P2P does not support memory.chunk_loss; use the legacy Kimi K3 CP path.")
+            if self.module_patches:
+                raise ValueError("Hybrid P2P uses model subclasses; remove legacy module_patches.")
+            if any(size & (size - 1) for size in (ulysses_parallel_size, kda_p2p_parallel_size)):
+                raise ValueError("Hybrid P2P axis sizes must be powers of two (including 1).")
+        else:
+            if kda_p2p_parallel_size != 1:
+                raise ValueError("distributed.kda_p2p_parallel_size > 1 requires kda_backend=hybrid_p2p.")
+            if plan.mla_backend != "ulysses":
+                raise ValueError("mla_backend=kv_allgather requires kda_backend=hybrid_p2p.")
+            if ulysses_parallel_size > 1 and kcp_parallel_size > 1:
+                raise ValueError("2D Ulysses-KCP AllGather is retired; select kda_backend=hybrid_p2p.")
+            if kcp_parallel_size == 1 and plan.kda_backend != "kcp":
+                raise ValueError("distributed.cp_plan.kda_backend requires kcp_parallel_size > 1.")
+            if kcp_parallel_size > 1:
+                from fsdp_turbo.ops.kcp import get_kcp_kda_backend
+
+                get_kcp_kda_backend(plan.kda_backend)
+                if not plan.kcp_function_patches:
+                    raise ValueError("distributed.cp_plan.kcp_function_patches must be set when KCP is enabled.")
+
+        # Reuse the existing KDA state-CP limits for both execution paths.
+        if kcp_parallel_size > 1 or hybrid_cp_enabled:
+            for requirement, size in (
+                ("distributed.tensor_parallel_size == 1", self.distributed.tensor_parallel_size),
+                ("distributed.kv_allgather_parallel_size == 1", self.distributed.kv_allgather_parallel_size),
+                ("micro batch size 1 (data.batch_size == 1)", self.data.batch_size),
+            ):
+                if size != 1:
+                    raise ValueError(f"KDA state context parallelism requires {requirement}; got {size}.")
 
     def validate_ep_config(self) -> None:
         """expert parallelize plan

@@ -1,10 +1,13 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Model-agnostic context-parallel sequence sharding helpers."""
 
+from collections.abc import Mapping, Sequence
+
 import torch
 import torch.distributed as dist
 
-from .communication import split_forward_gather_backward
+from .communication import load_balanced_split_forward_gather_backward, split_forward_gather_backward
+from .sequence_partition import SequencePartitionPlan, pad_tensor_to_length
 from .utils import cal_split_sizes
 
 
@@ -24,28 +27,26 @@ def sequence_parallel_range(seq_len: int, group):
     return start, start + sizes[rank]
 
 
-def pad_tensor_to_multiple(tensor, multiple: int, dim: int, pad_value=0):
-    """Right-pad ``tensor`` so ``dim`` is divisible by ``multiple``."""
+def pad_tensor_to_multiple(
+    tensor: torch.Tensor,
+    multiple: int,
+    dim: int,
+    pad_value: float = 0,
+) -> torch.Tensor:
+    """Right-pad an axis to a multiple using the shared large-tensor-safe helper."""
     if multiple <= 1:
         return tensor
-    dim %= tensor.dim()
-    pad_size = (multiple - tensor.size(dim) % multiple) % multiple
-    if pad_size == 0:
-        return tensor
-    shape = list(tensor.shape)
-    shape[dim] += pad_size
-    out = torch.empty(shape, dtype=tensor.dtype, device=tensor.device)
-    out.narrow(dim, tensor.size(dim), pad_size).fill_(pad_value)
-    per_row = max(1, tensor.numel() // tensor.size(dim))
-    chunk = max(1, (1 << 29) // per_row)
-    for start in range(0, tensor.size(dim), chunk):
-        end = min(start + chunk, tensor.size(dim))
-        out.narrow(dim, start, end - start).copy_(tensor.narrow(dim, start, end - start))
-    return out
+    padded_length = (tensor.size(dim) + multiple - 1) // multiple * multiple
+    return pad_tensor_to_length(tensor, dim, padded_length, pad_value)
 
 
-def pad_tensor_to_group(tensor, group, dim: int, pad_value=0):
-    """Right-pad ``tensor`` so ``dim`` is divisible by the group size."""
+def pad_tensor_to_group(
+    tensor: torch.Tensor,
+    group: dist.ProcessGroup,
+    dim: int,
+    pad_value: float = 0,
+) -> torch.Tensor:
+    """Right-pad an axis to the group size without duplicating padding logic."""
     return pad_tensor_to_multiple(tensor, dist.get_world_size(group), dim, pad_value)
 
 
@@ -64,14 +65,15 @@ def split_tensor_to_group(tensor, group, dim: int = 1):
 
 
 def split_sequence_batch(
-    batch,
-    group,
+    batch: Mapping[str, object],
+    group: dist.ProcessGroup,
     split_dim: int = 1,
-    pad_values=None,
+    pad_values: Mapping[str, float] | None = None,
     *,
-    sequence_keys=("input_ids", "attention_mask", "mm_token_type_ids"),
+    sequence_keys: Sequence[str] = ("input_ids", "attention_mask", "mm_token_type_ids"),
     build_position_ids: bool = False,
-):
+    zigzag: bool = False,
+) -> dict[str, object]:
     """Pad and split model inputs once over the complete CP group.
 
     ``labels`` deliberately remain complete and unshifted. The CP-aware loss
@@ -87,19 +89,18 @@ def split_sequence_batch(
 
     pad_values = DEFAULT_SEQUENCE_PAD_VALUES if pad_values is None else pad_values
     seq_len = input_ids.size(split_dim)
+    partition = SequencePartitionPlan(seq_len, dist.get_world_size(group), dist.get_rank(group), zigzag)
     for key in set(sequence_keys):
         value = batch.get(key)
         if not isinstance(value, torch.Tensor) or value.dim() <= split_dim:
             continue
         if value.size(split_dim) != seq_len:
             continue
-        value = pad_tensor_to_group(value, group, split_dim, pad_values.get(key, 0))
-        batch[key] = split_tensor_to_group(value, group, split_dim)
+        batch[key] = partition.pad_and_shard_tensor(value, split_dim, pad_values.get(key, 0))
 
     position_ids = batch.get("position_ids")
     if isinstance(position_ids, torch.Tensor) and position_ids.size(-1) == seq_len:
-        position_ids = pad_tensor_to_group(position_ids, group, dim=-1, pad_value=0)
-        batch["position_ids"] = split_tensor_to_group(position_ids, group, dim=-1)
+        batch["position_ids"] = partition.pad_and_shard_tensor(position_ids, dim=-1)
     return batch
 
 
@@ -108,10 +109,15 @@ def shard_fused_sequence_inputs(
     inputs_embeds: torch.Tensor,
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor | None,
-    group,
+    group: dist.ProcessGroup,
+    zigzag: bool = False,
     gather_backward: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Pad and shard a complete fused multimodal sequence before the LM."""
+    """Pad and shard fused multimodal inputs in contiguous or front/back order.
+
+    ``gather_backward`` reconstructs complete embedding gradients with the
+    existing CP split/gather scaling, including front/back layout restoration.
+    """
     if inputs_embeds.dim() != 3:
         raise ValueError(
             f"Fused CP inputs_embeds must have shape [batch, sequence, hidden], got {tuple(inputs_embeds.shape)}."
@@ -128,18 +134,20 @@ def shard_fused_sequence_inputs(
         )
 
     world_size = dist.get_world_size(group)
-    if attention_mask is None and inputs_embeds.size(1) % world_size:
+    partition = SequencePartitionPlan(inputs_embeds.size(1), world_size, dist.get_rank(group), zigzag)
+    if attention_mask is None and partition.padded_length != inputs_embeds.size(1):
         attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
 
-    inputs_embeds = pad_tensor_to_group(inputs_embeds, group, dim=1, pad_value=0)
     if gather_backward:
-        split_sizes = cal_split_sizes(inputs_embeds.size(1), world_size)
-        inputs_embeds = split_forward_gather_backward(inputs_embeds, group, dim=1, split_sizes=split_sizes)
+        inputs_embeds = pad_tensor_to_length(inputs_embeds, 1, partition.padded_length)
+        if zigzag:
+            inputs_embeds = load_balanced_split_forward_gather_backward(inputs_embeds, group, dim=1)
+        else:
+            split_sizes = cal_split_sizes(partition.padded_length, world_size)
+            inputs_embeds = split_forward_gather_backward(inputs_embeds, group, dim=1, split_sizes=split_sizes)
     else:
-        inputs_embeds = split_tensor_to_group(inputs_embeds, group, dim=1)
-    position_ids = split_tensor_to_group(pad_tensor_to_group(position_ids, group, dim=-1, pad_value=0), group, dim=-1)
+        inputs_embeds = partition.pad_and_shard_tensor(inputs_embeds)
+    position_ids = partition.pad_and_shard_tensor(position_ids, dim=-1)
     if attention_mask is not None:
-        attention_mask = split_tensor_to_group(
-            pad_tensor_to_group(attention_mask, group, dim=1, pad_value=0), group, dim=1
-        )
+        attention_mask = partition.pad_and_shard_tensor(attention_mask)
     return inputs_embeds, position_ids, attention_mask
