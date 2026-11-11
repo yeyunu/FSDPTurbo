@@ -84,6 +84,17 @@ class TrainerContextParallelTests(unittest.TestCase):
 
         self.assertIs(trainer._split_batch_for_context_parallel(batch), batch)
 
+    def test_packed_tnd_runtime_is_found_below_the_parallelism_wrapper(self):
+        trainer = self._trainer()
+        runtime = SimpleNamespace(split_batch=mock.Mock(return_value={"split": True}))
+        trainer.model.model = SimpleNamespace(tnd_context_parallel=runtime)
+        batch = {"input_ids": torch.arange(4).view(1, 4), "sfa_layout": "TND"}
+
+        output = trainer._split_batch_for_context_parallel(batch)
+
+        self.assertEqual(output, {"split": True})
+        runtime.split_batch.assert_called_once_with(batch)
+
     @mock.patch("transformers.AutoProcessor.from_pretrained")
     def test_multimodal_trainer_builds_processor_and_passes_tokenizer(self, from_pretrained):
         processor = SimpleNamespace(tokenizer=object())

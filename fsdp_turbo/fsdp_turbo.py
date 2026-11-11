@@ -125,7 +125,8 @@ class FSDPTurbo(torch.nn.Module):
         # well (Ulysses size 1); the size-1 Ulysses group makes its all-to-all
         # a no-op while the flattened CP group still spans KV ranks.
         cp_enabled = self.parallel_state.get_cp_group_size() > 1
-        if self.parallel_state.get_kvallgather_group_size() > 1:
+        # Packed TND installs even at one KV rank; other CP modes need >1.
+        if cp_plan.tnd_enabled or self.parallel_state.get_kvallgather_group_size() > 1:
             self.model = kv_allgather_context_parallelize_modules(
                 self.model,
                 self.parallel_state.get_kvallgather_group(),

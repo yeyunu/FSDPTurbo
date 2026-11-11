@@ -17,6 +17,7 @@ from fsdp_turbo.ops.cpu.engram import engram_backward_cpu, engram_forward_cpu, e
 from fsdp_turbo.ops.cpu.fused_attention import npu_fusion_attention_cpu
 from fsdp_turbo.ops.cpu.grouped_matmul import grouped_matmul_cpu, w4a16_grouped_matmul_cpu
 from fsdp_turbo.ops.cpu.grouped_matmul_mc2 import all2all_grouped_matmul_cpu, grouped_matmul_all2all_cpu
+from fsdp_turbo.ops.cpu.lightning_indexer import fused_lightning_indexer_cpu
 from fsdp_turbo.ops.cpu.lightning_indexer_score import lightning_indexer_score_torch
 from fsdp_turbo.ops.cpu.moonep_grouped_matmul import (
     moonep_grouped_matmul_cpu,
@@ -69,6 +70,7 @@ __all__ = [
     'all2all_grouped_matmul_cpu',
     'grouped_matmul_all2all_cpu',
     'lightning_indexer_score_torch',
+    'fused_lightning_indexer_cpu',
     'moonep_grouped_matmul_cpu',
     'moonep_grouped_matmul_dgrad_cpu',
     'moonep_grouped_matmul_wgrad_cpu',

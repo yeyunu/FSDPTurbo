@@ -88,7 +88,7 @@ class Transformer(nn.Module):
     FSDPTurbo owns distributed sharding. The tokenizer only feeds the Engram token map.
     """
 
-    def __init__(self, args: ModelArgs, tokenizer=None):
+    def __init__(self, args: ModelArgs, tokenizer=None, attention_cls=None, hash_state_cls=None):
         if args.dtype != "bf16" or args.expert_dtype is not None:
             raise ValueError("DeepSeek-V4.1 training requires dtype='bf16' and expert_dtype=None.")
         super().__init__()
@@ -97,11 +97,14 @@ class Transformer(nn.Module):
         self.norm_eps = args.norm_eps
         self.hc_eps = args.hc_eps
         self.engram_layout = EngramLayout.from_args(args)
+        hash_state_cls = hash_state_cls or NgramHashState
         self.engram_hash = (
-            NgramHashState(args, self.engram_layout, tokenizer) if self.engram_layout is not None else None
+            hash_state_cls(args, self.engram_layout, tokenizer) if self.engram_layout is not None else None
         )
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)
-        self.layers = nn.ModuleList([Block(layer_id, args, self.engram_layout) for layer_id in range(args.n_layers)])
+        self.layers = nn.ModuleList(
+            [Block(layer_id, args, self.engram_layout, attention_cls) for layer_id in range(args.n_layers)]
+        )
         if self.engram_hash is not None:
             for layer in self.layers:
                 if layer.engram is not None:
@@ -197,6 +200,9 @@ class Transformer(nn.Module):
         if engram_hashes is None:
             if self.engram_hash is None:
                 engram_hashes = None
+            elif getattr(self, "cp_runtime", None) is not None and self.cp_runtime.plan is not None:
+                # Hash local rows against the document halo, not a stream this rank lacks.
+                engram_hashes = self.cp_runtime.engram_hashes(self.engram_hash, input_ids, engram_mask)
             elif cu_seqlens is not None and cu_seqlens.numel() > 2:
                 boundaries = cu_seqlens.tolist()
                 engram_hashes = torch.cat(

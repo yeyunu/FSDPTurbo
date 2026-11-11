@@ -40,6 +40,7 @@ distributed:
 | `loss_function_patches` | 损失函数替换（如`causal_lm_loss`），保证CP切分后loss正确同步 |
 | `qsa_cp_query_chunk_size` | Qwen3.8 QSA在CP下的query分块大小；`null`使用模型默认值128 |
 | `qsa_sparse_gather` | Qwen3.8是否只收集QSA选中的KV；长序列建议设为`true` |
+| `cp_plan.tnd_exchange_style` | 仅packed-TND生效：`full_prefix`（默认）交换每个文档的完整KV前缀，`halo_prefix`只交换本地窗口仍能读到的尾部行，通信量更小 |
 
 ## 配合module_patches
 
@@ -149,3 +150,37 @@ DeepSeek-V4.1的KV AllGather CP将序列切成连续等长分片，Q保持本地
 - **Qwen3.8 CP及Kimi K3 Ulysses/KCP支持Chunk Loss**：CP下可同时设置`memory.chunk_loss: true`，此时损失走`cp_chunk_lm_loss`分块路径，不物化`[local_seq, vocab]`全量logits（1M序列、CP=8、vocab≈160k时约200 GiB/rank，分块后降至~2 GiB），详见[分块损失计算](./chunk_loss.md)。
 - **与微批次切分互斥**：开启CP后不能同时配置`memory.chunk_batch`，启动时会显式报错拒绝该组合，详见[微批次切分](./chunk_batch.md)。
 - **典型长序列配置**：对于32k+ 长序列训练，建议`ulysses_parallel_size=2~4`，配合重计算与FSDP2使用。
+- **KCP**：`kcp_parallel_size>1`启用（与Ulysses互斥）；MLA走Ulysses all-to-all，KDA跨rank传递递推状态，详见Kimi K3示例README。
+- **KCP**：`kcp_parallel_size>1`启用（与Ulysses互斥）；MLA走Ulysses all-to-all，KDA跨rank传递递推状态，详见Kimi K3示例README。
+
+## DeepSeek-V4.1 packed-TND上下文并行
+
+DeepSeek-V4.1支持两种上下文并行，二者互斥，由输入布局决定：
+
+| 布局 | 激活方式 | 切分方式 | 适用场景 |
+|---|---|---|---|
+| `BSND` | `kv_allgather_parallel_size > 1` 且模型支持`set_context_parallel_group` | 补齐到`cp_size × 压缩比LCM`后按序列等分 | 定长/右填充批次、图文批次 |
+| `TND` | `data.sfa_layout: "TND"`（`kv_allgather_parallel_size >= 1`，=1 即零切分参照臂） | 不补齐，按压缩比LCM对齐切分打包流，允许一个文档跨rank | 变长打包文本、打包图文批次 |
+
+packed-TND的关键约束与行为：
+
+1. 每个rank只持有打包流的一段，但会按文档组装它读到的KV前缀（`full_prefix`整段，或`halo_prefix`只取窗口仍可达的尾部行）。
+2. `actual_seq_len`必须严格递增且收于打包长度；每个文档长度必须能被所有生效压缩比整除；打包总长度必须能被压缩比LCM整除。
+3. `data.batch_size`必须为1，`ulysses_parallel_size`与`kcp_parallel_size`必须为1。
+4. loss在完整流上真心移位并按文档边界屏蔽，再按全局有效token数归一化，与BSND路径的归一化口径一致。
+5. 图文（image 批次）在 packed-TND 下由 `TNDVisionTransformer` 按本 rank 的切点取图像的本地交集写入，图像跨度可以跨 rank；`images` 与 `token_types` 必须成对出现。
+6. 与 `memory.recompute` 互斥：注意力重计算会重放前向，而 KV 源层按压缩比共用同一份运行时状态，重放读到的是后续源层覆盖后的值，因此配置初始化时直接报错拒绝该组合。
+7. 与 `memory.chunk_loss` 互斥：packed-TND 的损失在整条打包流上做全局移位与归一，分块头按本地块归一，两者描述的不是同一条流，因此配置初始化时直接报错拒绝该组合。
+
+```yaml
+data:
+  sfa_layout: "TND"
+  batch_size: 1
+distributed:
+  kv_allgather_parallel_size: 8
+  ulysses_parallel_size: 1
+  cp_plan:
+    tnd_exchange_style: "full_prefix"
+```
+
+packed-TND 的 runtime 由 `tnd.py` 统一装配：CP 阶段调用 `install_tnd_context_parallel(model, group, cp_plan)`，把 runtime 挂到模型后返回同一个模型；trainer 只需调用 `split_tnd_batch(model, batch)` 取本 rank 的切分，非 packed-TND 批次返回 `None`。runtime 的查找、布局判断和分段逻辑都留在 `tnd.py`，trainer 不感知模型包装层级。

@@ -233,6 +233,21 @@ class Indexer(torch.nn.Module):
         return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
 
+def canonical_index_order(indices: torch.Tensor) -> torch.Tensor:
+    """Sort valid indices ascending and move ``-1`` padding to the end.
+
+    The fused operator keeps its own top-k order; the eager path sorts. Sparse
+    attention accumulates in the given order, so canonicalising the valid
+    entries removes an order-only difference without putting ``-1`` at the head
+    (which the kernel rejects).
+    """
+    if indices.numel() == 0:
+        return indices
+    sentinel = torch.iinfo(indices.dtype).max
+    ordered = indices.masked_fill(indices < 0, sentinel).sort(dim=-1).values
+    return torch.where(ordered == sentinel, torch.full_like(ordered, -1), ordered)
+
+
 def select_candidate_blocks(
     logits: torch.Tensor, compress_lens: torch.Tensor | int, topk_blocks: int, block_size: int
 ) -> torch.Tensor:

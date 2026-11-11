@@ -215,8 +215,10 @@ class NgramHashState(nn.Module):
             source = self.cache[:batch].gather(1, (positions - shift).clamp_min(0))
             blocked = blocked | (positions < shift) | (source == self.DEAD)
             tokens.append(torch.where(blocked, self.pad_id, source))
-        tokens = torch.stack(tokens, dim=-1)  # [B, L, max_ngram_size]
+        return self._hash_tokens(torch.stack(tokens, dim=-1))
 
+    def _hash_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Hash ``[B, L, max_ngram_size]`` compressed ids into per-layer, per-head buckets."""
         # XOR the multiplied ids together one lookback at a time, so the running value after step i
         # is the hash of the (i+1)-gram; each lands in its own prime-sized bucket range
         products = tokens.unsqueeze(2) * self.multipliers  # [B, L, n_engram_layers, max_ngram_size]
@@ -225,6 +227,49 @@ class NgramHashState(nn.Module):
             rolling = torch.bitwise_xor(rolling, products[..., i])
             hashes.append(rolling.unsqueeze(-1) % self.primes[:, i - 1])
         return torch.cat(hashes, dim=-1) + self.offsets
+
+
+class CPNgramHashState(NgramHashState):
+    """N-gram hashing over a per-document halo instead of the complete stream.
+
+    The caller passes the tokens before ``q_lo`` (truncated at the document head)
+    and the document-local start, so the halo never leaks a neighbouring
+    document. Without a halo the vendored whole-stream path runs.
+    """
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        start_pos: int | None = None,
+        token_mask: torch.Tensor | None = None,
+        *,
+        halo_ids: torch.Tensor | None = None,
+        halo_mask: torch.Tensor | None = None,
+        q_lo: int | None = None,
+    ) -> torch.Tensor:
+        """Hash the local rows from the document halo, or the whole stream without one."""
+        if halo_ids is None:
+            return super().forward(input_ids, 0 if start_pos is None else start_pos, token_mask)
+
+        local = self.token_map[input_ids]
+        if token_mask is not None:
+            local = torch.where(token_mask, local, self.DEAD)
+        halo = self.token_map[halo_ids]
+        if halo_mask is not None:
+            halo = torch.where(halo_mask, halo, self.DEAD)
+        cache = torch.cat([halo, local], dim=1)
+        halo_len = halo.shape[1]
+        length = local.shape[1]
+        positions = (q_lo + torch.arange(length, device=input_ids.device)).expand_as(local)
+        offsets = halo_len + torch.arange(length, device=input_ids.device)
+        tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
+        for shift in range(self.layout.max_ngram_size):
+            index = (offsets - shift).clamp_min(0).expand_as(local)
+            source = cache.gather(1, index)
+            blocked = blocked | (positions < shift) | (source == self.DEAD)
+            tokens.append(torch.where(blocked, self.pad_id, source))
+        return self._hash_tokens(torch.stack(tokens, dim=-1))
 
 
 class Engram(nn.Module):

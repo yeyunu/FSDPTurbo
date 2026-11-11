@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
-"""Configure model-native KV-AllGather or legacy attention function wrappers."""
+"""Configure model-native KV-AllGather, a packed-TND runtime, or legacy wrappers."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from fsdp_turbo.distributed.context_parallel.kv_allgather.kv_allgather_attention
     get_kv_allgather_attention_fn,
     get_kv_allgather_compressor_attention_fn,
 )
+from fsdp_turbo.distributed.context_parallel.kv_allgather.tnd import install_tnd_context_parallel
 from fsdp_turbo.distributed.context_parallel.patch import apply_function_patch_specs
 
 if TYPE_CHECKING:
@@ -40,11 +41,12 @@ def kv_allgather_context_parallelize_modules(
 ) -> _Model:
     """Configure native CP through the model API, or install legacy wrappers.
 
-    Native models implement ``set_context_parallel_group(group)`` and pass the
-    group through their own forward call chain. Their API selects native CP
-    without a configuration switch; combining it with wrappers raises ValueError.
-    Models without that API must supply function patches or a TypeError is raised.
+    A model with ``set_context_parallel_group`` uses native CP; a model without
+    it needs function patches. Packed TND passes a runtime instead and is
+    exclusive with both, since either would split the batch twice.
     """
+    if getattr(cp_plan, "tnd_enabled", False):
+        return install_tnd_context_parallel(model, cp_group, cp_plan)
     set_group = getattr(model, "set_context_parallel_group", None)
     if callable(set_group):
         if cp_plan.kv_allgather_function_patches:

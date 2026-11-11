@@ -178,8 +178,8 @@ memory:
   # Preserve document-boundary masks while computing the loss in chunks.
   chunk_loss: false
   chunk_loss_size: 512
-  # V4.1 attention shares runtime state between layers. Recompute requires a
-  # model-specific state capture and is intentionally disabled in this adapter.
+  # V4.1 attention shares one runtime state slot per compression ratio, so a
+  # replay reads overwritten state; packed-TND rejects recompute.
   recompute: false
   recompute_plan: []
 

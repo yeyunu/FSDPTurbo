@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from fsdp_turbo.fsdp_turbo_config import load_config_from_yaml
+from fsdp_turbo.distributed.context_parallel.kv_allgather.tnd import is_tnd_batch
 from fsdp_turbo.models.deepseek.deepseek_v41 import (
     DeepSeekV41Processor,
     build_deepseek_v41_model,
@@ -55,7 +56,7 @@ class DeepseekV41Trainer(BaseTrainer):
     def prepare_batch(self, batch: _TrainingBatch) -> _TrainingBatch:
         """Align right-padded batches; defer image batches' CP split until fusion."""
         cp_size = self.config.distributed.kv_allgather_parallel_size
-        if cp_size > 1:
+        if cp_size > 1 and not is_tnd_batch(batch):
             from fsdp_turbo.models.deepseek.deepseek_v41.context_parallel import validate_sequence_length
 
             layout = batch.get("sfa_layout", "BSND")
@@ -92,7 +93,7 @@ class DeepseekV41Trainer(BaseTrainer):
 
     def _split_batch_for_context_parallel(self, batch: _TrainingBatch) -> _TrainingBatch:
         """Keep full image coordinates until the backbone has fused image features."""
-        if batch.get("images") is not None or batch.get("token_types") is not None:
+        if not is_tnd_batch(batch) and (batch.get("images") is not None or batch.get("token_types") is not None):
             return batch
         return super()._split_batch_for_context_parallel(batch)
 
@@ -149,6 +150,8 @@ class DeepseekV41Trainer(BaseTrainer):
             head_compute_dtype=self.config.model.head_compute_dtype,
             chunk_loss=self.config.memory.chunk_loss,
             chunk_loss_size=self.config.memory.chunk_loss_size,
+            # CPAttention is installed at build; the runtime arrives with the CP group.
+            context_parallel=self.config.distributed.cp_plan.tnd_enabled,
         )
         training_model = prepare_deepseek_v41_model_for_fsdp(
             training_model,

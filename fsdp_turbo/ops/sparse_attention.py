@@ -1,6 +1,8 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """Semantic dispatch wrapper for indexed sparse attention."""
 
+import torch
+
 from fsdp_turbo.ops import dispatch_op
 
 
@@ -19,9 +21,25 @@ def indexed_sparse_attention(
     window_size=128,
     layout="BSND",
     cu_seqlens=None,
+    cu_seqlens_ori_kv=None,
+    cu_seqlens_cmp_kv=None,
 ):
-    """Apply differentiable attention over explicitly selected KV positions."""
+    """Apply differentiable attention over explicitly selected KV positions.
+
+    For packed TND the optional ``cu_seqlens_ori_kv`` / ``cu_seqlens_cmp_kv``
+    carry a KV prefix longer than the local q segment; omitting them keeps the
+    original behaviour where both follow ``cu_seqlens``.
+    """
+    if isinstance(query, torch.Tensor) and query.numel() == 0:
+        # Free guard: an empty query is a caller bug the kernels cannot report.
+        raise ValueError("indexed_sparse_attention: empty query is not supported")
     device_type = "cpu" if use_eager else None
+    # Optional: keep the 13-argument positional contract for existing callers.
+    extra = {}
+    if cu_seqlens_ori_kv is not None:
+        extra["cu_seqlens_ori_kv"] = cu_seqlens_ori_kv
+    if cu_seqlens_cmp_kv is not None:
+        extra["cu_seqlens_cmp_kv"] = cu_seqlens_cmp_kv
     return dispatch_op(
         "indexed_sparse_attention",
         query,
@@ -38,6 +56,7 @@ def indexed_sparse_attention(
         layout,
         cu_seqlens,
         device_type=device_type,
+        **extra,
     )
 
 

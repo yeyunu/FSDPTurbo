@@ -21,6 +21,8 @@ def indexed_sparse_attention_torch(
     window_size: int = 128,
     layout: str = "BSND",
     cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_ori_kv: torch.Tensor | None = None,
+    cu_seqlens_cmp_kv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute indexed attention with a sink and accumulate KV gradients by row.
 
@@ -29,6 +31,7 @@ def indexed_sparse_attention_torch(
     gradient. Repeated selected positions accumulate into the same KV row.
     """
     del use_sparse_flash_attn, compress_ratio, window_size, cu_seqlens
+    del cu_seqlens_ori_kv, cu_seqlens_cmp_kv
     if layout.upper() != "BSND":
         raise NotImplementedError("The PyTorch indexed-attention fallback only supports BSND.")
     if compressed_key_value is not None:

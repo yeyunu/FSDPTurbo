@@ -101,6 +101,8 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         self.enable_chunk_loss = chunk_loss
         self.chunk_size = chunk_loss_size
         self._kv_cp_group: torch.distributed.ProcessGroup | None = None
+        # The two CP modes are exclusive.
+        self.tnd_context_parallel = None
         if chunk_loss:
             apply_chunkloss_module(backbone.head)
 
@@ -171,7 +173,28 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         """
         if group is None:
             raise ValueError("Native KV-AllGather CP requires an explicit process group.")
+        if self.tnd_context_parallel is not None:
+            raise ValueError("native BSND CP cannot be combined with packed-TND CP.")
         self._kv_cp_group = group if torch.distributed.get_world_size(group) > 1 else None
+
+    def set_tnd_context_parallel(self, runtime) -> list:
+        """Attach the packed-TND runtime to every attention layer.
+
+        Returns the attention modules the runtime now drives, so the framework
+        reads layer attributes from exactly this set instead of scanning the
+        whole model (the vision tower has a ``head_dim`` too).
+        """
+        if self._kv_cp_group is not None:
+            raise ValueError("packed-TND CP cannot be combined with native BSND CP.")
+        if self.enable_chunk_loss:
+            raise ValueError("packed-TND CP normalises the loss over the whole stream; disable memory.chunk_loss.")
+        self.tnd_context_parallel = runtime
+        self.model.cp_runtime = runtime
+        driven = []
+        for layer in self.model.layers:
+            layer.attn.cp_runtime = runtime
+            driven.append(layer.attn)
+        return driven
 
     def forward(
         self,
@@ -218,6 +241,7 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
             raise ValueError("Image inputs require an enabled DeepSeek vision tower.")
 
         cp_group = self._kv_cp_group
+        tnd = self.tnd_context_parallel
         if isinstance(sfa_layout, (list, tuple)):
             if len(sfa_layout) != 1:
                 raise ValueError("A batch must use one common sfa_layout.")
@@ -225,6 +249,8 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         sfa_layout = sfa_layout.upper()
         if sfa_layout not in ("BSND", "TND"):
             raise ValueError(f"sfa_layout must be BSND or TND, got {sfa_layout!r}.")
+        if tnd is not None and sfa_layout != "TND":
+            raise ValueError("packed-TND CP requires sfa_layout='TND'; got %r." % (sfa_layout,))
         if cp_group is not None and sfa_layout != "BSND":
             raise ValueError("DeepSeek-V4.1 CP currently supports BSND input only.")
         cu_seqlens = None
@@ -253,7 +279,8 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
             if cu_seqlens.numel() > 2:
                 if self.model_args.use_fused_compressor:
                     raise NotImplementedError("Packed TND does not yet support the fused compressor.")
-                if self.model_args.use_fused_lightning_indexer:
+                if self.model_args.use_fused_lightning_indexer and tnd is None:
+                    # The TND arm splits per document; the plain packed forward does not.
                     raise NotImplementedError("Packed TND does not yet support fused lightning indexers.")
             if position_ids is not None:
                 expected_position_ids = torch.cat(
@@ -295,7 +322,7 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         if indexer_terms:
             reference_model.shared_attn.publish("indexer_inputs", None)
         shift_labels = None
-        if labels is not None and cp_group is None:
+        if labels is not None and cp_group is None and tnd is None:
             if cu_seqlens is not None and cu_seqlens.numel() > 2:
                 labels = labels.clone()
                 boundary_starts = cu_seqlens[1:-1].to(device=labels.device, dtype=torch.long)
@@ -314,7 +341,10 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
                 else self.model.head(hidden_states, full_logits=True)
             )
             loss = None
-            if labels is not None and cp_group is not None:
+            if labels is not None and tnd is not None:
+                # Shifted and normalised over the whole packed stream by the runtime.
+                loss = tnd.loss(logits, labels)
+            elif labels is not None and cp_group is not None:
                 from fsdp_turbo.distributed.context_parallel.loss import cp_compute_lm_loss
 
                 loss = cp_compute_lm_loss(logits, labels, cp_group)
@@ -368,11 +398,29 @@ def _build_deepseek_v41_model(
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
     chunk_loss: bool = False,
     chunk_loss_size: int = 512,
+    context_parallel: bool = False,
 ) -> DeepseekV41ForCausalLMAdapter:
     if head_compute_dtype not in ("fp32", "bf16", "hf32"):
         raise ValueError("head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
+    attention_cls = None
+    hash_state_cls = None
+    backbone_cls = reference_model.Transformer
+    if context_parallel:
+        from .cp_attention import CPAttention
+        from .engram.engram import CPNgramHashState
+        from .vision_cp import TNDVisionTransformer
+
+        attention_cls = CPAttention
+        hash_state_cls = CPNgramHashState
+        # Overrides only the image merge; without a runtime the vendored method runs.
+        backbone_cls = TNDVisionTransformer
     with reference_model.set_dtype(torch.bfloat16):
-        backbone = reference_model.Transformer(model_args, tokenizer=tokenizer)
+        backbone = backbone_cls(
+            model_args,
+            tokenizer=tokenizer,
+            attention_cls=attention_cls,
+            hash_state_cls=hash_state_cls,
+        )
     backbone.head.compute_dtype = torch.bfloat16 if head_compute_dtype == "bf16" else torch.float32
     backbone.head.use_hf32 = head_compute_dtype == "hf32"
     return DeepseekV41ForCausalLMAdapter(
@@ -389,7 +437,7 @@ def build_deepseek_v41_model(
     config_path: str | Path | None = None,
     model_name_or_path: str | Path | None = None,
     tokenizer: PreTrainedTokenizerBase | None = None,
-    engram_storage_backend: Literal["host_offload", "elastic_buffer"] = "host_offload",
+    engram_storage_backend: Literal["host_offload", "elastic_buffer"] | None = "host_offload",
     use_sparse_flash_attn: bool = False,
     use_fused_lightning_indexer: bool = False,
     use_fused_lightning_indexer_loss: bool = False,
@@ -406,6 +454,7 @@ def build_deepseek_v41_model(
     head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
     chunk_loss: bool = False,
     chunk_loss_size: int = 512,
+    context_parallel: bool = False,
 ) -> DeepseekV41ForCausalLMAdapter:
     """Build an uninitialized BF16 model from model_args or a selected config JSON.
 
@@ -420,6 +469,10 @@ def build_deepseek_v41_model(
         model_args = build_deepseek_v41_model_args(config_path=config_path, model_name_or_path=model_name_or_path)
     else:
         _validate_training_args(model_args)
+    if engram_storage_backend is None:
+        # Engram off: drop the layers; the module rejects a None backend.
+        model_args = replace(model_args, engram_layer_ids=(), engram_num_embeddings=())
+        engram_storage_backend = "host_offload"
     model_args = replace(
         model_args,
         engram_storage_backend=engram_storage_backend,
@@ -443,6 +496,7 @@ def build_deepseek_v41_model(
         head_compute_dtype=head_compute_dtype,
         chunk_loss=chunk_loss,
         chunk_loss_size=chunk_loss_size,
+        context_parallel=context_parallel,
     )
 
 

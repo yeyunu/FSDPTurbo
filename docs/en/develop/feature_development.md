@@ -25,12 +25,16 @@ When constructing `FSDPTurbo(config, model)`, transformations are applied to the
 | 1 | `init_parallel_state` | Initialize process groups and the device mesh |
 | 2 | Quantization conversion | Weight format conversion such as MXFP8/W8A16 |
 | 3 | Tensor parallelism (TP) | Column/row-parallel sharding of Linear |
-| 4 | Context parallelism (CP) | Ulysses/KV-AllGather attention transformation and loss patch |
-| 5 | `module_patches` | User-configured function replacements |
-| 6 | Expert parallelism (EP/EFSDP) | MoE expert sharding and dispatcher |
-| 7 | Activation recomputation | Wrap forward with checkpoint |
-| 8 | Batch chunking | Wrap forward with chunk_batch |
-| 9 | FSDP2 sharding | Wrap with `fully_shard`; must be executed last |
+| 4 | Post-TP capture | Restore mesh and placements on quantized Linear after sharding |
+| 5 | Context parallelism (CP) | Ulysses/KV-AllGather attention, packed-TND runtime and loss patch |
+| 6 | `module_patches` | User-configured function replacements |
+| 7 | Expert parallelism (EP/EFSDP) | MoE expert sharding and dispatcher |
+| 8 | Vocabulary parallelism (VP/V-FSDP) | Vocabulary-dim sharding and V-FSDP |
+| 9 | Pre-FSDP module hooks | Nonstandard storage prepares itself and joins the FSDP ignore list |
+| 10 | Activation recomputation | Wrap forward with checkpoint |
+| 11 | Activation swapping | Wrap forward with swap_activation |
+| 12 | Batch chunking | Wrap forward with chunk_batch |
+| 13 | FSDP2 sharding | Wrap with `fully_shard`; must be executed last |
 
 > [!NOTE]
 > When adding a new feature, confirm its insertion position: all transformations that depend on the original module structure must be applied before FSDP2 sharding; `module_patches` are applied before FSDP, and a failed target match raises an error directly.

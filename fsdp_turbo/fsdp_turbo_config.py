@@ -262,6 +262,10 @@ class CPPlanConfig:
     mla_backend: str | None = None
     qsa_cp_query_chunk_size: Optional[int] = None
     qsa_sparse_gather: Optional[bool] = None
+    # Derived by validate_cp_config from the input layout; never set by hand.
+    tnd_enabled: bool = field(default=False, init=False, repr=False)
+    # full_prefix gathers the whole KV prefix; halo_prefix only the reachable tail.
+    tnd_exchange_style: str = "full_prefix"
 
 
 def uses_hybrid_cp_zigzag_layout(cp_plan: CPPlanConfig | None) -> bool:
@@ -637,6 +641,7 @@ class FSDPTurboConfig:
         recompute_patterns = (
             recompute_plan.apply_modules if isinstance(recompute_plan, RecomputePlanConfig) else recompute_plan
         )
+
         swap_plan = self.memory.swap_activation_plan
         swap_patterns = (swap_plan.apply_modules or []) if self.memory.swap_activation and swap_plan else []
         if any(
@@ -853,6 +858,45 @@ class FSDPTurboConfig:
             [] if self.distributed.tp_plan.sequence_parallel is None else self.distributed.tp_plan.sequence_parallel
         )
 
+    def _validate_tnd_cp_config(self) -> None:
+        """Derive and validate packed-TND mode from the input layout.
+
+        Packed TND is a property of the batch, not of a patch list: one packed
+        stream is cut across the KV-AllGather ranks and each rank assembles the
+        prefix of every document it touches. It therefore follows
+        ``data.sfa_layout`` and never combines with the native BSND path.
+        """
+        plan = self.distributed.cp_plan
+        if plan.tnd_exchange_style not in ("full_prefix", "halo_prefix"):
+            raise ValueError(
+                "distributed.cp_plan.tnd_exchange_style must be full_prefix or halo_prefix; "
+                f"got {plan.tnd_exchange_style!r}."
+            )
+        plan.tnd_enabled = self.data.sfa_layout == "TND"
+        # The layout alone selects packed TND, including the zero-split arm.
+        if not plan.tnd_enabled:
+            return
+        if self.data.batch_size != 1:
+            raise ValueError(
+                f"packed-TND CP requires micro batch size 1 (data.batch_size == 1); got {self.data.batch_size}."
+            )
+        if self.distributed.ulysses_parallel_size != 1 or self.distributed.kcp_parallel_size != 1:
+            raise ValueError(
+                "packed-TND CP owns the whole context-parallel domain; set "
+                "distributed.ulysses_parallel_size=1 and kcp_parallel_size=1."
+            )
+        if plan.kv_allgather_function_patches:
+            raise ValueError("packed-TND CP is native; it cannot be combined with KV-AllGather function patches.")
+        if self.memory.chunk_loss:
+            # Chunked head normalises locally; packed-TND normalises over the whole stream.
+            raise ValueError("packed-TND CP normalises the loss over the whole stream; set memory.chunk_loss=false.")
+        if self.memory.recompute:
+            # Replay would read a state slot that later source layers already overwrote.
+            raise ValueError(
+                "packed-TND CP does not support memory.recompute: a replay reads the KV source "
+                "state that later source layers have already overwritten. Set memory.recompute=false."
+            )
+
     def validate_cp_config(self) -> None:
         """Validate native CP or normalize function patches and parallel constraints."""
         kcp_parallel_size = self.distributed.kcp_parallel_size
@@ -924,6 +968,11 @@ class FSDPTurboConfig:
                     raise ValueError(
                         "DeepSeek-V4.1 CP uses the model's native interface; remove compressor_sparse_attention patches."
                     )
+                if patch_type == "kv_allgather_tnd":
+                    raise ValueError(
+                        "kv_allgather_tnd no longer uses a function patch: set "
+                        "distributed.kv_allgather_parallel_size > 1 with data.sfa_layout='TND'."
+                    )
                 normalized.append(normalized_patch)
             setattr(self.distributed.cp_plan, field_name, normalized)
 
@@ -950,12 +999,15 @@ class FSDPTurboConfig:
         ulysses_types = {patch["type"] for patch in self.distributed.cp_plan.ulysses_function_patches}
         qwen_embedded_cp = bool(ulysses_types) and ulysses_types <= kv_embedded_types
 
+        self._validate_tnd_cp_config()
+
         # An enabled KV axis without wrappers requires the model's native API.
         # The CP entry verifies that API when the model is available.
         if (
             self.distributed.kv_allgather_parallel_size > 1
             and not self.distributed.cp_plan.kv_allgather_function_patches
             and not qwen_embedded_cp
+            and not self.distributed.cp_plan.tnd_enabled
         ):
             if any(
                 (

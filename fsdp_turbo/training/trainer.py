@@ -680,6 +680,11 @@ class BaseTrainer:
 
     def _split_batch_for_context_parallel(self, batch):
         """Split once over flattened KV-AllGather x Ulysses ranks."""
+        from fsdp_turbo.distributed.context_parallel.kv_allgather.tnd import split_tnd_batch
+
+        split = split_tnd_batch(self.model, batch)
+        if split is not None:
+            return split
         parallel_state = self.model.parallel_state
         if parallel_state.get_cp_group_size() <= 1:
             return batch

@@ -41,6 +41,23 @@ def cp_all_reduce_forward_backward(
     return _AllReduceForwardBackward.apply(input_, group)
 
 
+def shift_labels_globally(
+    labels: torch.Tensor,
+    boundaries=(),
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Shift a complete token stream by one, masking the stream tail and document starts.
+
+    The shift happens on the whole stream, so a token at a document end would
+    otherwise predict the next document's first token; every boundary is masked
+    for that reason. Callers then slice their own segment out of the result.
+    """
+    masked = labels.clone()
+    for boundary in boundaries:
+        masked[..., boundary] = ignore_index
+    return torch.nn.functional.pad(masked[..., 1:], (0, 1), value=ignore_index)
+
+
 def cp_fixed_cross_entropy(
     source: torch.Tensor,
     target: torch.Tensor,

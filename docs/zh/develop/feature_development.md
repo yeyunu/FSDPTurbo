@@ -25,12 +25,16 @@ FSDPTurbo采用**配置驱动**的特性管理架构：特性以YAML配置为入
 | 1 | `init_parallel_state` | 初始化进程组与设备网格 |
 | 2 | 量化转换 | MXFP8 / W8A16等权重格式转换 |
 | 3 | 张量并行（TP） | 列/行并行切分Linear |
-| 4 | 上下文并行（CP） | Ulysses / KV-AllGather注意力变换与loss patch |
-| 5 | `module_patches` | 用户配置的函数替换 |
-| 6 | 专家并行（EP / EFSDP） | MoE专家分片与dispatcher |
-| 7 | 激活重计算 | checkpoint包装forward |
-| 8 | 微批次切分 | chunk_batch包装forward |
-| 9 | FSDP2分片 | `fully_shard`包装，必须最后执行 |
+| 4 | TP 后处理 | 为量化Linear补齐切分后的mesh与placements |
+| 5 | 上下文并行（CP） | Ulysses / KV-AllGather注意力变换、packed-TND runtime与loss patch |
+| 6 | `module_patches` | 用户配置的函数替换 |
+| 7 | 专家并行（EP / EFSDP） | MoE专家分片与dispatcher |
+| 8 | 词表并行（VP / V-FSDP） | 词表维切分与V-FSDP |
+| 9 | pre-FSDP 模块钩子 | 非标准存储模块自准备，并把模块名加入FSDP忽略列表 |
+| 10 | 激活重计算 | checkpoint包装forward |
+| 11 | 激活换出 | swap_activation包装forward |
+| 12 | 微批次切分 | chunk_batch包装forward |
+| 13 | FSDP2分片 | `fully_shard`包装，必须最后执行 |
 
 > [!NOTE]
 > 新增特性时需确认插入位置：所有依赖原始模块结构的变换必须在FSDP2分片之前；`module_patches`在FSDP之前应用，目标不匹配会直接报错。

@@ -1,6 +1,7 @@
 """Engram residual module and n-gram hashing for DeepSeek-V4.1."""
 
 from .engram import (
+    CPNgramHashState,
     Engram,
     EngramLayout,
     NgramHashState,
@@ -8,6 +9,7 @@ from .engram import (
 )
 
 __all__ = [
+    "CPNgramHashState",
     "Engram",
     "EngramLayout",
     "NgramHashState",

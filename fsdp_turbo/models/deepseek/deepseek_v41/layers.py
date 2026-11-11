@@ -286,11 +286,12 @@ class Block(nn.Module):
 
     batch_chunk_context = staticmethod(shared_attn.chunk_window)
 
-    def __init__(self, layer_id: int, args: ModelArgs, engram_layout: EngramLayout | None = None):
+    def __init__(self, layer_id: int, args: ModelArgs, engram_layout: EngramLayout | None = None, attention_cls=None):
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
-        attention_cls = self.attention_cls
+        if attention_cls is None:
+            attention_cls = type(self).attention_cls
         if attention_cls is None:
             # Attention imports the base layers; resolve the default after module initialization.
             from .attention import Attention as attention_cls  # pylint: disable=cyclic-import
