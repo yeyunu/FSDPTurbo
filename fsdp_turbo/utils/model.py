@@ -95,11 +95,20 @@ def set_num_hidden_layers(model_config, num_hidden_layers):
 
 
 def convert_model_dtype(model, dtype):
-    """Cast all model parameters and buffers to ``dtype`` in place."""
+    """Cast all model parameters and buffers to ``dtype`` in place.
+
+    Only floating-point tensors are cast: integer buffers (e.g. the PLE
+    ngram hash buffers ``layer_multipliers`` / ``ngram_heads_vocab_sizes`` /
+    ``ngram_heads_offsets``, values ~2.4e13 which do not survive a bf16
+    round-trip) must keep their exact ``torch.long`` values, otherwise the
+    ngram-id construction silently looks up the wrong embedding rows.
+    """
     for param in model.parameters():
-        param.data = param.data.to(dtype)
+        if param.data.dtype.is_floating_point:
+            param.data = param.data.to(dtype)
     for buffer in model.buffers():
-        buffer.data = buffer.data.to(dtype)
+        if buffer.data.dtype.is_floating_point:
+            buffer.data = buffer.data.to(dtype)
 
 
 def init_submodule_weights(submodule, name="submodule"):
