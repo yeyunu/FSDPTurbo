@@ -12,23 +12,28 @@ This repository enforces a development guide as a skill:
 ```
 
 Before you create, modify, review, or answer questions about any code under
-`fsdp_turbo/`, read that file in full. Skill name for harnesses that address
-skills by name: `fsdp-turbo-dev-guide`. If your harness has already loaded it
-into context, treat the loaded content as authoritative; if you cannot confirm
-that, read the file from disk. Do not rely on this file as a substitute — it is
-only a pointer and a summary.
+`fsdp_turbo/` or any material under `docs/`/`README.md`, read that file in full.
+Skill name for harnesses that address skills by name: `fsdp-turbo-dev-guide`. If
+your harness has already loaded it into context, treat the loaded content as
+authoritative; if you cannot confirm that, read the file from disk. Do not rely on
+this file as a substitute — it is only a pointer and a summary.
 
-The guide currently defines 17 rules covering: device abstraction via
-`torch.accelerator`, `torch_npu` import isolation, fused-operator registration
-with a CPU fallback, module cohesion and independent portability, config
-validation in `FSDPTurboConfig.__post_init__`, logging via `print_rank`, naming,
-the `fsdp_turbo.models` leaf boundary, the ban on patching model code, minimal
-code with only the necessary checks, reuse of existing utility functions over new
-abstractions, structure code only under `fsdp_turbo/models/` (parameter JSON
-configs belong in `examples/`), the two-level
-`models/<model-series>/<model-structure>/` layout, centralized environment
-variables, documentation kept in sync with code, type annotations and docstrings
-on public APIs, and the ban on unsafe deserialization and command execution.
+The guide currently defines 23 rules grouped into 9 categories: device and backend
+(`torch.accelerator` abstraction, `torch_npu` import isolation, fused-operator
+registration with a CPU fallback), module design (structure-first design, cohesion
+with a small public surface, decoupling so a single folder can be moved out),
+model adaptation (the `fsdp_turbo.models` leaf boundary, no patching of model
+code, structure code only with parameter JSON configs in `examples/`, and the
+two-level `models/<model-series>/<model-structure>/` layout),
+configuration/logging/environment (validation in `FSDPTurboConfig.__post_init__`
+that checks legality without mutating models, logging via `print_rank`,
+centralized environment variables), code style (naming, minimal code with only the
+necessary checks, reuse of existing utilities, English and sparse comments),
+interfaces and docs (type annotations and docstrings on public APIs, docs kept in
+sync with code), documentation conventions (no spaces between Chinese and English,
+standard product terms instead of A2/A3/A5, no numbered feature-doc titles),
+collaboration (a fresh AI review session before opening a PR), and security (no
+unsafe deserialization or command execution).
 
 ## Required behavior
 
@@ -55,6 +60,16 @@ on public APIs, and the ban on unsafe deserialization and command execution.
      a `docs/zh/_menu.md` entry);
    - `torch.load(..., weights_only=False)` on untrusted files, `pickle.load`,
      `eval`/`exec`, `os.system`, or `shell=True`;
+   - comments or docstrings written in Chinese, or long comment blocks above a
+     single line of code (comments must be English and sparse);
+   - spaces between Chinese and English words or numbers in documentation;
+   - `A2`/`A3`/`A5` abbreviations in docs instead of the standard product terms
+     (`Ascend 950PR&950DT系列产品`, `Atlas A3训练系列产品`,
+     `Atlas A2训练系列产品`);
+   - numbered titles in feature docs (`# 1. 断点续训` instead of `# 断点续训`);
+   - a new acceleration module added without a design pass (layer fit, class
+     responsibilities, extension seams) or one that cannot be moved out on its own
+     because it imports another business module;
    - `print` instead of `print_rank`.
 4. The guide marks some existing code as legacy, pending refactor. Do not start
    unrelated refactors for it, but bring it into compliance when you touch it.
