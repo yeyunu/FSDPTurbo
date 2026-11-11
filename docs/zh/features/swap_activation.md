@@ -29,6 +29,10 @@ memory:
 
 配置后由`FSDPTurbo`初始化流程自动应用，无需额外代码。
 
+## 交换重计算边界输入
+
+通过`memory.recompute_plan.swap_inputs`交换`recompute_plan.apply_modules`指定的checkpoint边界输入。配置示例见 [激活重计算](./recompute.md)。
+
 ## 适用场景
 
 - 长序列训练（激活显存占比高）

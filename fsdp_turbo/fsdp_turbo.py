@@ -1,4 +1,7 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
+from functools import partial
+from typing import TYPE_CHECKING
+
 import torch
 
 from fsdp_turbo.distributed.expert_parallel.expert_fully_shard_parallel import (
@@ -23,7 +26,8 @@ from fsdp_turbo.distributed.context_parallel.kcp.kcp_context_parallel import (
     kcp_context_parallelize_modules,
 )
 from fsdp_turbo.distributed.context_parallel.patch import apply_cp_loss_patches
-from fsdp_turbo.memory.recompute.recompute import recompute_modules
+from fsdp_turbo.memory.recompute.recompute import RecomputePlanConfig, recompute_modules
+from fsdp_turbo.memory.swap.swap_manager import SwapManager
 from fsdp_turbo.fsdp_turbo_config import FSDPTurboConfig, uses_hybrid_cp_zigzag_layout
 from fsdp_turbo.distributed.expert_parallel.expert_parallel import (
     expert_parallelize_modules,
@@ -36,6 +40,9 @@ from fsdp_turbo.distributed.vocab_parallel.vocab_fully_shard_parallel import (
 )
 from fsdp_turbo.utils.patch import apply_module_patches
 
+if TYPE_CHECKING:
+    from fsdp_turbo.memory.recompute.recompute import CheckpointInputContextFactory
+
 
 class FSDPTurbo(torch.nn.Module):
     """Apply configured model parallelism, memory policies and quantization."""
@@ -44,6 +51,7 @@ class FSDPTurbo(torch.nn.Module):
         super().__init__()
         self.config = config
         self.model = model
+        self.swap_manager: SwapManager | None = None
 
         self.parallel_state = init_parallel_state(self.config)
         self.apply_quantization_modules()
@@ -220,9 +228,15 @@ class FSDPTurbo(torch.nn.Module):
             if not matched:
                 raise RuntimeError(f"Configured module patch did not match the model: target={spec['target']!r}.")
 
+    def _get_swap_manager(self) -> SwapManager:
+        if self.swap_manager is None:
+            self.swap_manager = SwapManager(self.config.memory.swap_plan)
+        return self.swap_manager
+
     def apply_recompute_modules(self) -> None:
-        """Apply configured module recomputation and MXFP8 replay contexts."""
-        if not self.config.memory.recompute:
+        """Apply recomputation with optional input swapping and replay contexts."""
+        memory = self.config.memory
+        if not memory.recompute:
             return
         from contextlib import nullcontext
         from fsdp_turbo.quantization.core.recompute_phase import (
@@ -230,14 +244,39 @@ class FSDPTurbo(torch.nn.Module):
             mxfp8_recompute_context,
         )
 
+        from fsdp_turbo.memory.op_replay.op_replay import build_op_replay_context_fn
+        from fsdp_turbo.memory.recompute.recompute import compose_checkpoint_contexts
+
+        replay_context = None
+        if memory.op_replay_scopes:
+            replay_context = build_op_replay_context_fn(
+                self.model,
+                memory.op_replay_scopes,
+                False,
+                self._get_swap_manager().get_cache("op_replay"),
+            )
+
+        plan = memory.recompute_plan
+        swap_inputs = isinstance(plan, RecomputePlanConfig) and plan.swap_inputs
+        input_context: CheckpointInputContextFactory = nullcontext
+        if swap_inputs:
+            from fsdp_turbo.memory.act_stash.act_stash import ActStashHooks
+
+            input_context = partial(ActStashHooks, self._get_swap_manager().get_cache("act_stash"))
+
         def mxfp8_context_factory(module):
-            if module is None:
-                return None
-            mark_module_for_recompute(module)
-            return lambda: (nullcontext(), mxfp8_recompute_context(module))
+            contexts = [] if replay_context is None else [replay_context]
+            if module is not None:
+                mark_module_for_recompute(module)
+                contexts.append(lambda: (nullcontext(), mxfp8_recompute_context(module)))
+            return compose_checkpoint_contexts(contexts)
 
         self.model = recompute_modules(
-            self.model, self.config.memory.recompute_plan, context_fn_factory=mxfp8_context_factory
+            self.model,
+            plan,
+            context_fn_factory=mxfp8_context_factory,
+            reject_nested=bool(memory.op_replay_scopes) or swap_inputs,
+            input_context=input_context,
         )
 
     def apply_swap_activation_modules(self):

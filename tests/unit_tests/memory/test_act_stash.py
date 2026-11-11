@@ -1,9 +1,12 @@
 import copy
+from unittest.mock import Mock
 
 import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from fsdp_turbo import fsdp_turbo as turbo_module
+from fsdp_turbo.fsdp_turbo_config import load_config_from_yaml
 from fsdp_turbo.memory.act_stash.act_stash import (
     ActStashHooks,
     _stashable,
@@ -211,9 +214,8 @@ class TestCheckpointJurisdiction:
         x_ref = x.detach().clone().requires_grad_()
 
         layer, cache = self._run(x)
-        # exactly one put: the boundary input x (checkpoint's initial forward
-        # runs under no_grad -> nothing packed; internal saved tensors are
-        # taken over by the checkpoint frame hooks at recompute)
+        # Exactly one put: the boundary input x. The checkpoint frame's
+        # inner hooks handle tensors saved inside the checkpoint.
         assert cache._iter_stats['put_cnt'] == 1
         assert cache._iter_stats['pop_cnt'] == 1
 
@@ -229,6 +231,57 @@ class TestCheckpointJurisdiction:
         _, cache = self._run(x, extra_kwargs={"pos": pos})
         # documented blind spot: tensors inside kwargs stay outside the hooks
         assert cache._iter_stats['put_cnt'] == 1
+
+
+@pytest.mark.parametrize("op_replay", [False, True])
+def test_configured_swap_core_offloads_checkpoint_inputs(tmp_path, monkeypatch, op_replay):
+    _skip_if_cpu()
+
+    class Layer(torch.nn.Module):
+        def forward(self, value, *, scale):
+            return (value * scale).square()
+
+    config_path = tmp_path / "config.yaml"
+    yaml_text = """memory:
+  recompute: true
+  recompute_plan:
+    apply_modules: ['']
+    flatten_inputs: true
+    swap_inputs: true
+  swap_plan:
+    capacity_mb: 0
+    cpu_arena_slab_size_mb: null
+"""
+    if op_replay:
+        yaml_text += """  op_replay_scopes:
+    - apply_modules: ['']
+      cache_ops: [aten.mul.Tensor]
+      save_rng: false
+"""
+    config_path.write_text(yaml_text, encoding="utf-8")
+
+    parallel_state = Mock()
+    parallel_state.get_cp_group_size.return_value = 1
+    parallel_state.get_kvallgather_group_size.return_value = 1
+    monkeypatch.setattr(turbo_module, "init_parallel_state", lambda config: parallel_state)
+    monkeypatch.setattr(turbo_module, "fully_shard_parallel_modules", lambda model, *_: model)
+    model = turbo_module.FSDPTurbo(load_config_from_yaml(config_path), Layer())
+
+    value = torch.randn(8, 64, device=_get_device(), requires_grad=True)
+    scale = torch.randn_like(value)
+    reference_value = value.detach().clone().requires_grad_()
+    output = model(value, scale=scale)
+    reference_output = Layer()(reference_value, scale=scale)
+    output.sum().backward()
+    reference_output.sum().backward()
+    torch.testing.assert_close(output, reference_output)
+    torch.testing.assert_close(value.grad, reference_value.grad)
+
+    cache = model.swap_manager.get_cache("act_stash")
+    model.swap_manager.step_end()
+    expected_count = 3 if op_replay else 2
+    assert cache.stats["put_cnt"] == expected_count
+    assert cache.stats["ddr_load"] == expected_count
 
 
 class TestPrefetchArmsOnReversePops:

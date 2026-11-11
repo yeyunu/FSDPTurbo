@@ -70,3 +70,6 @@ Kimi K3的Hybrid P2P通过`distributed.cp_plan.kda_backend: hybrid_p2p`开启，
 `distributed.ulysses_parallel_size`与`distributed.kda_p2p_parallel_size`分别设置Ulysses和P2P并行度，完整CP大小为两者之积。
 `kda_p2p_parallel_size`默认为1，Hybrid P2P的`kcp_parallel_size`保持1。
 使用Ulysses或KCP时，`kda_p2p_parallel_size`保持1，配置示例见 [上下文并行](../features/context_parallel.md)。
+开启 `memory.recompute` 后，可在 `memory.recompute_plan` 中使用模块列表或结构化配置。
+使用算子重放时，通过 `op_replay_scopes` 指定缓存范围和可选的 `quantizer`，并通过 `memory.swap_plan` 配置交换容量和预取。详见 [激活重计算](../features/recompute.md)。
+设置`memory.recompute_plan.swap_inputs: true`可交换`apply_modules`指定的checkpoint边界输入。输入交换和算子重放共用`memory.swap_plan`。详见 [激活重计算](../features/recompute.md)。

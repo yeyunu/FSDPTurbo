@@ -1,5 +1,12 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 from fsdp_turbo.ops.cpu.cce_loss import cce_loss_cpu
+from fsdp_turbo.ops.cpu.payload_quant import (
+    dequant_fp8_blockwise_cpu,
+    dequant_int8_per_row_cpu,
+    dynamic_block_quant_cpu,
+    dynamic_quant_cpu,
+    fp8_payload_quant_supported_cpu,
+)
 from fsdp_turbo.ops.cpu.attn_res import attn_res_cpu
 from fsdp_turbo.ops.cpu.attention_projection import attention_output_projection_cpu
 from fsdp_turbo.ops.cpu.clipped_swiglu import clipped_swiglu_cpu
@@ -40,6 +47,11 @@ from fsdp_turbo.ops.cpu.sparse_indexer_loss import sparse_indexer_gradient_torch
 __all__ = [
     "sparse_indexer_gradient_torch",
     'attention_output_projection_cpu',
+    'dequant_fp8_blockwise_cpu',
+    'dequant_int8_per_row_cpu',
+    'dynamic_block_quant_cpu',
+    'dynamic_quant_cpu',
+    'fp8_payload_quant_supported_cpu',
     'cce_loss_cpu',
     'attn_res_cpu',
     'clipped_swiglu_cpu',

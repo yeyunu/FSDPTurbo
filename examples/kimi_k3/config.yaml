@@ -33,7 +33,7 @@ optimizer:
 run:
   seed: 42
   max_steps: 100
-  num_train_epochs: 1
+  num_train_epochs: 5
   gradient_accumulation_steps: 1
   logging_steps: 1
   profile:
@@ -187,8 +187,26 @@ memory:
   mm_merge_chunk_tokens: 0
   recompute: false
   recompute_plan:
-    - language_model.model.layers.{*}
-    - vision_tower.encoder.blocks.{*}
+    use_reentrant: false
+    flatten_inputs: true
+    swap_inputs: true
+    apply_modules:
+      - language_model.model.layers.{*}
+      - vision_tower.encoder.blocks.{*}
+    op_replay_scopes:
+      - name: forward_matmul
+        apply_modules:
+          - language_model.model.layers.{*}
+          - vision_tower.encoder.blocks.{*}
+        save_rng: false
+        quantizer: fp8_blockwise
+        cache_ops:
+          - aten.matmul.default
+          - npu.npu_grouped_matmul.default
+  swap_plan:
+    capacity_mb: 1024
+    keep_rate: 0.0
+    enable_prefetch: true
 
 # --- Quantization Configuration ---
 quantization:

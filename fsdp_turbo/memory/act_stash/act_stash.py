@@ -13,15 +13,12 @@ is driven by the caller via SwapManager.step_end().
 Jurisdiction and contracts:
 - A saved_tensors_hooks tenant covers exactly what autograd saves while the
   hook context is active: with the ActStash wrapper applied outside a
-  non-reentrant checkpoint (the intended wiring order), the checkpoint's
-  initial forward runs under no_grad (nothing packed) and its internal saved
-  tensors are taken over by the checkpoint frame hooks at recompute, so
-  ActStash's coverage is "outside checkpoints + checkpoint boundary inputs".
-- Tensors inside kwargs/containers never reach the pack hook (checkpoint
-  saves only direct tensor arguments); this is a known blind spot shared by
-  every hooks-based mechanism.
-- A put tensor must not be mutated in place while its handle is alive (the
-  saved-tensor autograd version counter already rejects such writes).
+  non-reentrant checkpoint (the intended wiring order), the checkpoint frame
+  owns the tensors saved inside it. ActStash covers tensors saved outside
+  checkpoints and checkpoint boundary inputs.
+- Checkpoint only saves direct positional tensor arguments. Enable recompute
+  input flattening to expose tensor leaves inside kwargs and containers.
+- A put tensor must not be mutated in place while its handle is alive.
 - Handle model: eviction only drops the cache's own reference. An externally
   retained tensor simply cannot be physically freed (benign degradation:
   correct gradients, no HBM saved).
@@ -63,9 +60,9 @@ class ActStashHooks(saved_tensors_hooks):
     """saved_tensors_hooks tenant: pack = cache.put, unpack = cache.pop.
 
     Ineligible tensors (see _stashable) pass through as their own token, so
-    unpack can tell the two token kinds apart without any bookkeeping. The
-    autograd engine guarantees every packed tensor is eventually unpacked
-    (retain_graph replays unpack), so a pop miss is always a bug, not a race.
+    unpack can tell the two token kinds apart without any bookkeeping. Each
+    handle is consumed on its first unpack, so graphs using ActStash are
+    intended for a single backward pass.
     """
 
     def __init__(self, cache: SwapCache):

@@ -1,5 +1,34 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
+import torch
+
 from fsdp_turbo.ops import dispatch_op
+
+
+def dynamic_quant(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return int8 payload and fp32 per-row scales for a 2D activation."""
+    return dispatch_op('dynamic_quant', tensor, device_type=tensor.device.type)
+
+
+def dynamic_block_quant(tensor: torch.Tensor, block_size: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return e4m3fn payload and fp32 scales for each 1xN block."""
+    return dispatch_op('dynamic_block_quant', tensor, block_size, device_type=tensor.device.type)
+
+
+def dequant_int8_per_row(payload: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Reconstruct an int8 matrix in its original activation dtype."""
+    return dispatch_op('dequant_int8_per_row', payload, scale, dtype, device_type=payload.device.type)
+
+
+def dequant_fp8_blockwise(
+    payload: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype, block_size: int = 128
+) -> torch.Tensor:
+    """Reconstruct an e4m3fn matrix from its 1xN block scales."""
+    return dispatch_op('dequant_fp8_blockwise', payload, scale, dtype, block_size, device_type=payload.device.type)
+
+
+def fp8_payload_quant_supported() -> bool:
+    """Check the current accelerator's support for native FP8 swap payloads."""
+    return dispatch_op('fp8_payload_quant_supported')
 
 
 def dynamic_mx_quant(x, axis=-1, dst_type=None, scale_alg=0, block_size=32, round_mode=None):

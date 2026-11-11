@@ -29,6 +29,12 @@ memory:
 
 Once configured, it is applied automatically by the `FSDPTurbo` initialization flow, with no additional code required.
 
+## Offloading checkpoint inputs
+
+Set `memory.recompute_plan.swap_inputs: true` to offload checkpoint inputs for the modules or methods selected by `recompute_plan.apply_modules`. FSDPTurbo installs `ActStash` outside the checkpoint wrapper. By default, eligible top-level positional tensors can be swapped. Set `recompute_plan.flatten_inputs: true` to include tensor leaves in keyword arguments and containers.
+
+`ActStash` and operator replay share the capacity and prefetch settings in `memory.swap_plan`. `BaseTrainer` clears the cache after each optimizer update. Each `ActStash` handle is consumed on first unpack, so use one backward pass per graph.
+
 ## Applicable Scenarios
 
 - Long-sequence training (activations account for a high proportion of memory usage)

@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
@@ -79,13 +79,15 @@ def test_method_entry_wraps_named_method_only():
     layer = model.layers[0]
     original_unrelated = layer.unrelated
     factory = Mock(return_value=None)
+    input_context = Mock(side_effect=nullcontext)
 
     with patch(CHECKPOINT, return_value="output") as mock_checkpoint:
-        recompute_modules(model, ["layers.{*}.attention"], context_fn_factory=factory)
+        recompute_modules(model, ["layers.{*}.attention"], context_fn_factory=factory, input_context=input_context)
         assert layer.attention("value") == "output"
 
     # Method entries cannot be marked per module, so the factory receives None.
     assert [args for args, _ in factory.call_args_list] == [(None,), (None,)]
+    input_context.assert_called_once_with()
     assert mock_checkpoint.call_args.kwargs == {"use_reentrant": False}
     assert layer.unrelated == original_unrelated
 
@@ -169,9 +171,10 @@ def test_flatten_inputs_real_checkpoint_backward():
         assert keyword["left"] is shared
 
 
-def test_reject_nested_checkpoints():
+@pytest.mark.parametrize("ancestor", ["", "layers"])
+def test_reject_nested_checkpoints(ancestor):
     with pytest.raises(ValueError, match="nested checkpoints"):
-        recompute_modules(_ToyModel(), ["layers", "layers.{*}"], reject_nested=True)
+        recompute_modules(_ToyModel(), [ancestor, "layers.{*}"], reject_nested=True)
 
 
 def test_past_key_values_is_bound_to_none():

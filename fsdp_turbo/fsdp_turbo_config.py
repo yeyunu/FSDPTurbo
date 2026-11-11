@@ -15,6 +15,12 @@ from fsdp_turbo.utils.dtype import get_dtype
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.str_match import module_name_match
 
+from fsdp_turbo.memory.recompute.recompute import RecomputePlanConfig
+from fsdp_turbo.memory.op_replay.op_replay import OpReplayScopeConfig
+from fsdp_turbo.memory.swap.swap_manager import SwapPlanConfig
+from fsdp_turbo.memory.swap.quantizer import QUANTIZERS, Fp8BlockwiseQuantizer
+from fsdp_turbo.ops.quantize import fp8_payload_quant_supported
+
 logger = logging.getLogger(__name__)
 
 
@@ -513,7 +519,9 @@ class MemoryConfig:
     """
 
     recompute: bool = False
-    recompute_plan: List[str] = None
+    recompute_plan: Union[List[str], RecomputePlanConfig] = None
+    op_replay_scopes: List[OpReplayScopeConfig] = field(default_factory=list)
+    swap_plan: SwapPlanConfig = field(default_factory=SwapPlanConfig)
     chunk_batch: bool = False
     chunk_batch_plan: Optional[ChunkBatchPlanConfig] = None
     chunk_loss: bool = False
@@ -554,13 +562,14 @@ class FSDPTurboConfig:
         self.validate_indexer_loss_config()
         self.validate_data_config()
         self.validate_tp_config()
+        self.validate_swap_config()
+        self.validate_recompute_config()
         self.validate_chunk_loss_config()
         self.validate_mm_merge_chunk_tokens_config()
         self.validate_cp_config()
         self.validate_module_patches()
         self.validate_ep_config()
         self.validate_engram_config()
-        self.validate_recompute_config()
         self.validate_chunk_batch_config()
         self.validate_swap_activation_config()
         self.validate_quantization_config()
@@ -601,7 +610,8 @@ class FSDPTurboConfig:
         if isinstance(batches, bool) or (batches is not None and (not isinstance(batches, int) or batches <= 0)):
             raise ValueError("optimizer.swap_prefetch_batches must be a positive integer when provided.")
 
-    def validate_chunk_loss_config(self):
+    def validate_chunk_loss_config(self) -> None:
+        """Validate chunked loss and reject recompute or swap hooks on its head."""
         if not isinstance(self.memory.chunk_loss, bool):
             raise ValueError("memory.chunk_loss must be a boolean.")
         chunk_size = self.memory.chunk_loss_size
@@ -615,7 +625,10 @@ class FSDPTurboConfig:
         # through cp_chunk_lm_loss (global label shift + cross-rank
         # normalization). A model whose chunk-loss path cannot run under CP must
         # reject the combination in its own wiring.
-        recompute_patterns = (self.memory.recompute_plan or []) if self.memory.recompute else []
+        recompute_plan = self.memory.recompute_plan if self.memory.recompute else []
+        recompute_patterns = (
+            recompute_plan.apply_modules if isinstance(recompute_plan, RecomputePlanConfig) else recompute_plan
+        )
         swap_plan = self.memory.swap_activation_plan
         swap_patterns = (swap_plan.apply_modules or []) if self.memory.swap_activation and swap_plan else []
         if any(
@@ -1263,8 +1276,60 @@ class FSDPTurboConfig:
             elif not callable(replacement):
                 raise ValueError("module_patches replacement must be callable or a dotted callable path.")
 
-    def validate_recompute_config(self):
-        self.memory.recompute_plan = [] if self.memory.recompute_plan is None else self.memory.recompute_plan
+    def validate_swap_config(self) -> None:
+        """Normalize the swap plan and validate its CPU arena settings."""
+        if isinstance(self.memory.swap_plan, dict):
+            # Direct callers can pass a dict despite the normalized field type.
+            self.memory.swap_plan = SwapPlanConfig(**self.memory.swap_plan)  # pylint: disable=not-a-mapping
+        swap_plan = self.memory.swap_plan
+        if swap_plan.cpu_arena_slab_size_mb is not None and swap_plan.cpu_arena_slab_size_mb <= 0:
+            raise ValueError("swap_plan.cpu_arena_slab_size_mb must be positive or null")
+        if swap_plan.cpu_arena_pool_policy not in ("all", "standard", "none"):
+            raise ValueError("swap_plan.cpu_arena_pool_policy must be all, standard or none")
+
+    def validate_recompute_config(self) -> None:
+        """Normalize legacy lists and structured non-reentrant replay plans."""
+        plan = self.memory.recompute_plan
+        if isinstance(plan, dict):
+            plan = dict(plan)
+            if plan.pop("use_reentrant", False) is not False:
+                raise ValueError("recompute requires use_reentrant=false")
+            if "op_replay_scopes" in plan:
+                if self.memory.op_replay_scopes:
+                    raise ValueError("Define op_replay_scopes in memory or recompute_plan, not both")
+                self.memory.op_replay_scopes = plan.pop("op_replay_scopes")
+            plan = RecomputePlanConfig(**plan)
+        if isinstance(plan, RecomputePlanConfig):
+            if not isinstance(plan.swap_inputs, bool):
+                raise ValueError("recompute_plan.swap_inputs must be a boolean.")
+            if plan.swap_inputs and (not self.memory.recompute or not plan.apply_modules):
+                raise ValueError("recompute_plan.swap_inputs requires recompute=true and a non-empty apply_modules.")
+        self.memory.recompute_plan = [] if plan is None else plan
+        self.memory.op_replay_scopes = [
+            OpReplayScopeConfig(**scope) if isinstance(scope, dict) else scope for scope in self.memory.op_replay_scopes
+        ]
+        for scope in self.memory.op_replay_scopes:
+            if not scope.apply_modules or not isinstance(scope.save_rng, bool):
+                raise ValueError("Replay scopes require apply_modules and boolean save_rng")
+            from fsdp_turbo.memory.op_replay.op_replay import _parse_op_list
+
+            _parse_op_list(scope.cache_ops)
+            if scope.quantizer is not None and (
+                not isinstance(scope.quantizer, str) or scope.quantizer not in QUANTIZERS
+            ):
+                raise ValueError(f"Unknown payload quantizer {scope.quantizer!r}; expected one of {sorted(QUANTIZERS)}")
+            if (
+                not isinstance(scope.fp8_block_size, int)
+                or scope.fp8_block_size not in Fp8BlockwiseQuantizer.SUPPORTED_BLOCK_SIZES
+            ):
+                raise ValueError("fp8_block_size must be 64, 128, 192 or 256")
+            if scope.quantizer == Fp8BlockwiseQuantizer.name:
+                if not fp8_payload_quant_supported():
+                    raise ValueError("fp8_blockwise is only supported on Ascend 950PR&950DT products")
+            elif scope.fp8_block_size != Fp8BlockwiseQuantizer.DEFAULT_BLOCK_SIZE:
+                raise ValueError("fp8_block_size requires quantizer='fp8_blockwise'")
+        if self.memory.op_replay_scopes and not self.memory.recompute:
+            raise ValueError("op_replay_scopes requires recompute=true")
 
     def validate_chunk_batch_config(self):
         """Normalize and validate chunk-batch configuration.
@@ -1464,7 +1529,11 @@ def _dict_to_dataclass(cls, data):
                 if arg is not type(None) and dc.is_dataclass(arg):  # pylint: disable=unidiomatic-typecheck
                     optional_dataclass = arg
                     break
-        if dc.is_dataclass(field_type) and isinstance(value, dict):
+        # Structured recompute plans include replay scopes and use_reentrant,
+        # consumed by validate_recompute_config rather than RecomputePlanConfig.
+        if cls is MemoryConfig and key == "recompute_plan":
+            kwargs[key] = value
+        elif dc.is_dataclass(field_type) and isinstance(value, dict):
             kwargs[key] = _dict_to_dataclass(field_type, value)
         elif optional_dataclass is not None and isinstance(value, dict):
             kwargs[key] = _dict_to_dataclass(optional_dataclass, value)

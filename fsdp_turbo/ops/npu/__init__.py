@@ -4,6 +4,13 @@ import logging
 # Register the lazy adapter before imports of optional native libraries.
 from fsdp_turbo.ops.npu.tilekernels_mhc import tilekernels_mhc_post_npu
 from fsdp_turbo.ops.npu.cce_loss import cce_loss_npu
+from fsdp_turbo.ops.npu.payload_quant import (
+    dequant_fp8_blockwise_npu,
+    dequant_int8_per_row_npu,
+    dynamic_block_quant_npu,
+    dynamic_quant_npu,
+    fp8_payload_quant_supported_npu,
+)
 from fsdp_turbo.ops.npu.attn_res import attn_res_npu
 from fsdp_turbo.ops.npu.attention_projection import attention_output_projection_npu
 from fsdp_turbo.ops.npu.clipped_swiglu import clipped_swiglu_npu
@@ -86,6 +93,11 @@ except ImportError:  # depends on the torch_npu wheel exposing the SFA op
 __all__ = [
     "sparse_indexer_gradient_npu",
     'attention_output_projection_npu',
+    'dequant_fp8_blockwise_npu',
+    'dequant_int8_per_row_npu',
+    'dynamic_block_quant_npu',
+    'dynamic_quant_npu',
+    'fp8_payload_quant_supported_npu',
     'cce_loss_npu',
     'attn_res_npu',
     'clipped_swiglu_npu',

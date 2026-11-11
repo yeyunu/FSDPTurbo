@@ -26,13 +26,18 @@ pool with the H2D waiting `_put_stream`, and `_wait_h2d` settles on both
 streams, so a zero-cost REPLICATED eviction needs no wait of its own.
 """
 
+from __future__ import annotations
+
 import itertools
 import torch
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, List
+from typing import TYPE_CHECKING, Optional, List
 
 from .slab_arena import SlabArena, TensorBuffer
+
+if TYPE_CHECKING:
+    from .quantizer import PayloadQuantizer
 
 
 @dataclass(frozen=True)
@@ -73,15 +78,30 @@ class SwapHandle:
     Swap streams are required (SwapCache always provides them); constructing a
     handle without streams is a programming error. All copies are issued on
     the swap stream(s) and ordered via events — there is no synchronous path.
+
+    quantizer/meta: opaque payload transform and device-resident reconstruction
+    metadata, released by clear(). The state machine accounts only payload bytes.
     """
 
-    _id_counter = itertools.count()  # process-wide monotonic id, for logging/debugging only
+    _id_counter = itertools.count()  # process-wide monotonic id for diagnostics
 
-    def __init__(self, tensor, h2d_stream=None, d2h_stream=None, *, cpu_arena: SlabArena):
+    def __init__(
+        self,
+        tensor: torch.Tensor,
+        h2d_stream: Optional[torch.Stream] = None,
+        d2h_stream: Optional[torch.Stream] = None,
+        *,
+        cpu_arena: SlabArena,
+        quantizer: Optional[PayloadQuantizer] = None,
+        meta: Optional[object] = None,
+    ) -> None:
         self.tensor: Optional[torch.Tensor] = tensor
         self.id = next(SwapHandle._id_counter)
         self._cpu_arena = cpu_arena
         self._bytes = cpu_arena.payload_bytes(tensor)
+        # Opaque metadata (including device-resident scales) belongs to the quantizer.
+        self.quantizer = quantizer
+        self.meta = meta
         # H2D/D2H share one stream by default: on a half-duplex host link,
         # concurrent streams compete for bandwidth while a single stream
         # serializes both directions and eliminates cross-stream races.
@@ -218,6 +238,8 @@ class SwapHandle:
         host code reading it directly must synchronize the device first
         (tests call _sync_device()). Tenants should prefer pop/consume,
         which land the payload on device with proper ordering.
+        With a quantizer, get() exposes the payload; SwapCache.pop() restores
+        the original dtype and shape.
         """
         self.wait()
         if self._state in (SwapState.HBM_ONLY, SwapState.REPLICATED):
@@ -229,6 +251,7 @@ class SwapHandle:
         raise RuntimeError(f"Handle {self.id}: no tensor in state {self._state.name}")
 
     def swap_out(self) -> MemDelta:
+        """Issue D2H if needed and return the memory-accounting delta."""
         if self._state in (SwapState.DDR_ONLY, SwapState.D2H_IN_PROGRESS):
             return MemDelta(0, 0)
         if self._state == SwapState.H2D_IN_PROGRESS:
@@ -260,6 +283,7 @@ class SwapHandle:
         return MemDelta(hbm=0, ddr=self._bytes)
 
     def swap_in(self) -> MemDelta:
+        """Issue H2D if needed and return the memory-accounting delta."""
         if self._state in (SwapState.HBM_ONLY, SwapState.REPLICATED, SwapState.H2D_IN_PROGRESS):
             return MemDelta(0, 0)
         if self._state == SwapState.D2H_IN_PROGRESS:
@@ -288,6 +312,8 @@ class SwapHandle:
         return MemDelta(hbm=self._bytes, ddr=0)
 
     def clear(self) -> MemDelta:
+        """Drop quantizer metadata, settle copies, and release payload resources."""
+        self.quantizer = self.meta = None
         delta = self.wait()
         if self._state == SwapState.HBM_ONLY:
             # HBM_ONLY means never offloaded, so no buffer was ever registered
@@ -334,7 +360,7 @@ class SwapCache:
 
     Token model: the SwapHandle returned by put is the sole token for pop
     (and the cache key, so tenants need no numbering space).
-    handle.id is a process-wide monotonic number, for logging/debugging only.
+    handle.id is a process-wide monotonic number for diagnostics.
 
     Capacity semantics (capacity_bytes):
     - None: no capacity management (pass-through, nothing is evicted);
@@ -370,7 +396,7 @@ class SwapCache:
         eviction_policy="fifo",
         enable_prefetch: bool = True,
     ):
-        if torch.accelerator.current_accelerator() is None:
+        if not torch.accelerator.is_available():
             raise RuntimeError("SwapCache requires a usable device (CUDA/NPU); swap is not available on CPU-only hosts")
         # capacity_bytes: None (or negative, defensive normalization) disables
         # capacity management (pass-through); 0 means "zero capacity" (evict
@@ -528,11 +554,28 @@ class SwapCache:
             if self._d2h_in_flight:
                 self._wait_oldest_d2h()
 
-    def put(self, tensor: torch.Tensor) -> SwapHandle:
+    def put(self, tensor: torch.Tensor, quantizer: Optional[PayloadQuantizer] = None) -> SwapHandle:
+        """Cache a payload, optionally quantizing on the calling stream without RNG or autograd.
+
+        Capacity and DMA account only the payload; opaque metadata stays on device.
+        The put event is recorded after quantization. Inputs must not be mutated
+        while cached; unsupported inputs pass through with no metadata.
+        """
         # Returns the handle (the sole pop token) with
         # hbm_bytes <= capacity_bytes guaranteed; the soft limit decides how
         # early proactive eviction starts.
-        handle = SwapHandle(tensor, h2d_stream=self._h2d_stream, d2h_stream=self._d2h_stream, cpu_arena=self._cpu_arena)
+        meta = None
+        if quantizer is not None:
+            with torch.no_grad():
+                tensor, meta = quantizer.quantize(tensor)
+        handle = SwapHandle(
+            tensor,
+            h2d_stream=self._h2d_stream,
+            d2h_stream=self._d2h_stream,
+            cpu_arena=self._cpu_arena,
+            quantizer=quantizer,
+            meta=meta,
+        )
         self.handles[handle] = None
         self._put_order.append(handle)
         self._handle_to_put_idx[handle] = len(self._put_order) - 1
@@ -542,6 +585,12 @@ class SwapCache:
         return handle
 
     def pop(self, handle: SwapHandle) -> Optional[torch.Tensor]:
+        """Consume on the calling stream, dequantizing to a new tensor when requested.
+
+        The plain path preserves tensor identity when its HBM copy is available.
+        Snapshot metadata before consume clears the handle. Dequantization is
+        outside cache accounting, as in MindSpeed-MM.
+        """
         if handle not in self.handles:
             return None
         del self.handles[handle]
@@ -549,6 +598,7 @@ class SwapCache:
             self._iter_stats['hbm_hit'] += 1
         else:
             self._iter_stats['ddr_load'] += 1
+        quantizer, meta = handle.quantizer, handle.meta
         tensor, delta = handle.consume()
         self._apply(delta)
         self._d2h_in_flight.pop(handle, None)  # consume may have waited out an in-flight D2H
@@ -565,6 +615,9 @@ class SwapCache:
         # cache cannot infer iteration boundaries from its own state,
         # so the upper layer delimits iterations via end_iteration()/clear().
 
+        if quantizer is not None and tensor is not None:
+            with torch.no_grad():
+                return quantizer.dequantize(tensor, meta)
         return tensor
 
     def _prefetch_chain(self) -> None:

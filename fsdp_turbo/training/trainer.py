@@ -304,6 +304,9 @@ class BaseTrainer:
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
         self.optimizer.zero_grad()
+        swap_manager = getattr(self.model, "swap_manager", None)
+        if swap_manager is not None:
+            swap_manager.step_end()
         return grad_norm
 
     def _on_log_step(

@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 CheckpointContextFn = Callable[[], tuple[AbstractContextManager, AbstractContextManager]]
 CheckpointContextFnFactory = Callable[[Optional[nn.Module]], Optional[CheckpointContextFn]]
+CheckpointInputContextFactory = Callable[[], AbstractContextManager]
 
 ReplayContextFn = Callable[[nn.Module], AbstractContextManager]
 
@@ -134,6 +135,10 @@ class RecomputePlanConfig:
             "reaches save_for_backward (needed by tenants that swap saved activations)."
         },
     )
+    swap_inputs: bool = field(
+        default=False,
+        metadata={"help": "Offload eligible checkpoint inputs through the shared swap cache."},
+    )
 
 
 def recompute_modules(
@@ -141,6 +146,8 @@ def recompute_modules(
     plan: List[str] | RecomputePlanConfig,
     context_fn_factory: Optional[CheckpointContextFnFactory] = None,
     reject_nested: bool = False,
+    *,
+    input_context: CheckpointInputContextFactory = nullcontext,
 ) -> nn.Module:
     """Wire checkpoint-based recompute onto the modules or methods in ``plan``.
 
@@ -150,6 +157,7 @@ def recompute_modules(
         context_fn_factory: Called once per target at wiring time. Module targets pass their module;
             method targets pass ``None``. It returns a checkpoint context_fn or ``None``.
         reject_nested: Whether to reject ancestor/descendant module checkpoint coverage.
+        input_context: Context factory entered before checkpoint saves its inputs.
 
     Returns:
         The input model with checkpoint wrappers installed.
@@ -187,11 +195,14 @@ def recompute_modules(
             context_fn_factory,
             plan.flatten_inputs,
             module,
+            input_context=input_context,
         )
     wrapped_module_ids = {id(module) for _, module in modules}
     wrapped_methods = set()
     for pattern in method_entries:
-        _apply_recompute_method(model, pattern, plan, context_fn_factory, wrapped_module_ids, wrapped_methods)
+        _apply_recompute_method(
+            model, pattern, plan, context_fn_factory, wrapped_module_ids, wrapped_methods, input_context
+        )
 
     return model
 
@@ -202,7 +213,9 @@ def _normalize_plan(plan: List[str] | RecomputePlanConfig) -> RecomputePlanConfi
     return RecomputePlanConfig(apply_modules=list(plan))
 
 
-def _apply_recompute_method(model, pattern, plan, context_fn_factory, wrapped_module_ids, wrapped_methods):
+def _apply_recompute_method(
+    model, pattern, plan, context_fn_factory, wrapped_module_ids, wrapped_methods, input_context
+):
     """Wrap a method on every module matching the prefix of *pattern*.
 
     'model.layers.{*}._attention_forward' -> module pattern 'model.layers.{*}',
@@ -225,7 +238,11 @@ def _apply_recompute_method(model, pattern, plan, context_fn_factory, wrapped_mo
         if method is None or not callable(method):
             raise RuntimeError(f'[Recompute] No callable method {method_name!r} on module {name!r}.')
         print_rank(logger.info, f'Applying recompute to method: {name}.{method_name}')
-        setattr(module, method_name, recompute_wrapper(method, context_fn_factory, plan.flatten_inputs))
+        setattr(
+            module,
+            method_name,
+            recompute_wrapper(method, context_fn_factory, plan.flatten_inputs, input_context=input_context),
+        )
         wrapped_methods.add(method_key)
     if not matched:
         raise RuntimeError(f'[Recompute] No module named {module_pattern} (from {pattern!r}).')
@@ -239,7 +256,7 @@ def _check_no_nested_checkpoints(modules):
     """
     names = [name for name, _ in modules]
     for outer in names:
-        prefix = outer + '.'
+        prefix = outer + '.' if outer else ''
         for inner in names:
             if inner != outer and inner.startswith(prefix):
                 raise ValueError(
@@ -355,6 +372,8 @@ def recompute_wrapper(
     context_fn_factory: Optional[CheckpointContextFnFactory] = None,
     flatten_inputs: bool = False,
     module: Optional[nn.Module] = None,
+    *,
+    input_context: CheckpointInputContextFactory = nullcontext,
 ) -> Callable[..., object]:
     """Wrap a callable with non-reentrant checkpointing.
 
@@ -363,6 +382,7 @@ def recompute_wrapper(
         context_fn_factory: Optional factory invoked once at wiring time.
         flatten_inputs: Whether to flatten the full argument tree before checkpointing.
         module: Owning module passed to the factory, or ``None`` for method targets.
+        input_context: Context factory entered before checkpoint saves its inputs.
 
     Returns:
         A wrapper that invokes ``function`` through non-reentrant checkpointing.
@@ -396,9 +416,10 @@ def recompute_wrapper(
             args, kwargs = bound.args, bound.kwargs
 
         checkpoint_kwargs = {} if context_fn is None else {'context_fn': context_fn}
-        if flatten_inputs:
-            flattened_function, unique_leaves = _flatten_call(function, args, kwargs)
-            return checkpoint(flattened_function, *unique_leaves, use_reentrant=False, **checkpoint_kwargs)
-        return checkpoint(function, *args, use_reentrant=False, **checkpoint_kwargs, **kwargs)
+        with input_context():
+            if flatten_inputs:
+                flattened_function, unique_leaves = _flatten_call(function, args, kwargs)
+                return checkpoint(flattened_function, *unique_leaves, use_reentrant=False, **checkpoint_kwargs)
+            return checkpoint(function, *args, use_reentrant=False, **checkpoint_kwargs, **kwargs)
 
     return wrapper

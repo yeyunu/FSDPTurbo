@@ -40,6 +40,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 from fsdp_turbo.utils.log import print_rank
 from fsdp_turbo.utils.str_match import module_name_match
 from fsdp_turbo.memory.swap.swap_core import SwapCache, SwapHandle
+from fsdp_turbo.memory.swap.quantizer import QUANTIZERS, Fp8BlockwiseQuantizer, PayloadQuantizer
 
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,14 @@ class OpReplayScopeConfig:
             "['aten.matmul.default', 'npu.npu_fusion_attention.default']). "
             "None falls back to the built-in default whitelist."
         },
+    )
+    quantizer: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional payload quantizer: int8_pertoken or fp8_blockwise. None keeps original precision."},
+    )
+    fp8_block_size: int = field(
+        default=128,
+        metadata={"help": "Column block size for fp8_blockwise on Ascend 950PR&950DT products: 64, 128, 192 or 256."},
     )
 
 
@@ -216,12 +225,19 @@ class OpReplayScope:
     save_rng:  record/replay post-op RNG snapshots for this scope's cached ops
     """
 
-    def __init__(self, cache_ops=None, save_rng=True, name=None):
+    def __init__(
+        self,
+        cache_ops: Optional[set[torch._ops.OpOverload]] = None,
+        save_rng: bool = True,
+        name: Optional[str] = None,
+        quantizer: Optional[str | PayloadQuantizer] = None,
+    ) -> None:
         if cache_ops is None:
             cache_ops = _default_cache_ops()
         self.cache_ops = cache_ops
         self.save_rng = save_rng
         self.name = name
+        self.quantizer = QUANTIZERS[quantizer] if isinstance(quantizer, str) else quantizer
 
     @classmethod
     def from_config(cls, cfg: OpReplayScopeConfig) -> "OpReplayScope":
@@ -229,10 +245,14 @@ class OpReplayScope:
         cfg.cache_ops -> built-in default whitelist (the fallback lives in
         the constructor, so both entry paths agree).
         """
+        quantizer = cfg.quantizer
+        if quantizer == Fp8BlockwiseQuantizer.name and cfg.fp8_block_size != Fp8BlockwiseQuantizer.DEFAULT_BLOCK_SIZE:
+            quantizer = Fp8BlockwiseQuantizer(block_size=cfg.fp8_block_size)
         return cls(
             cache_ops=_parse_op_list(cfg.cache_ops),
             save_rng=cfg.save_rng,
             name=cfg.name,
+            quantizer=quantizer,
         )
 
     def __repr__(self):
@@ -302,7 +322,9 @@ class OpReplayCachingMode(_OpReplayMode):
         has_tensor = False
         for leaf in leaves:
             if isinstance(leaf, torch.Tensor):
-                handle = self.session.op_cache.put(_maybe_detach(leaf, any_ret_has_alias_info))
+                handle = self.session.op_cache.put(
+                    _maybe_detach(leaf, any_ret_has_alias_info), quantizer=scope.quantizer
+                )
                 info_leaves.append(_HandleInfo(handle))
                 has_tensor = True
             else:
