@@ -10,6 +10,7 @@ FSDPTurbo内置基于PyTorch Profiler的性能数据采集能力，通过YAML配
 run:
   profile:
     enabled: true
+    ranks: [0]
     wait_steps: 0
     warmup_steps: 0
     active_steps: 10
@@ -26,6 +27,7 @@ run:
 | 参数 | 说明 |
 |---|---|
 | `enabled` | Profiling开关 |
+| `ranks` | 只在指定全局rank上采集（如`[0]`），未列入的rank零开销跳过；不配置（或设为`null`）表示全部rank采集 |
 | `wait_steps` / `warmup_steps` / `active_steps` / `repeat` | Profiler调度：等待/预热/采集步数与重复轮数 |
 | `skip_first` | 跳过起始步数 |
 | `output_dir` | Profiling数据输出目录 |

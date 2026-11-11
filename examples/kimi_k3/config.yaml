@@ -12,6 +12,10 @@ model:
   # Non-CP runs use this interface (upstream behavior); CP runs switch to the
   # flash kernel from the CP state.
   attn_implementation: "flash_attention_2"
+  # Performance-testing switch: builds on the meta device (zero-fill after
+  # sharding), skips checkpoint reading. Values are meaningless; pair with
+  # ep_plan.fixed_router for MoE models to keep the a2a load balanced.
+  skip_weight_load: false
 
 # --- Optimizer Configuration ---
 optimizer:
@@ -38,6 +42,9 @@ run:
   logging_steps: 1
   profile:
     enabled: false
+    # Global ranks that collect profiler data; unlisted ranks run with a
+    # zero-overhead no-op. null = all ranks collect.
+    ranks: null
     wait_steps: 0
     warmup_steps: 0
     active_steps: 10

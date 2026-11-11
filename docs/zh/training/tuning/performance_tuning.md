@@ -10,6 +10,24 @@
 - **通信瓶颈**：AllGather / ReduceScatter耗时占比高，需调整预取策略或并行度。
 - **显存瓶颈**：频繁OOM或显存碎片化，需开启重计算 / CPU offload等内存优化。
 
+## 快速性能验证
+
+需要快速测量端到端吞吐、排除权重加载耗时干扰时，开启`model.skip_weight_load: true`：
+模型在meta设备上只构建网络结构（零磁盘I/O、零CPU物化），FSDP分片完成后每rank仅在
+加速器上物化自己的分片并零填充。权重数值无意义，仅适用于性能测量；需要真实权重
+数值的场景必须保持`false`。
+
+该开关的meta建模与物化流程由各训练入口自行实现，当前仅在
+`examples/kimi_k3/train.py`中生效；其他示例（如deepseek_v41走模型专用的
+初始化路径）不响应此配置。
+
+MoE模型使用该开关时须同时开启`ep_plan.fixed_router: true`：零填充会把
+router权重置零，top-k路由退化到固定专家集合，导致EP负载严重失衡甚至OOM；
+固定均匀路由与权重数值无关，可保持a2a负载均衡。
+
+开启`fsdp_plan.cpu_offload`时，参数分片在CPU上物化、buffer留在计算设备，
+与offload语义一致；其他场景物化在加速器上。
+
 ## 通信优化
 
 | 手段 | 配置项 | 说明 |

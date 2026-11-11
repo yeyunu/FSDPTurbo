@@ -61,12 +61,23 @@ class KimiK3Trainer(BaseTrainer):
             kda_backend=cp_plan.kda_backend,
             mla_backend=cp_plan.mla_backend,
         )
-        model = model_class.from_pretrained(
-            self.config.model.model_name_or_path,
-            config=model_config,
-            attn_implementation=self.config.model.attn_implementation,
-            trust_remote_code=False,
-        )
+        # Perf-test switch: skip checkpoint reading, build the network on the
+        # meta device, then materialize per-rank shards after FSDP sharding.
+        skip_weight_load = self.config.model.skip_weight_load
+        if skip_weight_load:
+            with torch.device("meta"):
+                model = model_class.from_config(
+                    model_config,
+                    attn_implementation=self.config.model.attn_implementation,
+                    trust_remote_code=False,
+                )
+        else:
+            model = model_class.from_pretrained(
+                self.config.model.model_name_or_path,
+                config=model_config,
+                attn_implementation=self.config.model.attn_implementation,
+                trust_remote_code=False,
+            )
         convert_model_dtype(model, self.config.model.torch_dtype)
         if self.config.memory.chunk_loss:
             # The CP-aware forward reads these attributes off the top-level model
@@ -83,6 +94,27 @@ class KimiK3Trainer(BaseTrainer):
 
         print_rank(logger.info, "> Applying FSDPTurbo parallelism...")
         model = FSDPTurbo(self.config, model)
+
+        if skip_weight_load:
+            # Materialize only this rank's shard (host-side under cpu_offload;
+            # buffers always follow the compute device). Zero-fill keeps
+            # startup collective-free; pair with ep_plan.fixed_router so the
+            # zeroed router does not skew MoE a2a load balance.
+            device = (
+                torch.device("cpu")
+                if self.config.distributed.fsdp_plan.cpu_offload
+                else torch.accelerator.current_accelerator()
+            )
+            model.to_empty(device=device)
+            if device.type == "cpu":
+                compute_device = torch.accelerator.current_accelerator()
+                for buffer in model.buffers():
+                    buffer.data = buffer.data.to(compute_device)
+            with torch.no_grad():
+                for param in model.parameters():
+                    param.zero_()
+                for buffer in model.buffers():
+                    buffer.zero_()
 
         print_rank(logger.info, "> Model built successfully")
         return model

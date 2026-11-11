@@ -74,6 +74,10 @@ class ModelConfig:
     use_fused_causal_conv1d: bool = False
     use_fused_gdn: bool = False
     tilekernels: Dict[str, bool] = field(default_factory=lambda: {"tilekernels_mhc_post": False})
+    # Perf-test switch: skip checkpoint reading, build the network on the
+    # meta device and zero-fill per-rank shards after FSDP sharding. Values
+    # are meaningless; keep False whenever real weights are needed.
+    skip_weight_load: bool = False
 
 
 @dataclass
@@ -121,6 +125,9 @@ class OptimizerConfig:
 @dataclass
 class ProfileConfig:
     enabled: bool = False
+    # Collect the profiler only on the listed global ranks (zero-overhead
+    # nullcontext elsewhere); None = all ranks.
+    ranks: Optional[List[int]] = None
     wait_steps: int = 0
     warmup_steps: int = 0
     active_steps: int = 1
@@ -577,6 +584,7 @@ class FSDPTurboConfig:
         self.validate_fsdp_config()
         self.validate_vp_config()
         self.validate_memory_snapshot_config()
+        self.validate_profile_config()
         self.validate_optimizer_config()
 
     def validate_optimizer_config(self):
@@ -660,6 +668,8 @@ class FSDPTurboConfig:
             not isinstance(self.model.config_path, str) or not self.model.config_path.strip()
         ):
             raise ValueError("model.config_path must be a non-empty string when provided.")
+        if not isinstance(self.model.skip_weight_load, bool):
+            raise ValueError("model.skip_weight_load must be a boolean.")
         if not isinstance(self.model.use_fused_clipped_swiglu, bool):
             raise ValueError("model.use_fused_clipped_swiglu must be a boolean.")
         if not isinstance(self.model.use_triton_inplace_rope, bool):
@@ -783,6 +793,15 @@ class FSDPTurboConfig:
             self.distributed.fsdp_plan.ignored_modules = list(
                 set(self.distributed.fsdp_plan.ignored_modules)
             )  # remove duplicates
+
+    def validate_profile_config(self):
+        """Validate the run.profile collection section."""
+        ranks = self.run.profile.ranks
+        if ranks is not None and (
+            not isinstance(ranks, (list, tuple))
+            or any(not isinstance(rank, int) or isinstance(rank, bool) or rank < 0 for rank in ranks)
+        ):
+            raise ValueError("run.profile.ranks must be a list of non-negative integers or null.")
 
     def validate_memory_snapshot_config(self):
         """Validate the run.memory_snapshot collection section."""
