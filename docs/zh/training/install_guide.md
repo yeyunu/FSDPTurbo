@@ -47,7 +47,7 @@ FSDPTurbo当前仅支持源码安装。请参考如下操作获取对应源码�
    建议使用Python 3.12版本，具体可参见[版本说明](../release_notes_fsdpturbo.md)。若不希望影响全局Python环境，可使用venv、conda、uv等常用虚拟环境管理工具创建独立的虚拟环境。以conda为例，可参考如下命令：
 
    ```bash
-   conda create -n fsdpturbo python=3.11
+   conda create -n fsdpturbo python=3.12
    conda activate fsdpturbo
    ```
 

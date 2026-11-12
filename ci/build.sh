@@ -6,11 +6,11 @@ DOCKERFILE="${SCRIPT_DIR}/Dockerfile"
 
 NPU_TYPE="910b"
 OS="openeuler24.03"
-BASE_IMAGE_VERSION="9.0.0"
+BASE_IMAGE_VERSION="9.1.0"
 BASE_IMAGE=""
-PYTHON_VERSION="3.11"
+PYTHON_VERSION="3.12"
 TORCH_VERSION="2.10"
-TORCH_NPU_VERSION="2.10"
+TORCH_NPU_VERSION="2.10.0.post4"
 TORCHVISION_VERSION="0.25.0"
 IMAGE_NAME=""
 NO_CACHE=""
@@ -46,19 +46,19 @@ Options:
     -o, --os OS               OS: openeuler24.03 or ubuntu22.04 (default: openeuler24.03, auto-detected from --base-image if not specified)
     -i, --image-name NAME     Image name (default: fsdpturbo-ci:{chip}-{os}-py{py_ver}-{arch})
     -n, --no-cache            Build without cache
-    --base-image-version VER  Base image CANN version (default: 9.0.0)
+    --base-image-version VER  Base image CANN version (default: 9.1.0)
     --base-image IMAGE        Full base image name (higher priority than --base-image-version; passed through unchanged)
-    --python-version VER      Python tag in the CANN base image (default: 3.11)
+    --python-version VER      Python tag in the CANN base image (default: 3.12)
     --torch-version VER       PyTorch version (default: 2.10)
-    --torch-npu-version VER   torch_npu version (default: 2.10)
+    --torch-npu-version VER   torch_npu version (default: 2.10.0.post4)
     --torchvision-version VER torchvision version (default: 0.25.0)
     --cleanup-on-fail         Clean dangling images/containers if build fails
     -h, --help                Show help
 
 Examples:
     bash $0
-    bash $0 -t a3 -o openeuler24.03 --base-image-version 9.0.0
-    bash $0 --base-image swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-openeuler24.03-py3.11
+    bash $0 -t a3 -o openeuler24.03 --base-image-version 9.1.0
+    bash $0 --base-image swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-openeuler24.03-py3.12
 
 Note:
     CANN base image tags use lowercase chip names, such as a3 and 910b. A full --base-image value is used exactly as provided.

@@ -8,9 +8,9 @@
 # ============================================
 
 ARG OS=openeuler24.03
-ARG BASE_IMAGE_VERSION=9.0.0
+ARG BASE_IMAGE_VERSION=9.1.0
 ARG NPU_TYPE=910b
-ARG PYTHON_VERSION=3.11
+ARG PYTHON_VERSION=3.12
 ARG BASE_IMAGE=""
 
 FROM ${BASE_IMAGE:-swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:${BASE_IMAGE_VERSION}-${NPU_TYPE}-${OS}-py${PYTHON_VERSION}}
@@ -20,7 +20,7 @@ SHELL ["/bin/bash", "-c"]
 
 ARG OS_FAMILY=ubuntu
 ARG TORCH_VERSION=2.10
-ARG TORCH_NPU_VERSION=2.10
+ARG TORCH_NPU_VERSION=2.10.0.post4
 ARG TORCHVISION_VERSION=0.25.0
 
 # Prepare required system dependencies

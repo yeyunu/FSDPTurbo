@@ -6,9 +6,9 @@
 | ------ | ------ |
 | 镜像名称 | `fsdpturbo-ci` |
 | 源码仓库 | [https://gitcode.com/Ascend/FSDPTurbo](https://gitcode.com/Ascend/FSDPTurbo) |
-| Dockerfile 路径 | `docker/Dockerfile` |
+| Dockerfile路径 | `ci/Dockerfile` |
 | 默认场景 | FSDPTurbo 运行时环境（CANN + PyTorch + torch_npu） |
-| 基础镜像 | 可配置 CANN 镜像，默认 `swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.0.0-910b-openeuler24.03-py3.11` |
+| 基础镜像 | 可配置CANN镜像，默认`swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-openeuler24.03-py3.12` |
 | 默认工作目录 | `/workspace` |
 
 ## 设计理念
@@ -27,8 +27,8 @@
 
 示例：
 
-- `910b-ubuntu22.04-py3.11-x86_64`
-- `a3-openeuler24.03-py3.11-aarch64`
+- `910b-ubuntu22.04-py3.12-x86_64`
+- `a3-openeuler24.03-py3.12-aarch64`
 
 ## 构建参数
 
@@ -36,18 +36,18 @@
 | ------ | ------ | ------ |
 | `-t, --npu-type` | NPU 类型：`a3` 或 `910b` | `910b` |
 | `-o, --os` | 操作系统：`openeuler24.03` 或 `ubuntu22.04` | `openeuler24.03` |
-| `--base-image-version` | CANN 基础镜像版本 | `9.0.0` |
+| `--base-image-version` | CANN基础镜像版本 | `9.1.0` |
 | `--base-image` | 完整 CANN 基础镜像名，优先级高于 `--base-image-version`；会原样传入 | 空 |
-| `--python-version` | CANN 基础镜像中的 Python 标签 | `3.11` |
+| `--python-version` | CANN基础镜像中的Python标签 | `3.12` |
 | `--torch-version` | PyTorch 版本 | `2.10` |
-| `--torch-npu-version` | TorchNPU 版本 | `2.10` |
+| `--torch-npu-version` | TorchNPU版本 | `2.10.0.post4` |
 
 ## 快速开始
 
 ### 构建镜像
 
 ```bash
-cd docker
+cd ci
 bash build.sh
 ```
 
@@ -89,7 +89,7 @@ docker run -it -d \
   -v {path-to-fsdpturbo}:/workspace/FSDPTurbo \
   -v {path-to-data}:/data \
   -v {path-to-weights}:/weights \
-  fsdpturbo-ci:910b-openeuler24.03-py3.11-aarch64 \
+  fsdpturbo-ci:910b-openeuler24.03-py3.12-aarch64 \
   /bin/bash
 ```
 
@@ -108,13 +108,13 @@ python -c "import fsdp_turbo; print('FSDPTurbo OK')"
 ## 兼容性说明
 
 - 当前版本采用统一 Dockerfile + 构建脚本结构，支持可配置的 CANN 基础镜像选择。
-- 默认基础镜像使用 CANN 9.0.0、910b、openEuler 24.03、Python 3.11。
-- 可以通过 `docker/build.sh` 切换 Ubuntu 22.04、a3 或其他 CANN 基础镜像版本。
+- 默认基础镜像使用CANN 9.1.0、910b、openEuler 24.03、Python 3.12。
+- 可以通过`ci/build.sh`切换Ubuntu 22.04、a3或其他CANN基础镜像版本。
 - 镜像预装 PyTorch、TorchNPU 以及 FSDPTurbo 的 Python 依赖（transformers、datasets、pyyaml）。
 - FSDPTurbo 源码需从宿主机挂载，容器内 `pip install -e` 安装后可随时修改代码。
 
 ## 许可证
 
-FSDPTurbo 基于 Apache License 2.0 许可证发布。详见 [LICENSE](https://gitcode.com/Ascend/FSDPTurbo/blob/master/LICENSE) 文件。
+FSDPTurbo基于Apache License 2.0许可证发布。详见[LICENSE](../LICENSE)文件。
 
 与所有 Docker 镜像一样，这些镜像可能还包含受其他许可证约束的其他软件（例如基础发行版中的 Bash，以及所包含主要软件的任何直接或间接依赖项）。
