@@ -14,6 +14,7 @@ CI 门禁用例看护仓库重点模型和基础特性，覆盖冒烟测试场�
 | ST | Kimi-K3 | Kimi-K3 减层冒烟, FSP=8, EP=8, EFP=1 | [run_test_kimi_k3.sh](system_tests/model/kimi_k3/run_test_kimi_k3.sh) | Y | Y | Y |
 | ST | DeepSeekV4 | DeepSeekV4-4L 减层冒烟, FSP=8, recompute / chunk_batch / chunk_loss / swap_activation / swap_optimizer 特性组合 | [run_test_deepseekv4.sh](system_tests/model/deepseekv4/run_test_deepseekv4.sh) | Y | Y | Y |
 | ST | GLM-5.3-Flash | GLM-5.3-Flash 减层冒烟, FSP=8, Ulysses CP=2, EP=8 | [run_test_glm5_3_flash.sh](system_tests/model/glm5.3_flash/run_test_glm5_3_flash.sh) | Y | Y | Y |
+| ST | Qwen3.8-Flash-Next | Qwen3.8-Flash-Next (qwen4_exp) 减层冒烟, FSP=4, EP=8, EFP=1, PLE n-gram CPU offload | [run_test_qwen3_8_flash_next.sh](system_tests/model/qwen3.8_flash_next/run_test_qwen3_8_flash_next.sh) | | | |
 | UT | distributed | 上下文并行（Ulysses / KCP / KDA）、EP dispatcher 量化 | [test_context_parallel.py](unit_tests/distributed/context_parallel/test_context_parallel.py) [test_kda_context_parallel.py](unit_tests/distributed/context_parallel/test_kda_context_parallel.py) [test_dispatcher_quant.py](unit_tests/distributed/expert_parallel/test_dispatcher_quant.py) | Y | | |
 | UT | distributed | EP 负载均衡接口、重计算缓存；双进程 Gloo 比较 all2all / allgather 输出及梯度 | [test_ep_balance.py](unit_tests/distributed/expert_parallel/test_ep_balance.py) | Y | | |
 | UT | memory | 激活重计算 | [test_recompute.py](unit_tests/memory/test_recompute.py) | Y | | |
