@@ -23,6 +23,7 @@ class HyperConnection(nn.Module):
         self.scale = nn.Parameter(torch.empty(3))
 
     def forward(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply device-dispatched Sinkhorn mixing and collapse streams on the input device."""
         flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
 
         mixes = F.linear(flat, self.fn.float())

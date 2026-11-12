@@ -5,7 +5,7 @@ from typing import Set, List, Any, Optional
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy
+from torch.distributed.fsdp import CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy, OffloadPolicy
 from torch.distributed._composable_state import _get_module_state
 from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
 from fsdp_turbo.fsdp_turbo_config import EPPlanConfig, FSDPPlanConfig
@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 def fully_shard_parallel_modules(
     model: torch.nn.Module, fsdp_mesh: DeviceMesh, fsdp_plan: FSDPPlanConfig, ep_plan: EPPlanConfig = None
-):
+) -> torch.nn.Module:
+    """Wrap dense FSDP units while preserving ignored state and expert prefetch coordination."""
     ignored_modules, ignored_params = get_ignored_modules(model, fsdp_plan)
     fsdp_modules = get_fsdp_modules(model, fsdp_plan, ignored_modules)
     hook_modules = get_fsdp_hook_modules(model, fsdp_plan)
@@ -54,27 +55,9 @@ def fully_shard_parallel_modules(
         hook_module = find_hook_module(module, hook_modules)
         fully_shard_fn(module, hook_module=hook_module, **module_config)
     fully_shard_fn(model, **config)
-    # Ignored modules are not wrapped into any FSDP unit, so FSDP never moves
-    # their parameters to the compute device, and forward fails with device
-    # mismatch. Move them parameter by parameter here. Exceptions:
-    # - Modules with pre_fsdp_hook: apply_pre_fsdp_module_hooks already invoked
-    #   their hook before FSDP and they manage device layout themselves (e.g.
-    #   the host-offload engram table must stay on host after materializing;
-    #   moving it would OOM and break the host storage protocol)
-    # - Meta placeholder parameters: filled by the loading/materialize flow;
-    #   to() would silently materialize an uninitialized tensor
-    # Parameters of FSDP descendants are already on device, so to() is
-    # idempotent. A pure CPU mesh needs no move.
     if ignored_modules and fsdp_mesh.device_type != "cpu":
         device = torch.device(f"{fsdp_mesh.device_type}:{torch.accelerator.current_device_index()}")
-        for name, module in model.named_modules():
-            if name not in ignored_modules:
-                continue
-            if callable(getattr(module, "pre_fsdp_hook", None)):
-                continue
-            for t in (*module.parameters(recurse=True), *module.buffers(recurse=True)):
-                if not t.is_meta:
-                    t.data = t.data.to(device)
+        _move_unmanaged_ignored_modules(model, ignored_modules, device)
     layer_expert_units: dict[torch.nn.Module, list[torch.nn.Module]] = {}
     layer_moe_blocks: dict[torch.nn.Module, torch.nn.Module] = {}
     build_expert_map = fsdp_plan.num_to_forward_prefetch > 0 or fsdp_plan.backward_prefetch_on_moe_input
@@ -97,6 +80,36 @@ def fully_shard_parallel_modules(
         for layer in order[first_expert_idx + 1 :]:
             layer.register_forward_pre_hook(_wait_expert_a2a_hook, prepend=True)
     return model
+
+
+def _move_unmanaged_ignored_modules(model, ignored_modules, device):
+    """Move ignored state without overriding nested FSDP or host-storage ownership."""
+    ignored_submodules = {
+        descendant
+        for name, module in model.named_modules()
+        if name in ignored_modules
+        for descendant in module.modules()
+    }
+    protected_submodules = {
+        descendant
+        for module in ignored_submodules
+        if isinstance(module, FSDPModule) or callable(getattr(module, "pre_fsdp_hook", None))
+        for descendant in module.modules()
+    }
+    protected_tensors = {
+        tensor
+        for module in protected_submodules
+        for tensor in (*module.parameters(recurse=False), *module.buffers(recurse=False))
+    }
+    moved_tensors = set()
+    for module in model.modules():
+        if module not in ignored_submodules or module in protected_submodules:
+            continue
+        for tensor in (*module.parameters(recurse=False), *module.buffers(recurse=False)):
+            if tensor.is_meta or tensor in protected_tensors or tensor in moved_tensors:
+                continue
+            tensor.data = tensor.data.to(device)
+            moved_tensors.add(tensor)
 
 
 def _wait_expert_a2a_hook(module, args):

@@ -85,6 +85,8 @@ fsdp_plan:
   pin_memory: true
 ```
 
+被`ignored_modules`排除的模块仅迁移尚未由FSDP或`pre_fsdp_hook`管理的参数与buffer。已独立分片的专家子模块、Host存储子模块及其共享张量保留原有设备归属，避免CPU Offload下直接修改DTensor存储导致设备信息不一致；meta张量仍由后续物化流程处理。
+
 ### 分片后物化参数
 
 DeepSeek-V4.1 示例先通过 `prepare_deepseek_v41_model_for_fsdp` 将普通参数转为 meta，

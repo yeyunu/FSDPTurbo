@@ -80,9 +80,14 @@ def _hc_split_sinkhorn_kernel_part2(
 
     row_max = tl.max(comb, axis=2)
     comb = tl.exp(comb - row_max[:, :, None])
-    comb = tl.where(pid_mask[:, None, None], comb, 0.0)
+    row_sum = tl.sum(comb, axis=2)
+    comb = comb / row_sum[:, :, None] + eps
+    column_mask = tl.arange(0, BLOCK_ALIGN) < hc_mult
+    comb = tl.where(pid_mask[:, None, None] & column_mask[None, None, :], comb, 0.0)
+    col_sum = tl.sum(comb, axis=1)
+    comb = comb / (col_sum[:, None, :] + eps)
 
-    for _ in range(sinkhorn_iters):
+    for _ in range(sinkhorn_iters - 1):
         row_sum = tl.sum(comb, axis=2)
         comb = comb / (row_sum[:, :, None] + eps)
 
@@ -101,6 +106,7 @@ def hc_split_sinkhorn(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute mHC coefficients with softmax-plus-epsilon and fused Sinkhorn normalization."""
     origin_dtype = mixes.dtype
     mixes = mixes.to(dtype=torch.float32)
     hc_scale = hc_scale.to(dtype=torch.float32)
@@ -265,74 +271,72 @@ def hc_split_sinkhorn_backward_kernel_part2(
 
     row_sum_list = tl.full((sinkhorn_iters, group, hc_mult, 1), 0.0, dtype=tl.float32)
     col_sum_list = tl.full((sinkhorn_iters, group, 1, BLOCK_ALIGN), 0.0, dtype=tl.float32)
-    K = tl.where(pid_mask[:, None, None], exp_comb, 0.0)
+    softmax_comb = exp_comb / tl.sum(exp_comb, axis=2)[:, :, None]
+    current_comb = tl.where(pid_mask[:, None, None] & mask_val, softmax_comb + eps, 0.0)
+    initial_col_sum = tl.sum(current_comb, axis=1)[:, None, :] + eps
+    current_comb = current_comb / initial_col_sum
 
-    for i in range(sinkhorn_iters):
-        row_sum = tl.sum(K, axis=2).reshape(group, hc_mult, 1)
-        K_row = K / (row_sum + eps)
+    for iteration in range(sinkhorn_iters - 1):
+        row_sum = tl.sum(current_comb, axis=2).reshape(group, hc_mult, 1)
+        row_normalized = current_comb / (row_sum + eps)
 
-        col_sum = tl.sum(K_row, axis=1).reshape(group, 1, BLOCK_ALIGN)
-        K_col = K_row / (col_sum + eps)
+        col_sum = tl.sum(row_normalized, axis=1).reshape(group, 1, BLOCK_ALIGN)
+        column_normalized = row_normalized / (col_sum + eps)
 
         row_sum_list = extension.insert_slice(
             ful=row_sum_list,
             sub=row_sum[None, :, :, :],
-            offsets=[i, 0, 0, 0],
+            offsets=[iteration, 0, 0, 0],
             sizes=[1, group, hc_mult, 1],
             strides=[1, 1, 1, 1],
         )
         col_sum_list = extension.insert_slice(
             ful=col_sum_list,
             sub=col_sum[None, :, :, :],
-            offsets=[i, 0, 0, 0],
+            offsets=[iteration, 0, 0, 0],
             sizes=[1, group, 1, BLOCK_ALIGN],
             strides=[1, 1, 1, 1],
         )
-        K = K_col
+        current_comb = column_normalized
 
     grad_comb_flat = tl.load(grad_comb_ptr + pid_feat_off + arange_val, mask=pid_mask[:, None], other=0.0)
-    dK = grad_comb_flat.reshape(group, hc_mult, BLOCK_ALIGN)
+    grad_current = grad_comb_flat.reshape(group, hc_mult, BLOCK_ALIGN)
 
-    for j in range(sinkhorn_iters):
-        i = sinkhorn_iters - j - 1
+    for reverse_iteration in range(sinkhorn_iters - 1):
+        iteration = sinkhorn_iters - reverse_iteration - 2
 
         row_sum = extension.extract_slice(
             row_sum_list,
-            [i, 0, 0, 0],
+            [iteration, 0, 0, 0],
             [1, group, hc_mult, 1],
             [1, 1, 1, 1],
         )
         col_sum = extension.extract_slice(
             col_sum_list,
-            [i, 0, 0, 0],
+            [iteration, 0, 0, 0],
             [1, group, 1, BLOCK_ALIGN],
             [1, 1, 1, 1],
         )
 
         col_sum = col_sum.reshape(group, 1, BLOCK_ALIGN) + eps
         row_sum = row_sum.reshape(group, hc_mult, 1) + eps
-        K_col = K * col_sum
+        column_input = current_comb * col_sum
 
-        grad_direct = dK / col_sum
-        d_col_sum_compressed = -tl.sum(dK * K_col / (col_sum * col_sum), axis=-2)
-        dK_row = grad_direct + d_col_sum_compressed[:, None, :]
+        grad_direct = grad_current / col_sum
+        d_col_sum_compressed = -tl.sum(grad_current * column_input / (col_sum * col_sum), axis=-2)
+        grad_row = grad_direct + d_col_sum_compressed[:, None, :]
 
-        K_row = K_col * row_sum
-        K = K_row
+        row_input = column_input * row_sum
+        current_comb = row_input
 
-        grad_direct_row = dK_row / row_sum
-        d_row_sum_compressed = -tl.sum(dK_row * K_row / (row_sum * row_sum), axis=-1)
-        dK = grad_direct_row + d_row_sum_compressed[:, :, None]
+        grad_direct_row = grad_row / row_sum
+        d_row_sum_compressed = -tl.sum(grad_row * row_input / (row_sum * row_sum), axis=-1)
+        grad_current = grad_direct_row + d_row_sum_compressed[:, :, None]
 
-        dK = dK * mask_val
+        grad_current = grad_current * mask_val
 
-    d_exp_comb = dK
-    d_comb_before_exp = d_exp_comb * exp_comb
-
-    max_mask = tl.where(comb_init == row_max, 1.0, 0.0)
-    max_count = tl.sum(max_mask, axis=-1).reshape(group, hc_mult, 1) + eps
-    row_sum_d_before_exp = tl.sum(d_comb_before_exp, axis=-1).reshape(group, hc_mult, 1)
-    d_comb_init = d_comb_before_exp - (row_sum_d_before_exp * max_mask / max_count)
+    grad_softmax = (grad_current - tl.sum(grad_current * current_comb, axis=1)[:, None, :]) / initial_col_sum
+    d_comb_init = softmax_comb * (grad_softmax - tl.sum(grad_softmax * softmax_comb, axis=2)[:, :, None])
 
     grad_comb_slice_flat = d_comb_init * scale_comb
 
@@ -362,10 +366,11 @@ def hc_split_sinkhorn_backward(
     sinkhorn_iters: int = 20,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiate the eager-equivalent fused formula, preserving each input's gradient dtype."""
     b, s, _ = mixes.shape
     batch_seq_size = b * s
 
-    origin_dtype = mixes.dtype
+    mixes_dtype, scale_dtype, base_dtype = mixes.dtype, hc_scale.dtype, hc_base.dtype
     mixes = mixes.to(dtype=torch.float32)
     hc_scale = hc_scale.to(dtype=torch.float32)
     hc_base = hc_base.to(dtype=torch.float32)
@@ -437,8 +442,8 @@ def hc_split_sinkhorn_backward(
     grad_mixes[:, :, 2 * hc_mult :] = grad_mixes_slice
     grad_hc_base[2 * hc_mult :] = grad_hc_base_slice
 
-    grad_mixes = grad_mixes.to(dtype=origin_dtype)
-    grad_hc_scale = grad_hc_scale.to(dtype=origin_dtype)
-    grad_hc_base = grad_hc_base.to(dtype=origin_dtype)
+    grad_mixes = grad_mixes.to(dtype=mixes_dtype)
+    grad_hc_scale = grad_hc_scale.to(dtype=scale_dtype)
+    grad_hc_base = grad_hc_base.to(dtype=base_dtype)
 
     return grad_mixes, grad_hc_scale, grad_hc_base
