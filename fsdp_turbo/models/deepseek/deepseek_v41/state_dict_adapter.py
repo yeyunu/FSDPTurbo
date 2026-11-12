@@ -440,21 +440,21 @@ def load_deepseek_v41_from_pretrained(
             )
 
         partial_options = StateDictOptions(strict=False)
-        for group_name in sorted(groups, key=lambda name: (name == "root", name)):
-            print_rank(logger.info, f"> Loading HuggingFace weight group: {group_name}")
-            hf_state = adapter.to_hf(groups[group_name])
-            hf_state = {
-                key: _match_checkpoint_layout(
+
+        ordered_groups = sorted(groups, key=lambda name: (name == "root", name))
+        print_rank(logger.info, f"> Loading HuggingFace weights of {len(ordered_groups)} state groups")
+        hf_state: dict[str, Any] = {}
+        for group_name in ordered_groups:
+            for key, value in adapter.to_hf(groups[group_name]).items():
+                hf_state[key] = _match_checkpoint_layout(
                     key,
                     value,
                     _checkpoint_tensor_size(metadata, key),
                 )
-                for key, value in hf_state.items()
-            }
-            dcp.load(hf_state, storage_reader=reader)
-            loaded_state = adapter.from_hf(hf_state)
-            set_model_state_dict(model, loaded_state, options=partial_options)
-            del hf_state, loaded_state
+        dcp.load(hf_state, storage_reader=reader)
+        loaded_state = adapter.from_hf(hf_state)
+        set_model_state_dict(model, loaded_state, options=partial_options)
+        del hf_state, loaded_state
     finally:
         for table, weight in saved_table_weights:
             table.register_parameter("weight", weight)
