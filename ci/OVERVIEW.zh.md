@@ -8,7 +8,7 @@
 | 源码仓库 | [https://gitcode.com/Ascend/FSDPTurbo](https://gitcode.com/Ascend/FSDPTurbo) |
 | Dockerfile路径 | `ci/Dockerfile` |
 | 默认场景 | FSDPTurbo 运行时环境（CANN + PyTorch + torch_npu） |
-| 基础镜像 | 可配置CANN镜像，默认`swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-910b-openeuler24.03-py3.12` |
+| 基础镜像 | 可配置CANN镜像，默认`swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.2.0-910b-openeuler24.03-py3.12` |
 | 默认工作目录 | `/workspace` |
 
 ## 设计理念
@@ -36,7 +36,7 @@
 | ------ | ------ | ------ |
 | `-t, --npu-type` | NPU 类型：`a3` 或 `910b` | `910b` |
 | `-o, --os` | 操作系统：`openeuler24.03` 或 `ubuntu22.04` | `openeuler24.03` |
-| `--base-image-version` | CANN基础镜像版本 | `9.1.0` |
+| `--base-image-version` | CANN基础镜像版本 | `9.2.0` |
 | `--base-image` | 完整 CANN 基础镜像名，优先级高于 `--base-image-version`；会原样传入 | 空 |
 | `--python-version` | CANN基础镜像中的Python标签 | `3.12` |
 | `--torch-version` | PyTorch 版本 | `2.10` |
@@ -108,7 +108,7 @@ python -c "import fsdp_turbo; print('FSDPTurbo OK')"
 ## 兼容性说明
 
 - 当前版本采用统一 Dockerfile + 构建脚本结构，支持可配置的 CANN 基础镜像选择。
-- 默认基础镜像使用CANN 9.1.0、910b、openEuler 24.03、Python 3.12。
+- 默认基础镜像使用CANN 9.2.0、910b、openEuler 24.03、Python 3.12。
 - 可以通过`ci/build.sh`切换Ubuntu 22.04、a3或其他CANN基础镜像版本。
 - 镜像预装 PyTorch、TorchNPU 以及 FSDPTurbo 的 Python 依赖（transformers、datasets、pyyaml）。
 - FSDPTurbo 源码需从宿主机挂载，容器内 `pip install -e` 安装后可随时修改代码。

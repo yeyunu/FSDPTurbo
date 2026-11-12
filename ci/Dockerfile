@@ -8,7 +8,7 @@
 # ============================================
 
 ARG OS=openeuler24.03
-ARG BASE_IMAGE_VERSION=9.1.0
+ARG BASE_IMAGE_VERSION=9.2.0
 ARG NPU_TYPE=910b
 ARG PYTHON_VERSION=3.12
 ARG BASE_IMAGE=""
