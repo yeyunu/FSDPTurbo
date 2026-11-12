@@ -105,6 +105,7 @@ def _reduction_device() -> torch.device:
     return torch.device(torch.accelerator.current_accelerator().type, int(dev))
 
 
+@torch.no_grad()
 def compute_grad_norm(
     parameters: Union[list, torch.Tensor],
     norm_type: Union[int, float] = 2.0,
@@ -211,6 +212,7 @@ def compute_grad_norm(
     return total_sum.item() ** (1.0 / norm_type)
 
 
+@torch.no_grad()
 def clip_grad_by_norm(
     parameters: Union[list, torch.Tensor],
     max_norm: float,

@@ -419,8 +419,13 @@ class SwapOptimizerOperate:
 
 
 def _local(t):
-    """Return the local shard of a DTensor; plain tensors pass through."""
-    return t.to_local() if isinstance(t, DTensor) else t
+    """Return the local shard of a DTensor; plain tensors pass through.
+
+    Reads ``_local_tensor`` instead of ``to_local()``: the backward prefetch path
+    runs with grad enabled, where ``to_local()`` dispatches a ``_ToTorchTensor``
+    autograd Function per call although no gradient ever flows back here.
+    """
+    return t._local_tensor if isinstance(t, DTensor) else t
 
 
 class AdamWSwap(AdamW, SwapOptimizerOperate):
@@ -497,6 +502,7 @@ class AdamWSwap(AdamW, SwapOptimizerOperate):
             prefetch_batches=prefetch_batches,
         )
 
+    @torch.no_grad()
     def step(self, closure=None):
         loss = None
         if closure is not None:
