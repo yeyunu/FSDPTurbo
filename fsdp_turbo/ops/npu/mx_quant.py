@@ -1,5 +1,7 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 
+import torch
+
 from fsdp_turbo.ops.registry import register_op
 
 try:
@@ -9,7 +11,6 @@ except ImportError:
 
 try:
     import cann_ops_nn
-    import torch
 except ImportError:
     cann_ops_nn = None
 

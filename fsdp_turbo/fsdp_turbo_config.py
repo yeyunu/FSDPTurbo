@@ -354,6 +354,7 @@ class EPPlanConfig:
     dispatcher: Union[Literal["all2all", "allgather", "mc2", "domino", "chunkmoe", "moonep"], Callable, str] = "all2all"
     fixed_router: bool = False
     apply_efsdp_modules: List[str] = field(default_factory=list)
+    enable_efsdp_prefetch: bool = True
     moonep_config: Optional[MoonEPConfig] = None
     router_debug: Optional[KimiRouterDebugConfig] = None
     # Gradient divide factor for expert HSDP. When unset (None) it is
@@ -1167,6 +1168,8 @@ class FSDPTurboConfig:
             if self.distributed.ep_plan is None
             else self.distributed.ep_plan
         )
+        if not isinstance(self.distributed.ep_plan.enable_efsdp_prefetch, bool):
+            raise ValueError("distributed.ep_plan.enable_efsdp_prefetch must be boolean.")
         if self.distributed.ep_plan.gradient_divide_factor is None:
             # Divide across all expert mesh dims (edp * efsdp * ep). torchrun
             # sets WORLD_SIZE; fall back to 1 for non-distributed runs.

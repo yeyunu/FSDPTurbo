@@ -41,6 +41,8 @@ from fsdp_turbo.ops.npu.rms_norm import rms_norm_npu
 from fsdp_turbo.ops.npu.rope import inplace_rope_npu, partial_rope_npu, rope_npu
 from fsdp_turbo.ops.npu.partial_rotary import cann_partial_rotary
 from fsdp_turbo.ops.npu.fused_attention import npu_fusion_attention_npu
+from fsdp_turbo.ops.npu.glm_indexer import lightning_indexer_npu, indexer_kl_loss_npu
+from fsdp_turbo.ops.npu.selected_attention import selected_attention_npu
 from fsdp_turbo.ops.npu.qsa import qsa_compress_block_keys_npu, qsa_selected_token_mask_npu
 
 from fsdp_turbo.ops.npu.situ_glu import situ_glu_npu
@@ -91,6 +93,9 @@ except ImportError:  # depends on the torch_npu wheel exposing the SFA op
     sparse_flash_attention_npu = None
 
 __all__ = [
+    'lightning_indexer_npu',
+    'indexer_kl_loss_npu',
+    'selected_attention_npu',
     "sparse_indexer_gradient_npu",
     'attention_output_projection_npu',
     'dequant_fp8_blockwise_npu',

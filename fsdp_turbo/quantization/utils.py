@@ -157,8 +157,12 @@ def w4a16_module_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) ->
 
 
 def moe_filter_fn(mod: nn.Module, fqn: str, config: QuantBaseConfig) -> bool:
-    return "experts" in fqn.lower() and _apply_modules_match(
-        fqn, config, 'mxfp8_apply_modules', 'mxfp8_ignored_modules'
+    """Select grouped expert weights without matching dense shared-expert MLPs."""
+    return (
+        "experts" in fqn.lower()
+        and hasattr(mod, 'gate_up_proj')
+        and hasattr(mod, 'down_proj')
+        and _apply_modules_match(fqn, config, 'mxfp8_apply_modules', 'mxfp8_ignored_modules')
     )
 
 

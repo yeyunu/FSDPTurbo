@@ -15,6 +15,8 @@ from fsdp_turbo.ops.cpu.gdn import chunk_gdn_cpu, recurrent_gdn_cpu
 from fsdp_turbo.ops.cpu.chunk_kda import chunk_kda_cpu
 from fsdp_turbo.ops.cpu.engram import engram_backward_cpu, engram_forward_cpu, engram_wkv_cpu
 from fsdp_turbo.ops.cpu.fused_attention import npu_fusion_attention_cpu
+from fsdp_turbo.ops.cpu.glm_indexer import lightning_indexer_cpu, indexer_kl_loss_cpu
+from fsdp_turbo.ops.cpu.selected_attention import selected_attention_cpu
 from fsdp_turbo.ops.cpu.grouped_matmul import grouped_matmul_cpu, w4a16_grouped_matmul_cpu
 from fsdp_turbo.ops.cpu.grouped_matmul_mc2 import all2all_grouped_matmul_cpu, grouped_matmul_all2all_cpu
 from fsdp_turbo.ops.cpu.lightning_indexer import fused_lightning_indexer_cpu
@@ -46,6 +48,9 @@ from fsdp_turbo.ops.cpu.tilekernels_mhc import tilekernels_mhc_post_cpu
 from fsdp_turbo.ops.cpu.sparse_indexer_loss import sparse_indexer_gradient_torch
 
 __all__ = [
+    'lightning_indexer_cpu',
+    'indexer_kl_loss_cpu',
+    'selected_attention_cpu',
     "sparse_indexer_gradient_torch",
     'attention_output_projection_cpu',
     'dequant_fp8_blockwise_cpu',

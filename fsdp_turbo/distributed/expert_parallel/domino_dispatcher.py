@@ -2,21 +2,23 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 from __future__ import annotations
 
-from typing import Callable, Iterable, Optional
+from collections.abc import Callable, Iterable
+from typing import Optional
 
 import torch
-
 from torch.distributed.tensor import DTensor
+
 from fsdp_turbo.distributed.expert_parallel.comm import gather_along_first_dim_expert_parallel
-from fsdp_turbo.ops.moe import permute, unpermute, grouped_matmul
-from fsdp_turbo.ops.clipped_swiglu import clipped_swiglu
 from fsdp_turbo.distributed.expert_parallel.utils import (
     fixed_router_for_debug,
     normalize_expert_args,
     record_last_expert_a2a_event,
 )
+from fsdp_turbo.ops.clipped_swiglu import clipped_swiglu
+from fsdp_turbo.ops.moe import grouped_matmul, permute, unpermute
 
 _DOMINO_NUM_SLICES = 2
+_DOMINO_COMM_STREAMS = {}
 
 
 def experts_computation(
@@ -25,7 +27,7 @@ def experts_computation(
     gate_up_weights: torch.Tensor,
     down_weights: torch.Tensor,
     act_fn: Callable[[torch.Tensor], torch.Tensor],
-    act_limit: Optional[float],
+    act_limit: float | None,
     fused: bool,
     use_fused_clipped_swiglu: bool = False,
 ) -> torch.Tensor:
@@ -61,7 +63,7 @@ def get_domino_experts_forward_fn(
 
     """
 
-    comm_streams = {}
+    comm_streams = _DOMINO_COMM_STREAMS
 
     def domino_experts_forward(
         self: torch.nn.Module, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
@@ -128,10 +130,10 @@ def dispatch_mlp_combine(
     top_k_weights_list: list[torch.Tensor],
     weights: tuple[torch.Tensor, torch.Tensor],
     act_fn: Callable[[torch.Tensor], torch.Tensor],
-    act_limit: Optional[float],
+    act_limit: float | None,
     num_global_experts: int,
     expert_ids_per_ep_rank: torch.Tensor,
-    comm_stream: Optional[torch.accelerator.Stream] = None,
+    comm_stream: torch.accelerator.Stream | None = None,
     use_fused_clipped_swiglu: bool = False,
     expert_module: Optional[torch.nn.Module] = None,
 ) -> list[torch.Tensor]:
@@ -205,16 +207,19 @@ def dispatch_mlp_combine(
         if p2_out is None:
             return
 
-        mlp_out = experts_computation(
-            p2_out,
-            num_tokens,
-            gate_up_weights,
-            down_weights,
-            act_fn,
-            act_limit,
-            fused,
-            use_fused_clipped_swiglu=use_fused_clipped_swiglu,
-        )
+        if expert_module is not None and hasattr(expert_module, "ep_forward"):
+            mlp_out = expert_module.ep_forward(p2_out, num_tokens)
+        else:
+            mlp_out = experts_computation(
+                p2_out,
+                num_tokens,
+                gate_up_weights,
+                down_weights,
+                act_fn,
+                act_limit,
+                fused,
+                use_fused_clipped_swiglu=use_fused_clipped_swiglu,
+            )
 
         up2_out = unpermute(mlp_out, up_idx2, use_eager=not fused)
         if up2_out.grad_fn is not None:
@@ -257,7 +262,12 @@ def dispatch_mlp_combine(
     return output_list
 
 
-def dispatch_preprocess(ep_group, top_k_index_list, num_global_experts, expert_ids_per_ep_rank):
+def dispatch_preprocess(
+    ep_group: torch.distributed.ProcessGroup,
+    top_k_index_list: list[torch.Tensor],
+    num_global_experts: int,
+    expert_ids_per_ep_rank: torch.Tensor,
+) -> dict[str, object]:
     """
     Preprocess step to calculate permutation indices and communication split sizes.
 
@@ -275,7 +285,11 @@ def dispatch_preprocess(ep_group, top_k_index_list, num_global_experts, expert_i
     local_experts_end_id = local_experts_start_id + num_local_experts
     # [S, E] --> [EP * S, E], where S is the fixed number of DOMINO slices.
     local_tokens_per_experts = torch.stack(
-        [torch.bincount(top_k_index.view(-1), minlength=num_global_experts) for top_k_index in top_k_index_list], dim=0
+        [
+            torch.histc(top_k_index.float(), bins=num_global_experts, min=0, max=num_global_experts).long()
+            for top_k_index in top_k_index_list
+        ],
+        dim=0,
     )
     num_global_tokens_per_expert, _ = gather_along_first_dim_expert_parallel(local_tokens_per_experts, ep_group)
     # [EP * S, E] --> [EP, S, E]
@@ -329,16 +343,16 @@ def prepare_dispatch_slice(preprocess_ctx, list_index):
 
 
 def domino_all_to_all(
-    group,
-    inputs,
-    output_split_sizes=None,
-    input_split_sizes=None,
-    comm_stream=None,
-    producer_event=None,
-    forward_event_list=None,
-    backward_event_list=None,
-    index=0,
-):
+    group: torch.distributed.ProcessGroup,
+    inputs: torch.Tensor,
+    output_split_sizes: Iterable[int] | None = None,
+    input_split_sizes: Iterable[int] | None = None,
+    comm_stream: torch.accelerator.Stream | None = None,
+    producer_event: torch.accelerator.Event | None = None,
+    forward_event_list: list[torch.accelerator.Event] | None = None,
+    backward_event_list: list[torch.accelerator.Event] | None = None,
+    index: int = 0,
+) -> torch.Tensor:
     """
     Wrapper for autograd function implementing DOMINO optimized AllToAll communication.
 
@@ -347,22 +361,25 @@ def domino_all_to_all(
         inputs: Input tensor to distribute
         output_split_sizes: Sizes for output splitting (for alltoall-v)
         input_split_sizes: Sizes for input splitting (for alltoall-v)
-        comm_stream: CUDA stream for communication
+        comm_stream: Accelerator stream owning the communication autograd node.
         forward_event: Event to synchronize forward pass
         backward_event: Event to synchronize backward pass
 
     """
-    return Domino_AllToAll.apply(
-        group,
-        inputs,
-        output_split_sizes,
-        input_split_sizes,
-        comm_stream,
-        producer_event,
-        forward_event_list,
-        backward_event_list,
-        index,
-    )
+    # Autograd must associate the node with the communication stream, so its
+    # consumers can wait without draining unrelated work on the compute stream.
+    with torch.accelerator.stream(comm_stream):
+        return _ReadyGradientAllToAll.apply(
+            group,
+            inputs,
+            output_split_sizes,
+            input_split_sizes,
+            comm_stream,
+            producer_event,
+            forward_event_list,
+            backward_event_list,
+            index,
+        )
 
 
 def empty_expert_output(dispatch_buf: torch.Tensor, hidden_dim: int, backward_event_list: list, index: int):
@@ -383,12 +400,12 @@ class Domino_AllToAll(torch.autograd.Function):
         ctx: torch.autograd.function.FunctionCtx,
         group: torch.distributed.ProcessGroup,
         inputs: torch.Tensor,
-        output_split_sizes: Optional[Iterable[int]],
-        input_split_sizes: Optional[Iterable[int]],
-        comm_stream: Optional[torch.accelerator.Stream] = None,
-        producer_event: Optional[torch.accelerator.Event] = None,
-        forward_event_list: Optional[list[torch.accelerator.Event]] = None,
-        backward_event_list: Optional[list[torch.accelerator.Event]] = None,
+        output_split_sizes: Iterable[int] | None,
+        input_split_sizes: Iterable[int] | None,
+        comm_stream: torch.accelerator.Stream | None = None,
+        producer_event: torch.accelerator.Event | None = None,
+        forward_event_list: list[torch.accelerator.Event] | None = None,
+        backward_event_list: list[torch.accelerator.Event] | None = None,
         index: int = 0,
     ) -> torch.Tensor:
         """
@@ -432,6 +449,16 @@ class Domino_AllToAll(torch.autograd.Function):
             res = _all_to_all_single(ctx.group, grad_output[0], ctx.input_split_sizes, ctx.output_split_sizes)
             ctx.backward_event_list[index] = torch.accelerator.current_stream().record_event()
         return None, res, None, None, None, None, None, None, None
+
+
+class _ReadyGradientAllToAll(Domino_AllToAll):
+    """Join side-stream gradients before returning them to autograd consumers."""
+
+    @staticmethod
+    def backward(ctx, *grad_output):
+        gradients = Domino_AllToAll.backward(ctx, *grad_output)
+        torch.accelerator.current_stream().wait_event(ctx.backward_event_list[ctx.index])
+        return gradients
 
 
 def _all_to_all_single(group, inputs, output_split_sizes=None, input_split_sizes=None):

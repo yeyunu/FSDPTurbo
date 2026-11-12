@@ -73,7 +73,10 @@ class MxGroupedMatmul(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor | None, ...]:
+        """Use host-side gradient shape metadata to detect empty token groups."""
         x, group_list, weight_bwd, weight_scale_bwd = ctx.saved_tensors
 
         if ctx.post_quant:
@@ -88,7 +91,7 @@ class MxGroupedMatmul(torch.autograd.Function):
             weight_scale_bwd = weight_scale_bwd.transpose(1, 2).contiguous()
 
         group_list_int32 = group_list.to(torch.int32)
-        total_tokens = group_list[-1].item()
+        total_tokens = grad_output.shape[0]
 
         grad_fp8, grad_scale = torch_npu.npu_dynamic_mx_quant(grad_output, axis=-1, dst_type=ctx.grad_fp8_dtype)
 

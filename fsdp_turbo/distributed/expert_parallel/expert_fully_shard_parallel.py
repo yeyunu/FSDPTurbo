@@ -86,9 +86,10 @@ def expert_fully_shard_modules(
             fully_shard_fn(experts, hook_module=hook_module, **config)
             set_gradient_divide_factor(experts, gradient_divide_factor)
 
-    set_modules_to_prefetch_efsdp(model, efsdp_modules, fsdp_plan)
+    if ep_plan.enable_efsdp_prefetch:
+        set_modules_to_prefetch_efsdp(model, efsdp_modules, fsdp_plan)
 
-    if fsdp_plan.num_to_backward_prefetch == 0:
+    if ep_plan.enable_efsdp_prefetch and fsdp_plan.num_to_backward_prefetch == 0:
         # FSDP2's default backward prefetch is enabled when no explicit list
         # is set, so a configured depth of zero needs an explicit override.
         disable_default_backward_prefetch(model.modules())
