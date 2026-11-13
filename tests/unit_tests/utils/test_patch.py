@@ -92,7 +92,12 @@ class PatchTargetTests(unittest.TestCase):
 
             callable_attribute = CallableAttribute()
 
+        class ReplacementBlock:
+            def forward(self, value):
+                return value * 3
+
         self.model_module.Block = Block
+        self.model_module.ReplacementBlock = ReplacementBlock
         sys.modules[self.owner_name] = self.owner
         sys.modules[self.alias_name] = self.alias
         sys.modules[self.model_name] = self.model_module
@@ -137,6 +142,19 @@ class PatchTargetTests(unittest.TestCase):
 
     def test_instance_method_patch_keeps_self_binding(self):
         matched = patch_model_members(self.model, f"{self.model_name}.Block.forward", patched_method)
+        self.assertEqual(matched, 1)
+        self.assertEqual(self.model.block.forward(4), 12)
+
+    def test_instance_method_patch_accepts_dotted_replacement(self):
+        _, matched = apply_module_patches(
+            self.model,
+            [
+                {
+                    "target": f"{self.model_name}.Block.forward",
+                    "replacement": f"{self.model_name}.ReplacementBlock.forward",
+                }
+            ],
+        )
         self.assertEqual(matched, 1)
         self.assertEqual(self.model.block.forward(4), 12)
 

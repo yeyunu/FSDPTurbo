@@ -30,13 +30,20 @@ def indexed_sparse_attention_torch(
     backward never materializes a ``[batch, query_length, kv_length, head_dim]``
     gradient. Repeated selected positions accumulate into the same KV row.
     """
-    del use_sparse_flash_attn, compress_ratio, window_size, cu_seqlens
+    del use_sparse_flash_attn, window_size, cu_seqlens
     del cu_seqlens_ori_kv, cu_seqlens_cmp_kv
     if layout.upper() != "BSND":
         raise NotImplementedError("The PyTorch indexed-attention fallback only supports BSND.")
     if compressed_key_value is not None:
         if compressed_topk_indices is None:
-            raise ValueError("compressed_topk_indices is required with compressed_key_value")
+            compressed_length = compressed_key_value.size(1)
+            compressed_topk_indices = torch.arange(compressed_length, device=query.device)
+            compressed_topk_indices = compressed_topk_indices.view(1, 1, -1).expand(query.size(0), query.size(1), -1)
+            causal_threshold = (torch.arange(query.size(1), device=query.device) + 1) // compress_ratio
+            compressed_topk_indices = compressed_topk_indices.masked_fill(
+                compressed_topk_indices >= causal_threshold.view(1, -1, 1),
+                -1,
+            )
         compressed_topk_indices = torch.where(
             compressed_topk_indices >= 0,
             compressed_topk_indices + key_value.size(1),

@@ -84,6 +84,7 @@ _REFERENCE_MODEL_KWARGS = {
     "num_nextn_predict_layers": 0,
     "max_position_embeddings": 4096,
     "attention_dropout": 0.0,
+    "use_sparse_flash_attn": True,
     "tie_word_embeddings": False,
     "bos_token_id": 0,  # nosec B105 - token id, not a secret
     "eos_token_id": 1,  # nosec B105 - token id, not a secret

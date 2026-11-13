@@ -15,6 +15,7 @@ from .adapter import (
 )
 from .context_parallel import build_raw_attention_mask, deepseek_v4_cp_attention_forward
 from .modeling import (
+    DeepseekV4Attention,
     DeepseekV4Config,
     DeepseekV4DecoderLayer,
     DeepseekV4Experts,
@@ -25,6 +26,7 @@ from .modeling import (
 
 __all__ = [
     "DeepseekV4CausalLMOutput",
+    "DeepseekV4Attention",
     "DeepseekV4Config",
     "DeepseekV4DecoderLayer",
     "DeepseekV4Experts",

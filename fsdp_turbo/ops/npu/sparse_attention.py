@@ -9,6 +9,7 @@ import torch
 
 from fsdp_turbo.ops.cpu.sparse_attention import indexed_sparse_attention_torch
 from fsdp_turbo.ops.registry import register_op
+from fsdp_turbo.utils.env import sparse_flash_mla_validation_enabled
 
 
 def _get_cann_ops():
@@ -33,7 +34,7 @@ def _cmp_mask_mode(has_compressed_kv: bool) -> int:
 
 @lru_cache(maxsize=16)
 def _is_a2_or_a3(device_index: int | None) -> bool:
-    device_name = torch.accelerator.get_device_name(device_index)
+    device_name = torch.npu.get_device_name(device_index)
     normalized_name = device_name.upper().replace("-", "").replace(" ", "")
     return any(model in normalized_name for model in ("ASCEND910B", "ASCEND910C", "ASCEND910_93"))
 
@@ -126,11 +127,8 @@ def _validate_sparse_flash_mla_inputs(
     )
 
     has_compressed_kv = compressed_kv is not None
-    require(
-        has_compressed_kv == (compressed_indices is not None),
-        "requires cmp_kv and cmp_sparse_indices to be both present or both absent",
-    )
     if not has_compressed_kv:
+        require(compressed_indices is None, "requires cmp_kv with cmp_sparse_indices")
         require(compress_ratio == 1, "requires cmp_ratio=1 without compressed KV")
         return
 
@@ -144,9 +142,13 @@ def _validate_sparse_flash_mla_inputs(
     require(compressed_kv.dtype == query.dtype, "requires q and cmp_kv dtypes to match")
     require(compressed_kv.device == query.device, "requires q and cmp_kv on one device")
     require(
-        compressed_indices.ndim == 3,
-        "expects cmp_sparse_indices with shape [B,S,K] before padding",
+        compressed_kv.shape[1] * compress_ratio + original_kv.shape[1] % compress_ratio == original_kv.shape[1],
+        "requires ori_len == cmp_len * cmp_ratio + residual",
     )
+    if compressed_indices is None:
+        require(compress_ratio == 128, "HCA requires cmp_ratio=128 when compressed indices are absent")
+        return
+    require(compressed_indices.ndim == 3, "expects cmp_sparse_indices with shape [B,S,K] before padding")
     require(
         compressed_indices.shape[:2] == query.shape[:2],
         "requires cmp_sparse_indices batch/query dimensions to match q",
@@ -164,12 +166,8 @@ def _validate_sparse_flash_mla_inputs(
         compressed_indices.shape[-1] <= 1024,
         "supports at most 1024 compressed indices",
     )
-    require(
-        compressed_kv.shape[1] * compress_ratio + original_kv.shape[1] % compress_ratio == original_kv.shape[1],
-        "requires ori_len == cmp_len * cmp_ratio + residual",
-    )
 
-    if os.getenv("FSDP_TURBO_VALIDATE_SPARSE_FLASH_MLA", "0") != "1":
+    if not sparse_flash_mla_validation_enabled():
         return
 
     indices = compressed_indices.to(dtype=torch.int32)
@@ -514,7 +512,8 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
             if has_compressed_kv
             else 0
         )
-        topk = compressed_indices.shape[-1] if has_compressed_kv else 0
+        has_compressed_indices = compressed_indices is not None
+        topk = compressed_indices.shape[-1] if has_compressed_indices else 0
         metadata_kwargs = dict(
             batch_size=batch_size,
             num_query_heads=num_query_heads,
@@ -565,9 +564,12 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
 
         saved = [query, original_kv, result, softmax_lse, attention_sink]
         if has_compressed_kv:
-            saved.extend((compressed_kv, compressed_indices))
+            saved.append(compressed_kv)
+        if has_compressed_indices:
+            saved.append(compressed_indices)
         ctx.save_for_backward(*saved)
         ctx.has_compressed_kv = has_compressed_kv
+        ctx.has_compressed_indices = has_compressed_indices
         ctx.softmax_scale = softmax_scale
         ctx.compress_ratio = compress_ratio
         ctx.window_size = window_size
@@ -584,7 +586,7 @@ class _SparseFlashMlaFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         query, original_kv, result, softmax_lse, attention_sink, *optional = ctx.saved_tensors
         compressed_kv = optional[0] if ctx.has_compressed_kv else None
-        compressed_indices = optional[1] if ctx.has_compressed_kv else None
+        compressed_indices = optional[1] if ctx.has_compressed_indices else None
         batch_size = ctx.metadata_kwargs["batch_size"]
         layout = ctx.layout
         cu_seqlens = ctx.cu_seqlens
@@ -681,6 +683,11 @@ def npu_sparse_flash_mla(
 ) -> torch.Tensor:
     """Run SparseFlashMla in BSND or packed TND layout.
 
+    With compressed KV, ``compressed_indices=None`` selects the HCA causal
+    prefix and requires ``compress_ratio=128``. Both HCA and CSA validate the
+    compressed length: floor(original length / ratio) in BSND, summed per
+    document in TND. CSA supplies explicit Lightning Indexer rows.
+
     ``cu_seqlens_ori_kv`` / ``cu_seqlens_cmp_kv`` decouple the KV prefix from the
     query segment, which packed-TND context parallelism needs: a rank owns a
     query slice but reads each document's whole prefix.
@@ -725,6 +732,8 @@ def npu_sparse_flash_mla(
                     f"floor(length / ratio): expected {expected_compressed_tokens}, "
                     f"got {compressed_kv.shape[0]}"
                 )
+            if compressed_indices is None and compress_ratio != 128:
+                raise ValueError("SparseFlashMla HCA requires cmp_ratio=128 when compressed indices are absent.")
     else:
         if cu_seqlens is not None:
             raise ValueError("cu_seqlens must be None for BSND layout")
@@ -740,9 +749,8 @@ def npu_sparse_flash_mla(
             window_size,
         )
     if compressed_kv is not None:
-        if compressed_indices is None:
-            raise ValueError("compressed_topk_indices is required with compressed_key_value")
-        compressed_indices = _prepare_compressed_indices(compressed_indices, query)
+        if compressed_indices is not None:
+            compressed_indices = _prepare_compressed_indices(compressed_indices, query)
         compressed_kv = compressed_kv.unsqueeze(2 if layout == "BSND" else 1)
     elif compressed_indices is not None:
         raise ValueError("compressed_key_value is required with compressed_topk_indices")

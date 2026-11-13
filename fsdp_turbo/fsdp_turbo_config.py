@@ -713,7 +713,7 @@ class FSDPTurboConfig:
         if self.model.track_indexer_kl_loss and coefficient == 0:
             raise ValueError("track_indexer_kl_loss requires a positive indexer_loss_coeff.")
 
-    def validate_data_config(self):
+    def validate_data_config(self) -> None:
         """Validate and normalize dataloader configuration."""
         if self.data.max_seq_length <= 0:
             raise ValueError("data.max_seq_length must be positive.")

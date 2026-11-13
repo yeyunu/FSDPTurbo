@@ -11,6 +11,11 @@ def get_local_rank() -> int:
     return int(os.environ.get("LOCAL_RANK", "-1"))
 
 
+def sparse_flash_mla_validation_enabled() -> bool:
+    """Enable expensive sparse-attention mask/index checks only when explicitly set to 1."""
+    return os.environ.get("FSDP_TURBO_VALIDATE_SPARSE_FLASH_MLA", "0") == "1"
+
+
 def env_flag(name: str, default: bool = False) -> bool:
     """Read a boolean flag; ``1``/``true``/``yes``/``on`` (any case) are true.
 
@@ -23,4 +28,4 @@ def env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in _TRUE
 
 
-__all__ = ["env_flag", "get_local_rank"]
+__all__ = ["env_flag", "get_local_rank", "sparse_flash_mla_validation_enabled"]

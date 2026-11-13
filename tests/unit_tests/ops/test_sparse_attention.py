@@ -189,6 +189,45 @@ def test_indexed_sparse_attention_cpu_merges_compressed_kv():
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_indexed_sparse_attention_cpu_builds_hca_causal_indices():
+    torch.manual_seed(39)
+    query = torch.randn(1, 8, 1, 4)
+    key_value = torch.randn(1, 8, 4)
+    compressed_key_value = torch.randn(1, 2, 4)
+    attention_sink = torch.randn(1)
+    positions = torch.arange(8)
+    original_indices = torch.arange(8).view(1, 1, -1).expand(1, 8, -1)
+    original_indices = original_indices.masked_fill(original_indices > positions.view(1, -1, 1), -1)
+
+    output = get_op('indexed_sparse_attention', 'cpu')(
+        query,
+        key_value,
+        attention_sink,
+        original_indices,
+        0.2,
+        compressed_key_value=compressed_key_value,
+        compress_ratio=4,
+    )
+
+    compressed_indices = torch.arange(2).view(1, 1, -1).expand(1, 8, -1)
+    compressed_indices = compressed_indices.masked_fill(
+        compressed_indices >= ((positions + 1) // 4).view(1, -1, 1),
+        -1,
+    )
+    merged_indices = torch.cat(
+        (original_indices, torch.where(compressed_indices >= 0, compressed_indices + 8, compressed_indices)),
+        dim=-1,
+    )
+    expected = _reference_indexed_sparse_attention(
+        query,
+        torch.cat((key_value, compressed_key_value), dim=1),
+        attention_sink,
+        merged_indices,
+        0.2,
+    )
+    torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_indexed_sparse_attention_cpu_rejects_non_bsnd_layout():
     query = torch.randn(1, 2, 1, 4)
     key_value = torch.randn(1, 3, 4)

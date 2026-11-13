@@ -193,7 +193,7 @@ def resolve_callable(path_or_callable):
 
     Args:
         path_or_callable: A callable object or a path such as
-            ``package.module.replacement``.
+            ``package.module.replacement`` or ``package.module.Class.method``.
 
     Raises:
         TypeError: If the resolved object is not callable.
@@ -208,8 +208,13 @@ def resolve_callable(path_or_callable):
     module_path, sep, name = path.rpartition(".")
     if not sep:
         raise ValueError(f"Invalid callable path {path!r}.")
-    module = import_module_or_suffix(module_path)
-    fn = getattr(module, name, None)
+    try:
+        module = import_module_or_suffix(module_path)
+    except ModuleNotFoundError:
+        cls, member_name = resolve_class_member(path)
+        fn = getattr(cls, member_name, None)
+    else:
+        fn = getattr(module, name, None)
     if not callable(fn):
         raise TypeError(f"Resolved object {path!r} is not callable.")
     return fn
