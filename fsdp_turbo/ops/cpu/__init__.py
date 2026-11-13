@@ -47,10 +47,13 @@ from fsdp_turbo.ops.cpu.tilekernels_mhc import tilekernels_mhc_post_cpu
 
 from fsdp_turbo.ops.cpu.sparse_indexer_loss import sparse_indexer_gradient_torch
 
+from fsdp_turbo.ops.cpu.vision_flash_attention import fused_vision_flash_attention_cpu
+
 __all__ = [
     'lightning_indexer_cpu',
     'indexer_kl_loss_cpu',
     'selected_attention_cpu',
+    'fused_vision_flash_attention_cpu',
     "sparse_indexer_gradient_torch",
     'attention_output_projection_cpu',
     'dequant_fp8_blockwise_cpu',

@@ -12,7 +12,6 @@ import torch
 from fsdp_turbo.ops.registry import register_op
 
 
-_LAYOUT = "BSND"
 _FULL_SEQUENCE_TOKENS = 2**31 - 1
 
 
@@ -34,10 +33,6 @@ def _validate_shape_and_dtype(tensor: torch.Tensor, name: str) -> None:
         raise ValueError("Fused vision FlashAttentionScore requires NPU tensors")
     if tensor.dtype != torch.bfloat16:
         raise ValueError(f"Fused vision FlashAttentionScore requires BF16 {name}, got {tensor.dtype}")
-    if tensor.ndim != 4 or tensor.shape[0] != 1:
-        raise ValueError(
-            f"Fused vision FlashAttentionScore expects {name} in [1,S,N,D] BSND layout, got {tuple(tensor.shape)}"
-        )
     if tensor.shape[-1] <= 0 or tensor.shape[-1] > 512:
         raise ValueError(f"FlashAttentionScore requires head_dim in [1, 512], got {tensor.shape[-1]}")
 
@@ -47,13 +42,12 @@ def fused_vision_flash_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
+    *,
+    sequence_ends: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
-    """Compute full bidirectional MHA for one image in BSND layout."""
+    """Compute BSND or packed TND attention through CANN's autograd operator."""
     for tensor, name in ((query, "query"), (key, "key"), (value, "value")):
         _validate_shape_and_dtype(tensor, name)
-    if query.shape != key.shape or query.shape != value.shape:
-        raise ValueError("Fused vision FlashAttentionScore requires identical Q/K/V shapes")
-
     query = query.contiguous()
     key = key.contiguous()
     value = value.contiguous()
@@ -61,8 +55,8 @@ def fused_vision_flash_attention(
         query,
         key,
         value,
-        query.shape[2],
-        input_layout=_LAYOUT,
+        query.shape[-2],
+        input_layout="BSND" if sequence_ends is None else "TND",
         pse=None,
         padding_mask=None,
         atten_mask=None,
@@ -72,6 +66,8 @@ def fused_vision_flash_attention(
         next_tockens=_FULL_SEQUENCE_TOKENS,
         inner_precise=0,
         prefix=None,
+        actual_seq_qlen=sequence_ends,
+        actual_seq_kvlen=sequence_ends,
         sparse_mode=0,
     )
     return outputs[0]

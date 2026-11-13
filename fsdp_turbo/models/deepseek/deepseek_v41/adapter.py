@@ -16,15 +16,10 @@ from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
 from fsdp_turbo.memory.chunk_loss.chunkloss_lm_head import apply_chunkloss_module
-from fsdp_turbo.memory.chunk_loss.chunk_loss import (
-    calculate_lm_loss,
-    chunk_loss as compute_chunk_loss,
-    fixed_cross_entropy,
-)
+from fsdp_turbo.memory.chunk_loss.chunk_loss import calculate_lm_loss, chunk_loss as compute_chunk_loss
 from fsdp_turbo.memory.recompute.recompute import register_replay_context
 from fsdp_turbo.ops.indexer_kl_metric import current_indexer_kl_metrics
 from fsdp_turbo.ops.sparse_indexer_loss import collect_indexer_gradients
-from fsdp_turbo.ops.hf32_linear import hf32_linear
 
 from .engram.host_offload_engram import HostOffloadEngram
 
@@ -72,6 +67,8 @@ class DeepseekV41CausalLMOutput:
 
 
 def _validate_training_args(model_args) -> None:
+    if not isinstance(model_args.enable_shared_expert_overlap, bool):
+        raise ValueError("enable_shared_expert_overlap must be a boolean.")
     if model_args.dtype != "bf16" or model_args.expert_dtype is not None:
         raise ValueError("DeepSeek-V4.1 training requires dtype='bf16' and expert_dtype=None.")
     if model_args.n_mtp_layers or model_args.dspark_block_size:
@@ -106,17 +103,6 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
         if chunk_loss:
             apply_chunkloss_module(backbone.head)
 
-    def _calculate_head_loss(self, hidden_states, head_weight, head_bias, *, shift_labels, alpha, reduction):
-        if not self.model.head.use_hf32:
-            return calculate_lm_loss(
-                hidden_states, head_weight, head_bias, shift_labels=shift_labels, alpha=alpha, reduction=reduction
-            )
-        logits = hf32_linear(hidden_states, head_weight).float()
-        loss = fixed_cross_entropy(
-            logits.reshape(-1, logits.size(-1)), shift_labels.reshape(-1), alpha=alpha, reduction=reduction
-        )
-        return loss, logits
-
     def loss_function(
         self,
         hidden_states: torch.Tensor,
@@ -128,16 +114,13 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
 
         Called by the public head interface inside its FSDP forward boundary.
         Targets equal to -100 are ignored; entirely ignored targets yield zero.
-        Projection follows the head's compute_dtype/use_hf32; loss uses FP32.
+        Projection follows the head's compute_dtype; loss uses FP32.
         """
         hidden_states = hidden_states.to(self.model.head.compute_dtype)
         head_weight = head_weight.to(self.model.head.compute_dtype)
         if head_bias is not None:
             head_bias = head_bias.to(self.model.head.compute_dtype)
         if shift_labels is None:
-            if self.model.head.use_hf32:
-                logits = hf32_linear(hidden_states, head_weight)
-                return logits if head_bias is None else logits + head_bias
             return F.linear(hidden_states, head_weight, head_bias)
         num_items = (shift_labels != -100).sum().clamp_min(1)
         loss_kwargs_chunks = [
@@ -145,7 +128,12 @@ class DeepseekV41ForCausalLMAdapter(nn.Module):
             for labels in torch.split(shift_labels, self.chunk_size, dim=1)
         ]
         return compute_chunk_loss(
-            hidden_states, head_weight, head_bias, self._calculate_head_loss, loss_kwargs_chunks, self.chunk_size
+            hidden_states,
+            head_weight,
+            head_bias,
+            calculate_lm_loss,
+            loss_kwargs_chunks,
+            self.chunk_size,
         )
 
     def from_pretrained(
@@ -395,13 +383,13 @@ def _build_deepseek_v41_model(
     model_args,
     *,
     tokenizer: PreTrainedTokenizerBase | None = None,
-    head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
+    head_compute_dtype: Literal["fp32", "bf16"] = "fp32",
     chunk_loss: bool = False,
     chunk_loss_size: int = 512,
     context_parallel: bool = False,
 ) -> DeepseekV41ForCausalLMAdapter:
-    if head_compute_dtype not in ("fp32", "bf16", "hf32"):
-        raise ValueError("head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
+    if head_compute_dtype not in ("fp32", "bf16"):
+        raise ValueError("head_compute_dtype must be 'fp32' or 'bf16'.")
     attention_cls = None
     hash_state_cls = None
     backbone_cls = reference_model.Transformer
@@ -422,7 +410,6 @@ def _build_deepseek_v41_model(
             hash_state_cls=hash_state_cls,
         )
     backbone.head.compute_dtype = torch.bfloat16 if head_compute_dtype == "bf16" else torch.float32
-    backbone.head.use_hf32 = head_compute_dtype == "hf32"
     return DeepseekV41ForCausalLMAdapter(
         backbone,
         model_args,
@@ -449,9 +436,10 @@ def build_deepseek_v41_model(
     use_triton_inplace_rope: bool = False,
     use_deepgemm_wo_a: bool = False,
     use_fused_vision_flash_attn: bool = False,
+    use_tnd_vision_flash_attn: bool = False,
     use_fused_partial_rotary: bool = False,
     use_fused_engram: bool = False,
-    head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32",
+    head_compute_dtype: Literal["fp32", "bf16"] = "fp32",
     chunk_loss: bool = False,
     chunk_loss_size: int = 512,
     context_parallel: bool = False,
@@ -463,6 +451,7 @@ def build_deepseek_v41_model(
     the public chunk-loss head, using this adapter's loss_function.
     ``use_deepgemm_wo_a`` selects the optional BF16 NPU output projection;
     its DeepGEMM dependency is loaded on the first projection call.
+    ``use_tnd_vision_flash_attn`` packs isolated images into one fused call.
     ``tilekernels`` supplies per-operator switches; None preserves model_args.
     """
     if model_args is None:
@@ -487,6 +476,7 @@ def build_deepseek_v41_model(
         use_triton_inplace_rope=use_triton_inplace_rope,
         use_deepgemm_wo_a=use_deepgemm_wo_a,
         use_fused_vision_flash_attn=use_fused_vision_flash_attn,
+        use_tnd_vision_flash_attn=use_tnd_vision_flash_attn,
         use_fused_partial_rotary=use_fused_partial_rotary,
         use_fused_engram=use_fused_engram,
     )

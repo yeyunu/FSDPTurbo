@@ -1,9 +1,14 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import torch
+from torch.distributed import ProcessGroup, Work
 
 
-def gather_along_first_dim_expert_parallel(input_, group, async_op=False):
+def gather_along_first_dim_expert_parallel(
+    input_: torch.Tensor,
+    group: ProcessGroup,
+    async_op: bool = False,
+) -> tuple[torch.Tensor, Work | None]:
     """Gather tensors and concatenate along the first dimension."""
     world_size = torch.distributed.get_world_size(group=group)
     if world_size == 1:
@@ -12,7 +17,7 @@ def gather_along_first_dim_expert_parallel(input_, group, async_op=False):
     dim_size = list(input_.size())
     dim_size[0] = dim_size[0] * world_size
 
-    output = torch.empty(dim_size, dtype=input_.dtype, device=torch.accelerator.current_device_index())
+    output = torch.empty(dim_size, dtype=input_.dtype, device=input_.device)
     handle = torch.distributed.all_gather_into_tensor(output, input_.contiguous(), group=group, async_op=async_op)
 
     return output, handle

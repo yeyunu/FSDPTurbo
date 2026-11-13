@@ -7,18 +7,16 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from fsdp_turbo.ops.hf32_linear import hf32_linear
-from fsdp_turbo.ops.mhc import fused_mhc_post, fused_mhc_pre_sinkhorn_premix
 from fsdp_turbo.ops.rms_norm import rms_norm
 from fsdp_turbo.ops.rope import inplace_rope
 from fsdp_turbo.ops.sinkhorn import hc_split_sinkhorn
-from fsdp_turbo.ops.tilekernels import tilekernels_mhc_post
 
 from .activation import limited_swiglu, silu_mul
 from .engram import Engram, EngramLayout
-from .experts import DeepSeekV41Experts
+from .experts import DeepSeekV41Experts, DispatchOverlapExperts
 from .model_args import ModelArgs
 from .runtime import ContextParallelAttentionState, shared_attn
+from .mhc import MHCPost, MHCPre
 from .utils import set_dtype
 
 
@@ -150,7 +148,6 @@ class ParallelHead(nn.Linear):
         self.hc_eps = hc_eps
         # FSDP may normalize parameter storage; projection precision is independent.
         self.compute_dtype = torch.float32
-        self.use_hf32 = False
         self.weight = nn.Parameter(torch.empty(vocab_size, dim, dtype=torch.float32))
         self.register_parameter("bias", None)
 
@@ -158,10 +155,7 @@ class ParallelHead(nn.Linear):
         """x: [b, s, d]. Generation only needs the last position, so that is the default."""
         if not full_logits:
             x = x[:, -1]
-        if self.use_hf32:
-            logits = hf32_linear(x, self.weight)
-        else:
-            logits = F.linear(x.to(self.compute_dtype), self.weight.to(self.compute_dtype))
+        logits = F.linear(x.to(self.compute_dtype), self.weight.to(self.compute_dtype))
         return logits
 
 
@@ -236,6 +230,8 @@ class Expert(nn.Module):
 class MoE(nn.Module):
     """Top-k routed experts plus one shared expert every token goes through."""
 
+    experts_cls = DeepSeekV41Experts
+
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         n_routed_experts, n_activated_experts = args.get_moe_config(layer_id)
@@ -244,7 +240,7 @@ class MoE(nn.Module):
         self.n_routed_experts = n_routed_experts
         self.n_activated_experts = n_activated_experts
         self.gate = Gate(layer_id, args)
-        self.experts = DeepSeekV41Experts(
+        self.experts = self.experts_cls(
             num_experts=n_routed_experts,
             hidden_size=args.dim,
             intermediate_size=args.moe_inter_dim,
@@ -272,6 +268,29 @@ class MoE(nn.Module):
         return output.type_as(x).view(shape)
 
 
+class SharedExpertOverlapMoE(MoE):
+    """Compute the shared branch while EP dispatch is in flight on its communication stream."""
+
+    experts_cls = DispatchOverlapExperts
+
+    def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Preserve FP32 branch accumulation and one final cast to the residual dtype."""
+        shape = x.size()
+        x = x.view(-1, self.dim)
+        weights, indices = self.gate(x, None if image_mask is None else image_mask.flatten())
+        shared_output = None
+
+        def compute_shared():
+            nonlocal shared_output
+            shared_output = self.shared_experts(x)
+
+        routed_output = self.experts(x, indices, weights, dispatch_overlap=compute_shared)
+        if shared_output is None:
+            raise RuntimeError("The expert dispatcher did not execute the shared-expert callback")
+        output = routed_output.float() + shared_output.float()
+        return output.type_as(x).view(shape)
+
+
 class Block(nn.Module):
     """A block whose residual stream is `hc_mult` parallel copies (Hyper-Connections).
 
@@ -286,7 +305,9 @@ class Block(nn.Module):
 
     batch_chunk_context = staticmethod(shared_attn.chunk_window)
 
-    def __init__(self, layer_id: int, args: ModelArgs, engram_layout: EngramLayout | None = None, attention_cls=None):
+    def __init__(
+        self, layer_id: int, args: ModelArgs, engram_layout: EngramLayout | None = None, attention_cls=None
+    ) -> None:
         super().__init__()
         self.layer_id = layer_id
         self.norm_eps = args.norm_eps
@@ -296,7 +317,8 @@ class Block(nn.Module):
             # Attention imports the base layers; resolve the default after module initialization.
             from .attention import Attention as attention_cls  # pylint: disable=cyclic-import
         self.attn = attention_cls(layer_id, args)
-        self.ffn = MoE(layer_id, args)
+        moe_cls = SharedExpertOverlapMoE if args.enable_shared_expert_overlap else MoE
+        self.ffn = moe_cls(layer_id, args)
         self.engram = None
         if engram_layout is not None and layer_id in engram_layout.layer_ids:
             if args.use_fused_engram:
@@ -320,7 +342,6 @@ class Block(nn.Module):
         self.hc_sinkhorn_iters = args.hc_sinkhorn_iters
         self.hc_eps = args.hc_eps
         self.use_fused_mhc = args.use_fused_mhc
-        self.use_tilekernels_mhc_post = args.tilekernels.get("tilekernels_mhc_post", False)
         if self.use_fused_mhc and (self.hc_mult != 4 or self.hc_sinkhorn_iters != 20):
             raise ValueError("Fused MHC requires hc_mult=4 and hc_sinkhorn_iters=20")
         mix_hc = (2 + hc_mult) * hc_mult
@@ -332,6 +353,9 @@ class Block(nn.Module):
             self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc))
             self.hc_attn_scale = nn.Parameter(torch.empty(3))
             self.hc_ffn_scale = nn.Parameter(torch.empty(3))
+        # Stateless computation boundaries: hc_* parameters stay on this Block.
+        self.mhc_pre = MHCPre(args)
+        self.mhc_post = MHCPost(args)
 
     def hc_mixes(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         """x: [b,s,hc,d], hc_fn: [mix_hc, hc*d], hc_scale: [3], hc_base: [mix_hc]. Returns the
@@ -358,33 +382,15 @@ class Block(nn.Module):
 
     def hc_pre_sinkhorn_premix(
         self, x: torch.Tensor, pre_mix: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Calculate this sub-block's MHC coefficients and collapse its input."""
-        if self.use_fused_mhc:
-            return fused_mhc_pre_sinkhorn_premix(
-                x,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                pre_mix,
-                hc_mult=self.hc_mult,
-                num_iters=self.hc_sinkhorn_iters,
-                hc_eps=self.hc_eps,
-                norm_eps=self.norm_eps,
-            )
-        pre, post, comb = self.hc_mixes(x, hc_fn, hc_scale, hc_base)
-        return self.hc_pre(x, pre_mix), post, comb, pre
+        return self.mhc_pre(x, pre_mix, hc_fn, hc_scale, hc_base)
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
         """Expand the sublayer output back to hc copies and mix the residual in through `comb`.
         x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc] -> [b,s,hc,d]
         """
-        if self.use_tilekernels_mhc_post:
-            return tilekernels_mhc_post(x, residual, post, comb)
-        if self.use_fused_mhc:
-            return fused_mhc_post(x, residual, post, comb)
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-        return y.type_as(x)
+        return self.mhc_post(x, residual, post, comb)
 
     def forward(
         self,

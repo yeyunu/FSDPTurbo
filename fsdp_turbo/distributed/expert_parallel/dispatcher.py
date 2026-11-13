@@ -80,12 +80,27 @@ def dispatch_preprocess(
     return (num_tokens_per_local_expert, global_indices), (input_split, output_splits)
 
 
-def alltoall_dispatch(ep_group, hidden_states, top_k_index, indices, split_sizes, fused):
+def alltoall_dispatch(
+    ep_group: torch.distributed.ProcessGroup,
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    indices: tuple[torch.Tensor, torch.Tensor],
+    split_sizes: tuple[torch.Tensor, torch.Tensor],
+    fused: bool,
+    dispatch_overlap: Optional[Callable[[], None]] = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Dispatch tokens, running an optional independent branch before the receive wait.
+
+    The callback runs on the caller's compute stream and must not consume the
+    pending receive tensor. The next permutation triggers its collective wait.
+    """
     local_indices, global_indices = indices
     input_split, output_splits = split_sizes
 
     hidden_states, unpermute_indices1 = permute(hidden_states, top_k_index, use_eager=not fused)
     hidden_states = all_to_all_single_autograd(hidden_states, output_splits.tolist(), input_split.tolist(), ep_group)
+    if dispatch_overlap is not None:
+        dispatch_overlap()
     hidden_states, unpermute_indices2 = permute(hidden_states, global_indices, use_eager=not fused)
 
     return hidden_states, (unpermute_indices1, unpermute_indices2)
@@ -239,7 +254,13 @@ def all2all_experts_forward_fn(
 
     # AllToAll dispatch --> MLP computation --> AllToAll combine
     hidden_states, unpermute_indices = alltoall_dispatch(
-        ep_group, hidden_states, top_k_index, permute_indices, split_sizes, fused
+        ep_group,
+        hidden_states,
+        top_k_index,
+        permute_indices,
+        split_sizes,
+        fused,
+        dispatch_overlap=kwargs.get("dispatch_overlap"),
     )
 
     if ep_balance_strategy is not None:

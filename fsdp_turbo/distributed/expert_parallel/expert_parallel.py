@@ -141,6 +141,10 @@ def get_experts_forward_fn(
         **kwargs,
     ):
         # Ensure correct parameter order and dimensions
+        dispatch_overlap = kwargs.get("dispatch_overlap")
+        if dispatch_overlap is not None and dispatcher != "all2all":
+            raise ValueError("Dispatch-overlap callbacks require the all2all dispatcher")
+        overlap_kwargs = {"dispatch_overlap": dispatch_overlap} if dispatch_overlap is not None else {}
         top_k_index, top_k_weights = normalize_expert_args(top_k_index, top_k_weights)
         hidden_states_shape = hidden_states.shape
         hidden_dim = getattr(self, "hidden_dim", None)
@@ -190,6 +194,7 @@ def get_experts_forward_fn(
             quant_config=quant_config,
             expert_module=self,
             ep_plan=ep_plan,
+            **overlap_kwargs,
         )
 
         if SKIP_MOE_PAD_TOKENS:

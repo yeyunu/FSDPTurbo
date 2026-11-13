@@ -242,6 +242,23 @@ def rope_npu(x, cos, sin, *, interleaved=False, inverse=False):
     return _rotary_mul_adapter(x, cos, sin, interleaved=interleaved, inverse=inverse)
 
 
+class _FixedCoefficientInplaceRope(torch.autograd.Function):
+    """Use the public Triton rotation without retaining its rotary input."""
+
+    @staticmethod
+    def forward(ctx, value, cos, sin):
+        ctx.save_for_backward(cos, sin)
+        return triton_inplace_rope(value, cos, sin)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        cos, sin = ctx.saved_tensors
+        # The kernel mutates its input. Never overwrite a gradient shared with
+        # another branch, including a contiguous upstream gradient.
+        private_grad = grad_output.clone(memory_format=torch.contiguous_format)
+        return _FixedCoefficientInplaceRope.apply(private_grad, cos, -sin), None, None
+
+
 @torch.inference_mode(False)
 @torch.no_grad()
 def _pack_partial_coefficients(cos, sin, *, inverse, dtype):
@@ -375,7 +392,10 @@ def inplace_rope_npu(
         x4 = x if x.ndim == 4 else x.unsqueeze(-2)
         cos4 = cos.expand(x4.size(0), x4.size(1), cos.size(-1)).contiguous()
         sin4 = sin.expand(x4.size(0), x4.size(1), sin.size(-1)).contiguous()
-        rotated = triton_inplace_rope(x4, cos4, sin4)
+        if torch.is_grad_enabled() and x4.requires_grad and not (cos4.requires_grad or sin4.requires_grad):
+            rotated = _FixedCoefficientInplaceRope.apply(x4, cos4, sin4)
+        else:
+            rotated = triton_inplace_rope(x4, cos4, sin4)
         return rotated if x.ndim == 4 else rotated.squeeze(-2)
     rope_x = x[..., -rotary_dim:]
     if cos.ndim == 2:

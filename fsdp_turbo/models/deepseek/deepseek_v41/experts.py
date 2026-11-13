@@ -3,6 +3,8 @@
 
 """Packed DeepSeek-V4.1 routed experts compatible with FSDPTurbo EP."""
 
+from typing import Callable
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -424,4 +426,21 @@ class DeepSeekV41Experts(nn.Module):
         return output.view(*original_shape)
 
 
-__all__ = ["DeepSeekV41Experts"]
+class DispatchOverlapExperts(DeepSeekV41Experts):
+    """Accept the EP dispatch callback, with sequential execution when EP is absent."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        topk_indices: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        dispatch_overlap: Callable[[], None] | None = None,
+    ) -> torch.Tensor:
+        """Execute the independent branch once, then use the native local experts."""
+        if dispatch_overlap is not None:
+            dispatch_overlap()
+        return super().forward(hidden_states, topk_indices, topk_weights)
+
+
+__all__ = ["DeepSeekV41Experts", "DispatchOverlapExperts"]

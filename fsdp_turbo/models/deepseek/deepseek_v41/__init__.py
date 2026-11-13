@@ -9,6 +9,7 @@ from .adapter import (
     prepare_deepseek_v41_model_for_fsdp,
 )
 from .experts import DeepSeekV41Experts
+from .mhc import MHCPost, MHCPre
 from .processor import DeepSeekV41Processor, prepare_deepseek_v41_tokenizer
 from .image_processor import ImageInput
 from .state_dict_adapter import (
@@ -20,6 +21,8 @@ __all__ = [
     "DeepseekV41CausalLMOutput",
     "DeepseekV41ForCausalLMAdapter",
     "DeepSeekV41Experts",
+    "MHCPost",
+    "MHCPre",
     "DeepSeekV41Processor",
     "DeepSeekV41StateDictAdapter",
     "ImageInput",

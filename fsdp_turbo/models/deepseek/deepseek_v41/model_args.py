@@ -27,6 +27,7 @@ class ModelArgs:
     # moe
     n_routed_experts: int = 8
     n_shared_experts: int = 1
+    enable_shared_expert_overlap: bool = False
     n_activated_experts: int = 2
     score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sqrtsoftplus"
     gate_temp: float = 1.0
@@ -78,6 +79,8 @@ class ModelArgs:
     use_deepgemm_wo_a: bool = False
     # Use CANN FlashAttentionScore/FlashAttentionScoreGrad in the vision tower.
     use_fused_vision_flash_attn: bool = False
+    # Pack images into one TND FlashAttentionScore call per vision block.
+    use_tnd_vision_flash_attn: bool = False
     # Use CANN InplacePartialRotaryMul/Grad for the large per-layer q/o RoPE.
     use_fused_partial_rotary: bool = False
     # Run the Engram wkv gating through the fused PyPTO-Pro kernels (NPU).

@@ -1,13 +1,10 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
 """CPU regression tests for the fused MHC h_pre gradient (GitCode PR 173).
 
-``fsdp_turbo/ops/npu/mhc.py`` fuses the MHC pre-Sinkhorn-premix operator with a small
-eager h_pre projection. The eager projection exists to keep the activation-recompute
-saved-tensor accounting symmetric, but it must not own a second copy of the h_pre
-gradient: the operator backward already turns ``grad_h_pre`` into x/phi/alpha/bias
-gradients, and ``Block.forward`` additionally feeds h_pre back as the next sublayer's
-``pre_mix``, so both a plain h_pre-only backward and the normal fused training path are
-affected. These tests pin the fused function to the unfused (``use_fused_mhc=False``)
+The fused operator backward owns ``grad_h_pre`` and turns it into x/phi/alpha/bias
+gradients. ``Block.forward`` feeds h_pre back as the next sublayer's ``pre_mix``,
+so both a plain h_pre-only backward and the normal fused training path are covered.
+These tests pin the fused function to the unfused (``use_fused_mhc=False``)
 reference path on CPU, replacing the CANN operators with an equivalent torch
 implementation.
 """
@@ -60,6 +57,7 @@ class _CpuMhcOps:
 
     def __init__(self):
         self._config = None
+        self.grad_h_pre = None
 
     @staticmethod
     def _forward_math(x, phi, alpha, bias, premix, hc_mult, num_iters, hc_eps, norm_eps):
@@ -108,6 +106,7 @@ class _CpuMhcOps:
         grad_h_pre,
         hc_eps,
     ):
+        self.grad_h_pre = grad_h_pre
         hc_mult, num_iters, _, norm_eps = self._config
         with torch.enable_grad():
             inputs = [tensor.detach().clone().requires_grad_(True) for tensor in (x, phi, alpha, bias, premix)]
@@ -171,6 +170,8 @@ def test_h_pre_gradient_is_not_counted_twice(cpu_mhc_ops):
     fused_inputs = _clone_with_grad((x, phi, alpha, bias, premix))
     *_, h_pre = _fused_pre(fused_inputs)
     h_pre.sum().backward()
+    assert cpu_mhc_ops.grad_h_pre is not None
+    torch.testing.assert_close(cpu_mhc_ops.grad_h_pre, torch.ones_like(h_pre))
 
     reference_inputs = _clone_with_grad((x, phi, alpha, bias, premix))
     _reference_pre(*reference_inputs[:4]).sum().backward()

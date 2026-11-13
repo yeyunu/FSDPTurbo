@@ -175,16 +175,20 @@ def test_tilekernels_mhc_post_kernel_errors_propagate(npu_adapter, phase):
 @pytest.mark.parametrize("tilekernels_enabled", [False, True])
 @pytest.mark.parametrize("fused_enabled", [False, True])
 def test_block_hc_post_selects_backend(monkeypatch, tilekernels_enabled, fused_enabled):
-    from fsdp_turbo.models.deepseek.deepseek_v41 import layers
+    from fsdp_turbo.models.deepseek.deepseek_v41 import layers, mhc
 
     # 仅测试 hc_post 分支，避免构造与该方法无关的 Attention/MoE 参数。
-    block = SimpleNamespace(use_tilekernels_mhc_post=tilekernels_enabled, use_fused_mhc=fused_enabled)
+    block = SimpleNamespace(
+        mhc_post=mhc.MHCPost(
+            SimpleNamespace(use_fused_mhc=fused_enabled, tilekernels={"tilekernels_mhc_post": tilekernels_enabled})
+        )
+    )
     inputs = _make_inputs()
     tilekernels_output, fused_output = object(), object()
     tilekernels_backend = Mock(return_value=tilekernels_output)
     fused_backend = Mock(return_value=fused_output)
-    monkeypatch.setattr(layers, "tilekernels_mhc_post", tilekernels_backend)
-    monkeypatch.setattr(layers, "fused_mhc_post", fused_backend)
+    monkeypatch.setattr(mhc, "tilekernels_mhc_post", tilekernels_backend)
+    monkeypatch.setattr(mhc, "fused_mhc_post", fused_backend)
     x, residual, post, comb = inputs
     output = layers.Block.hc_post(block, x, residual, post, comb)
     if tilekernels_enabled:

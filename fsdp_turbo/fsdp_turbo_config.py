@@ -65,7 +65,7 @@ class ModelConfig:
     # Fuse the Engram n-gram memory gating via the PyPTO-Pro kernels on Ascend950DT.
     use_fused_engram: bool = False
     # DeepSeek-V4.1 head projection precision; cross entropy remains FP32.
-    head_compute_dtype: Literal["fp32", "bf16", "hf32"] = "fp32"
+    head_compute_dtype: Literal["fp32", "bf16"] = "fp32"
     attn_implementation: str = 'eager'
     # MTP (Multi-Token Prediction) layers to train. 0 disables MTP.
     mtp_num_layers: int = 0
@@ -684,8 +684,8 @@ class FSDPTurboConfig:
             raise ValueError("model.use_deepgemm_wo_a must be a boolean.")
         if not isinstance(self.model.use_fused_partial_rotary, bool):
             raise ValueError("model.use_fused_partial_rotary must be a boolean.")
-        if self.model.head_compute_dtype not in ("fp32", "bf16", "hf32"):
-            raise ValueError("model.head_compute_dtype must be 'fp32', 'bf16' or 'hf32'.")
+        if self.model.head_compute_dtype not in ("fp32", "bf16"):
+            raise ValueError("model.head_compute_dtype must be 'fp32' or 'bf16'.")
         if not isinstance(self.model.attn_implementation, str) or not self.model.attn_implementation:
             raise ValueError("model.attn_implementation must be a non-empty string.")
         if self.model.load_pretrained_weights and not self.model.model_name_or_path:

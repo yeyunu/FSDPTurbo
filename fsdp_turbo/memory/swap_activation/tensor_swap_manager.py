@@ -5,6 +5,7 @@ Tensor swapping system for efficient memory management in neural network trainin
 This module provides functionality to swap tensors between device and host memory
 to optimize memory usage during forward and backward passes.
 """
+
 from collections import defaultdict
 from enum import Enum
 from typing import Optional, Callable, List, Dict, Tuple
@@ -14,6 +15,7 @@ import torch
 
 class TensorLocation(Enum):
     """Enumeration of possible tensor storage locations."""
+
     DEVICE = "device"
     HOST = "host"
 
@@ -30,8 +32,9 @@ def is_valid_for_swap(tensor: torch.Tensor, custom_check_fn: Optional[Callable] 
         bool: True if tensor can be swapped, False otherwise.
     """
     # Check if tensor is a parameter (should not be swapped)
-    if (isinstance(tensor, torch.nn.parameter.Parameter) or
-            isinstance(getattr(tensor, '_base', None), torch.nn.parameter.Parameter)):
+    if isinstance(tensor, torch.nn.parameter.Parameter) or isinstance(
+        getattr(tensor, '_base', None), torch.nn.parameter.Parameter
+    ):
         return False
 
     # Check if tensor storage is valid
@@ -71,13 +74,12 @@ class TensorKeyManager:
                 - tensor_key (Tuple[int, int]): A tuple of (layer_idx, tensor_index),
                   serving as a unique key for tensor swap operations.
                 - prev_layer_completed (bool): A boolean flag indicating whether
-                  the processing of the previous layer (layer_idx - 1) is complete.
+                  the processing of the previous recorded layer is complete.
         """
         prev_layer_completed = False
         if layer_idx > self._current_layer_idx:
             self._layer_tensor_counts[layer_idx] = 1
-            if layer_idx != 0:
-                prev_layer_completed = True
+            prev_layer_completed = self._current_layer_idx >= 0
         elif layer_idx == self._current_layer_idx:
             self._layer_tensor_counts[layer_idx] += 1
         else:
@@ -90,6 +92,14 @@ class TensorKeyManager:
 
         return tensor_key, prev_layer_completed
 
+    def get_previous_layer_idx(self, layer_idx: int) -> Optional[int]:
+        """Return the nearest earlier layer that actually saved swap tensors.
+
+        Layers with no eligible input do not appear in this iteration's counts.
+        Return None when no recorded predecessor exists.
+        """
+        return max((index for index in self._layer_tensor_counts if index < layer_idx), default=None)
+
     def get_prefetch_keys(self, layer_idx: int, tensor_idx: int) -> List[tuple]:
         """
         Get keys for tensors that should be prefetched.
@@ -101,7 +111,7 @@ class TensorKeyManager:
         Returns:
             List of prefetch keys.
         """
-        prefetch_layer_idx = layer_idx - 1 if layer_idx >= 1 else None
+        prefetch_layer_idx = self.get_previous_layer_idx(layer_idx)
 
         if prefetch_layer_idx is None:
             return []
@@ -178,8 +188,9 @@ class SwapTensor:
         self.device_tensor.storage().resize_(0)
         self.current_location = TensorLocation.HOST
 
-    def async_h2d(self, h2d_stream: torch.Stream,
-                  should_resize_storage: bool, working_stream: Optional[torch.Stream] = None) -> None:
+    def async_h2d(
+        self, h2d_stream: torch.Stream, should_resize_storage: bool, working_stream: Optional[torch.Stream] = None
+    ) -> None:
         """
         Asynchronously copy tensor from host to device.
 
@@ -231,7 +242,10 @@ class SingletonMeta(type):
 class AsyncSwapHandler(metaclass=SingletonMeta):
     """Central manager for coordinating tensor swap operations across the system."""
 
-    def __init__(self, custom_check_fn: Optional[Callable] = None,):
+    def __init__(
+        self,
+        custom_check_fn: Optional[Callable] = None,
+    ):
         self.key_to_swap_tensor = {}
         self.tensor_key_to_ = {}
         self._key_manager = TensorKeyManager()
@@ -256,7 +270,7 @@ class AsyncSwapHandler(metaclass=SingletonMeta):
 
         # release previous layer tensor
         if prev_layer_completed:
-            self.release_device_tensor(layer_idx - 1)
+            self.release_device_tensor(self._key_manager.get_previous_layer_idx(layer_idx))
 
         swap_tensor = SwapTensor(tensor, tensor_key)
 
@@ -338,17 +352,16 @@ class AsyncSwapHandler(metaclass=SingletonMeta):
         if self._h2d_stream is None:
             self._h2d_stream = torch.accelerator.Stream()
         return self._h2d_stream
-    
+
 
 class TensorSwapContext:
     """Context manager for tensor swap operations during model execution."""
+
     context_map = defaultdict(lambda: -1)
 
     def __init__(
-            self,
-            module_tag: str = 'default',
-            custom_check_fn: Optional[Callable] = None,
-            prefetch: bool = True) -> None:
+        self, module_tag: str = 'default', custom_check_fn: Optional[Callable] = None, prefetch: bool = True
+    ) -> None:
         """Initialize the tensor swap context.
 
         Args:
@@ -379,6 +392,7 @@ class TensorSwapContext:
 
     def __enter__(self):
         """Enter the context and set up swap hooks."""
+
         def _on_save_for_backward(tensor):
             swap_tensor = self.swap_handler.swap_out_cur_and_release_prev(tensor, self.layer_idx, self.layer_nums)
             return swap_tensor
@@ -389,9 +403,7 @@ class TensorSwapContext:
 
         self.pack_hook = _on_save_for_backward
         self.unpack_hook = _on_get_saved_tensor
-        torch._C._autograd._push_saved_tensors_default_hooks(
-            self.pack_hook, self.unpack_hook
-        )
+        torch._C._autograd._push_saved_tensors_default_hooks(self.pack_hook, self.unpack_hook)
 
     def __exit__(self, *args):
         """Exit the context and remove hooks."""

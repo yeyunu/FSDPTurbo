@@ -1,4 +1,4 @@
-from typing import Any, Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
@@ -19,25 +19,31 @@ class ChunkLoss(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx,
+        ctx: torch.autograd.function.FunctionCtx,
         hidden_states: torch.Tensor,
         head_weight: torch.Tensor,
         head_bias: Optional[torch.Tensor],
-        loss_forward: Callable,
-        loss_kwargs_chunks: list[Any],
+        loss_forward: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+        loss_kwargs_chunks: list[dict[str, object]],
         chunk_size: int,
     ) -> torch.Tensor:
         """
-        Forward pass: compute the total loss by processing hidden states in chunks.
+        Compute chunk gradients, accumulating standard linear-head dW in place.
+
+        The callback uses F.linear with the supplied dtypes and current autocast,
+        returning loss and FP32 logits;
+        the loss must depend on hidden states and weights only through those logits.
+        dW uses the common weight/autocast dtype to
+        avoid narrowing BF16 projection operands to FP16 before the GEMM.
+        Rounding can differ from separate per-chunk matmul and add operations.
 
         Args:
             ctx: Context object used to save tensors for backward pass.
             hidden_states (torch.Tensor): Input tensor of shape (batch_size, seq_len, hidden_dim).
             head_weight (torch.Tensor): Weight matrix of the final prediction head.
             head_bias (Optional[torch.Tensor]): Bias vector of the head (currently unsupported).
-            loss_forward (Callable): A function that takes (hidden_chunk, weight, bias, **kwargs)
-                                     and returns (loss, aux_output).
-            loss_kwargs_chunks (list[Any]): A list of keyword argument dictionaries, one per chunk.
+            loss_forward: Linear-head loss callback returning (loss, logits).
+            loss_kwargs_chunks: A list of keyword argument dictionaries, one per chunk.
             chunk_size (int): The size (in feature dimension) of each chunk.
 
         Returns:
@@ -65,7 +71,13 @@ class ChunkLoss(torch.autograd.Function):
         accumulated_loss = torch.tensor(0.0, device=device)
         # Pre-allocate gradient tensors for inputs and weights
         grad_inputs = torch.empty_like(hidden_states)
-        grad_weight = torch.zeros_like(head_weight)
+        projection_dtype = head_weight.dtype
+        grad_dtype = head_weight.dtype
+        if torch.is_autocast_enabled(device.type):
+            if projection_dtype != torch.float64:
+                projection_dtype = torch.get_autocast_dtype(device.type)
+            grad_dtype = torch.promote_types(grad_dtype, projection_dtype)
+        grad_weight = torch.zeros_like(head_weight, dtype=grad_dtype)
 
         # Split tensors into chunks along the feature dimension (dim=1 assumed to be sequence dim)
         grad_inputs_chunks = torch.split(grad_inputs, chunk_size, dim=1)
@@ -75,22 +87,28 @@ class ChunkLoss(torch.autograd.Function):
         for hidden_states_chunk, grad_inputs_chunk, loss_kwargs in zip(
             hidden_states_chunks, grad_inputs_chunks, loss_kwargs_chunks
         ):
-            # Compute both gradients and loss value for this chunk
-            (chunk_grad_input, chunk_grad_weight), (per_chunk_loss, chunk_aux) = torch.func.grad_and_value(
-                loss_forward, argnums=(0, 1), has_aux=True
-            )(hidden_states_chunk, head_weight, None, **loss_kwargs)
+            flat_hidden = hidden_states_chunk.reshape(-1, head_weight.size(1))
+            with torch.enable_grad():
+                per_chunk_loss, logits = loss_forward(
+                    hidden_states_chunk.detach().requires_grad_(), head_weight, None, **loss_kwargs
+                )
+                (grad_logits,) = torch.autograd.grad(per_chunk_loss, logits)
+            grad_logits = grad_logits.reshape(-1, head_weight.size(0))
+            grad_logits = grad_logits.to(projection_dtype)
+            chunk_grad_input = grad_logits.matmul(head_weight.to(projection_dtype)).reshape_as(hidden_states_chunk)
+            # addmm_ does not autocast: use the rounded projection operands,
+            # then accumulate directly into dW without a per-chunk [vocab, hidden] gradient.
+            grad_weight.addmm_(
+                grad_logits.to(grad_weight.dtype).t(), flat_hidden.to(projection_dtype).to(grad_weight.dtype)
+            )
+            del logits, grad_logits, flat_hidden
 
             # Accumulate loss and gradients
             accumulated_loss.add_(per_chunk_loss)
             grad_inputs_chunk.copy_(chunk_grad_input)
-            grad_weight.add_(chunk_grad_weight)
-            # Release the chunk's buffers before the next iteration: the loop
-            # variables would otherwise keep chunk_grad_weight (the [vocab,
-            # hidden] grad, independent of chunk_size) and chunk_aux (the
-            # [chunk, vocab] fp32 logits) alive while the next chunk's
-            # grad_and_value runs its internal backward, doubling the peak.
-            del chunk_grad_input, chunk_grad_weight, chunk_aux
+            del chunk_grad_input, per_chunk_loss
 
+        grad_weight = grad_weight.to(head_weight.dtype)
         # Convert gradient back to DTensor with the original placement so that
         # head_weight.grad matches the parameter type expected by the optimizer.
         if is_dtensor:
@@ -261,8 +279,8 @@ def chunk_loss(
     hidden_states: torch.Tensor,
     head_weight: torch.Tensor,
     head_bias: Optional[torch.Tensor],
-    loss_forward: Callable[..., Tuple[torch.Tensor, torch.Tensor]],
-    loss_kwargs_chunks: list[dict[str, torch.Tensor | int | str]],
+    loss_forward: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    loss_kwargs_chunks: list[dict[str, object]],
     chunk_size: int,
 ) -> torch.Tensor:
     """
@@ -278,12 +296,15 @@ def chunk_loss(
     output projection and re-chunk valid tokens across the batch. Boolean
     indexing scatters input gradients back, leaving ignored rows at zero.
     Other reductions and fully valid or fully ignored batches use the dense path.
+    Weight gradients accumulate in place, promoting mixed FP16/BF16 to FP32,
+    and return in the stored weight dtype.
 
     Args:
         hidden_states: Input tensor (e.g., from a transformer) to compute loss on.
         head_weight: Weight matrix of the output classification head.
         head_bias: Bias vector of the head.
-        loss_forward: Callable that computes the loss for a given chunk.
+        loss_forward: Callback returning loss and logits from a standard linear head,
+            with loss depending on hidden states and weights only through logits.
         loss_kwargs_chunks: Aligned labels/alpha and shared kwargs for `loss_forward`.
         chunk_size: Maximum total tokens per chunk, independent of batch size.
             Any positive integer is supported; the final chunk can be shorter.

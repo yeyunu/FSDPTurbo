@@ -30,12 +30,6 @@ import torch
 
 __all__ = ["cann_partial_rotary"]
 
-# The operator's gradient kernel writes into the incoming grad_output, which
-# saves a 268 MiB copy per call at these shapes.  It is only safe when autograd
-# handed us an owned, contiguous tensor, so a non-contiguous gradient is cloned.
-# Set to False to always clone (slower, never mutates an incoming gradient).
-FUSED_ROTARY_INPLACE_BWD = True
-
 _OPS = None
 _OPS_PROBED = False
 
@@ -84,10 +78,10 @@ class _CannPartialRotary(torch.autograd.Function):
         r1, r2 = ctx.saved_tensors
         ops = _cann_ops()
         dim = grad_output.shape[-1]
-        if grad_output.is_contiguous() and FUSED_ROTARY_INPLACE_BWD:
-            grad_x = grad_output
-        else:
-            grad_x = grad_output.contiguous()
+        # Contiguity does not imply exclusive ownership: another graph branch
+        # or repeated backward may share this gradient. The CANN kernel writes
+        # in place, so it must consume a private buffer in both layout cases.
+        grad_x = grad_output.clone(memory_format=torch.contiguous_format)
         gin = grad_x if grad_x.dim() == 4 else grad_x.unsqueeze(2)
         # this kernel mutates grad_output in place and returns nothing
         ops.inplace_partial_rotary_mul_backward(
@@ -97,7 +91,7 @@ class _CannPartialRotary(torch.autograd.Function):
             rotary_mode="interleave",
             partial_slice=[dim - ctx.rd, dim],
         )
-        return grad_output if grad_x is grad_output else grad_x, None, None, None
+        return grad_x, None, None, None
 
 
 def cann_partial_rotary(

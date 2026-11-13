@@ -7,7 +7,6 @@ from functools import lru_cache
 from importlib import import_module
 
 import torch
-import torch.nn.functional as F
 
 from fsdp_turbo.ops.registry import register_op
 
@@ -240,7 +239,7 @@ def fused_mhc_pre_sinkhorn_premix(
     hc_eps: float = 1e-6,
     norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fuse MHC projection, Sinkhorn and collapse using the previous premix."""
+    """Fuse projection, Sinkhorn and collapse, including cross-layer h_pre gradients."""
     _validate_pre_inputs(x, phi, alpha, bias, premix, hc_mult, num_iters)
     contiguous_inputs = (
         x.contiguous(),
@@ -250,43 +249,13 @@ def fused_mhc_pre_sinkhorn_premix(
         premix.float().contiguous(),
     )
 
-    h_in, h_post, h_res, operator_h_pre = _MhcPreSinkhornPremixFunction.apply(
+    h_in, h_post, h_res, h_pre = _MhcPreSinkhornPremixFunction.apply(
         *contiguous_inputs,
         hc_mult,
         num_iters,
         hc_eps,
         norm_eps,
     )
-
-    # Condition on grad MODE only, not on input requires_grad: checkpoint replay runs the
-    # forward again under enable_grad but with DETACHED inputs, so an input-dependent
-    # condition would take the other branch during replay and desynchronize the saved-tensor
-    # counts (forward N vs replay N-1). Under enable_grad the eager h_pre correction builds
-    # the same graph shape in both passes; identity saved-tensors hooks below keep its
-    # internal saves out of the checkpoint's accounting.
-    if torch.is_grad_enabled():
-        # The eager h_pre subgraph below saves tensors for its own backward. Inside a
-        # non-reentrant checkpoint the replay runs the forward again with detached inputs, and
-        # those saves are what desynchronize the saved-tensor count against the first pass
-        # (CheckpointError, forward N vs replay N-1). The identity hooks keep this subgraph's
-        # saves out of the checkpoint's accounting without altering the graph it builds, so the
-        # hooks remain required: detaching the operator output below only removes one gradient
-        # edge and adds or drops no save here.
-        with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
-            flat_x = x.flatten(-2).float()
-            inv_rms = torch.rsqrt(flat_x.square().mean(dim=-1, keepdim=True) + norm_eps)
-            eager_h_pre = F.linear(flat_x, phi[:hc_mult].float()) * inv_rms
-            eager_h_pre = torch.sigmoid(eager_h_pre * alpha[0].float() + bias[:hc_mult].float()) + hc_eps
-            # Detach the operator output so exactly one path owns the h_pre gradient. The operator's
-            # backward already consumes grad_h_pre and turns it into x/phi/alpha/bias gradients;
-            # keeping operator_h_pre connected would deliver that same gradient twice (operator plus
-            # this eager projection, i.e. 2x on those inputs, PR 173 review 196628160). The eager
-            # subgraph is the single owner here. Parenthesizing the correction also keeps the forward
-            # value bit-identical to the operator output: eager_h_pre - eager_h_pre.detach() is
-            # exactly zero, so adding it back cannot re-round operator_h_pre.
-            h_pre = operator_h_pre.detach() + (eager_h_pre - eager_h_pre.detach())
-    else:
-        h_pre = operator_h_pre
 
     return h_in, h_post, h_res.unflatten(-1, (hc_mult, hc_mult)), h_pre
 

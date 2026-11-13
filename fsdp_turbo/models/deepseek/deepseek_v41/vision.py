@@ -1,4 +1,5 @@
 from functools import lru_cache
+from itertools import accumulate
 
 import torch
 import torch.nn.functional as F
@@ -60,6 +61,7 @@ class Attention(nn.Module):
         self.n_heads = args.vision_n_heads
         self.head_dim = args.vision_dim // args.vision_n_heads
         self.use_fused_vision_flash_attn = args.use_fused_vision_flash_attn
+        self.use_tnd_vision_flash_attn = args.use_tnd_vision_flash_attn
         self.wqkv = nn.Linear(args.vision_dim, 3 * args.vision_dim)
         self.wo = nn.Linear(args.vision_dim, args.vision_dim)
 
@@ -69,7 +71,9 @@ class Attention(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         sequence_lengths: list[int] | None = None,
+        sequence_ends: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
+        """Attend within each image; TND fuses the packed batch into one call."""
         n = x.size(0)
         q, k, v = (t.view(n, self.n_heads, self.head_dim) for t in self.wqkv(x).chunk(3, dim=-1))
         q = apply_rotary(q, cos, sin)
@@ -88,7 +92,11 @@ class Attention(nn.Module):
                 v_part.transpose(0, 1),
             ).transpose(0, 1)
 
-        if sequence_lengths is None:
+        if self.use_tnd_vision_flash_attn:
+            if sequence_ends is None:
+                sequence_ends = tuple(accumulate(sequence_lengths)) if sequence_lengths is not None else (n,)
+            o = fused_vision_flash_attention(q, k, v, sequence_ends=sequence_ends)
+        elif sequence_lengths is None:
             o = attend(q, k, v)
         else:
             # QKV projections run once so every FSDP-wrapped vision block has
@@ -133,8 +141,10 @@ class Block(nn.Module):
         cos: torch.Tensor,
         sin: torch.Tensor,
         sequence_lengths: list[int] | None = None,
+        sequence_ends: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), cos, sin, sequence_lengths)
+        """Apply attention and MLP while preserving packed image boundaries."""
+        x = x + self.attn(self.norm1(x), cos, sin, sequence_lengths, sequence_ends)
         return x + self.mlp(self.norm2(x))
 
 
@@ -168,12 +178,13 @@ class ViT(nn.Module):
     ) -> list[torch.Tensor]:
         """Encode multiple images with one invocation of every FSDP module."""
         sequence_lengths = [patch.shape[0] for patch in patches]
+        sequence_ends = tuple(accumulate(sequence_lengths))
         x = self.patch_embed(torch.cat(patches, dim=0))
         rope_coefficients = [get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta) for n_h, n_w in grid_sizes]
         cos = torch.cat([item[0] for item in rope_coefficients], dim=0).to(x.device)
         sin = torch.cat([item[1] for item in rope_coefficients], dim=0).to(x.device)
         for block in self.blocks:
-            x = block(x, cos, sin, sequence_lengths)
+            x = block(x, cos, sin, sequence_lengths, sequence_ends)
         return list(self.norm(x).split(sequence_lengths, dim=0))
 
 
