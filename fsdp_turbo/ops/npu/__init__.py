@@ -57,6 +57,7 @@ from fsdp_turbo.ops.npu.vision_flash_attention import fused_vision_flash_attenti
 from fsdp_turbo.ops.npu.hf32_linear import hf32_linear_npu
 from fsdp_turbo.ops.npu.flash_attn import flash_attention_npu
 from fsdp_turbo.ops.npu.rotary_mul import rotary_mul_npu
+from fsdp_turbo.ops.npu.lightning_indexer import lightning_indexer_topk_npu, lightning_indexer_kl_loss_npu
 from fsdp_turbo.ops.npu.sparse_indexer_loss import sparse_indexer_gradient_npu
 
 _logger = logging.getLogger(__name__)
@@ -93,10 +94,12 @@ except ImportError:  # depends on the torch_npu wheel exposing the SFA op
     sparse_flash_attention_npu = None
 
 __all__ = [
+    'lightning_indexer_topk_npu',
+    'lightning_indexer_kl_loss_npu',
     'lightning_indexer_npu',
     'indexer_kl_loss_npu',
     'selected_attention_npu',
-    "sparse_indexer_gradient_npu",
+    'sparse_indexer_gradient_npu',
     'attention_output_projection_npu',
     'dequant_fp8_blockwise_npu',
     'dequant_int8_per_row_npu',

@@ -566,4 +566,129 @@ def fused_lightning_indexer(
     )
 
 
-__all__ = ["fused_lightning_indexer"]
+@register_op("lightning_indexer_topk", "npu")
+def lightning_indexer_topk_npu(
+    query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor, topk: int, cu_seqlens: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Select causal keys through TorchNPU LI; weights contain the full score scale.
+
+    Uses the installed AscendC operator without a local C++ extension.
+    Optional int32 ``cu_seqlens=[0,...,T]`` selects TND and local key indices.
+    """
+    layout = "BSND" if cu_seqlens is None else "TND"
+    endpoints = None if cu_seqlens is None else cu_seqlens[1:].contiguous()
+    indices, _ = torch_npu.npu_lightning_indexer(
+        query.contiguous(),
+        key.unsqueeze(-2).contiguous(),
+        weights.contiguous(),
+        actual_seq_lengths_query=endpoints,
+        actual_seq_lengths_key=endpoints,
+        sparse_count=topk,
+        sparse_mode=3,
+        layout_query=layout,
+        layout_key=layout,
+        return_value=False,
+    )
+    return indices
+
+
+class _AscendCIndexerKLLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        query_index,
+        key_index,
+        weights,
+        query,
+        key,
+        query_rope,
+        key_rope,
+        indices,
+        maximum,
+        denominator,
+        scale,
+        cu_seqlens,
+    ):
+        layout = "BSND" if cu_seqlens is None else "TND"
+        endpoints = None if cu_seqlens is None else cu_seqlens[1:].tolist()
+        stats_dimension = 1 if cu_seqlens is None else 0
+        query_grad, key_grad, weight_grad, loss = torch_npu.npu_sparse_lightning_indexer_grad_kl_loss(
+            query.detach().contiguous(),
+            key.detach().contiguous(),
+            query_index.contiguous(),
+            key_index.unsqueeze(-2).contiguous(),
+            weights.contiguous(),
+            indices.contiguous(),
+            maximum.unsqueeze(stats_dimension).contiguous(),
+            denominator.unsqueeze(stats_dimension).contiguous(),
+            scale,
+            query_rope=query_rope.detach().contiguous(),
+            key_rope=key_rope.detach().contiguous(),
+            actual_seq_qlen=endpoints,
+            actual_seq_klen=endpoints,
+            layout=layout,
+            sparse_mode=3,
+        )
+        ctx.save_for_backward(query_grad, key_grad.squeeze(-2), weight_grad)
+        ctx.query_count = query_index.numel() // (query_index.shape[-2] * query_index.shape[-1])
+        return loss.squeeze(0) / ctx.query_count
+
+    @staticmethod
+    def backward(ctx, upstream):
+        query_grad, key_grad, weight_grad = ctx.saved_tensors
+        scale = upstream / ctx.query_count
+        return (
+            query_grad * scale,
+            key_grad * scale,
+            weight_grad * scale,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+@register_op("lightning_indexer_kl_loss", "npu")
+def lightning_indexer_kl_loss_npu(
+    query_index: torch.Tensor,
+    key_index: torch.Tensor,
+    weights: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    indices: torch.Tensor,
+    maximum: torch.Tensor,
+    denominator: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fuse sparse teacher KL and indexer gradients; the teacher is detached.
+
+    Uses the installed TorchNPU LIG binding. Training must enable
+    ``torch.use_deterministic_algorithms(True)`` for deterministic LIG.
+    Optional ``cu_seqlens=[0,...,T]`` selects TND; loss and gradients are
+    normalized by T once, independent of the number of documents.
+    """
+    return _AscendCIndexerKLLoss.apply(
+        query_index,
+        key_index,
+        weights,
+        query,
+        key,
+        query_rope,
+        key_rope,
+        indices,
+        maximum,
+        denominator,
+        scale,
+        cu_seqlens,
+    )
+
+
+__all__ = ["fused_lightning_indexer", "lightning_indexer_topk_npu", "lightning_indexer_kl_loss_npu"]

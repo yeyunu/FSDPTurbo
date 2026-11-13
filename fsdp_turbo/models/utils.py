@@ -19,7 +19,7 @@ _MODEL_CLASSES: dict[str, type] = {}
 # models/__init__.py, which resolves a class lazily on attribute access; the
 # model name lets get_model_by_name import the matching module on first lookup.
 _BUILTIN_MODELS: dict[str, tuple[str, str]] = {
-    "KimiK3ForConditionalGeneration": (".kimi.modeling_kimi_k3", "kimi_k3"),
+    "KimiK3ForConditionalGeneration": (".kimi.kimi_k3.modeling_kimi_k3", "kimi_k3"),
     "Qwen4ExpForConditionalGeneration": (".qwen.modeling_qwen4_exp", "qwen4_exp"),
     "Qwen3_5ForConditionalGeneration": (".qwen.qwen3_5", "qwen3_5"),
     "Qwen3_5MoeForConditionalGeneration": (".qwen.qwen3_5_moe", "qwen3_5_moe"),

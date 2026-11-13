@@ -178,7 +178,7 @@ distributed:
 # Legacy fused-input CP entry; set module_patches: [] for hybrid_p2p.
 module_patches:
   - target: modeling_kimi_k3.KimiK3ForConditionalGeneration.forward
-    replacement: fsdp_turbo.models.kimi.kimi_k3_cp.kimi_k3_model_forward
+    replacement: fsdp_turbo.models.kimi.kimi_k3.kimi_k3_cp.kimi_k3_model_forward
 
 # --- Memory Configuration ---
 memory:

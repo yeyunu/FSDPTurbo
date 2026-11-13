@@ -19,10 +19,15 @@ Index order within a row does not matter (checked: 2.8e-07 between a permuted
 and an unpermuted call), so the indices are passed through untouched.
 """
 
+import logging
+
 import torch
 import torch_npu
 
-from fsdp_turbo.ops.registry import register_op
+from fsdp_turbo.ops.registry import get_op, register_op
+from fsdp_turbo.utils.log import log_warning_once
+
+logger = logging.getLogger(__name__)
 
 # Fixed by the operator, not by this model.
 SFA_ROPE_DIM = 64
@@ -32,16 +37,12 @@ SFA_ATTENTION_MODE = 2
 # rightDownCausal: the causal triangle anchored at the bottom right.
 SFA_SPARSE_MODE_CAUSAL = 3
 
-try:
-    _SFA = torch_npu.npu_sparse_flash_attention
-    _SFA_GRAD = torch_npu.npu_sparse_flash_attention_grad
-except AttributeError as exc:  # pragma: no cover - depends on the wheel
-    raise ImportError(
-        "torch_npu does not expose npu_sparse_flash_attention(_grad). Keep dsa_implementation on the dense path."
-    ) from exc
+_SFA = getattr(torch_npu, "npu_sparse_flash_attention", None)
+_SFA_GRAD = getattr(torch_npu, "npu_sparse_flash_attention_grad", None)
+_HAS_TORCH_NPU_SFA = _SFA is not None and _SFA_GRAD is not None
 
 
-def make_rope_pair(query, key, rope_head_dim, query_rope=None, key_rope=None):
+def make_rope_pair(query, key, rope_head_dim, query_rope=None, key_rope=None, *, check_width=True):
     """Return the (query_rope, key_rope) pair the operator requires.
 
     A model with real positional Q/K channels passes them through; one without
@@ -53,7 +54,7 @@ def make_rope_pair(query, key, rope_head_dim, query_rope=None, key_rope=None):
         return (query.new_zeros((*query.shape[:-1], SFA_ROPE_DIM)), key.new_zeros((*key.shape[:-1], SFA_ROPE_DIM)))
     if query_rope is None or key_rope is None:
         raise ValueError(f"rope_head_dim={rope_head_dim} but no rope tensors were given.")
-    if query_rope.shape[-1] != SFA_ROPE_DIM or key_rope.shape[-1] != SFA_ROPE_DIM:
+    if check_width and (query_rope.shape[-1] != SFA_ROPE_DIM or key_rope.shape[-1] != SFA_ROPE_DIM):
         raise NotImplementedError(
             f"npu_sparse_flash_attention requires rope head dim {SFA_ROPE_DIM}, got "
             f"query {query_rope.shape[-1]} / key {key_rope.shape[-1]}."
@@ -75,8 +76,14 @@ class SparseFlashAttentionFunction(torch.autograd.Function):
         actual_seq_qlen,
         actual_seq_kvlen,
         sparse_mode,
+        layout,
+        return_softmax_stats,
     ):
-        out, softmax_max, softmax_sum, *_ = _SFA(
+        use_cann = layout == "TND" or return_softmax_stats
+        operation = _SFA
+        if use_cann:
+            from cann_ops_transformer.ops.attention.sparse_flash_attention import sparse_flash_attention as operation
+        out, softmax_max, softmax_sum, *_ = operation(
             query,
             key,
             value,
@@ -88,8 +95,8 @@ class SparseFlashAttentionFunction(torch.autograd.Function):
             key_rope=key_rope,
             scale_value=float(scale),
             sparse_block_size=SFA_SPARSE_BLOCK_SIZE,
-            layout_query="BSND",
-            layout_kv="BSND",
+            layout_query=layout,
+            layout_kv=layout,
             sparse_mode=int(sparse_mode),
             attention_mode=SFA_ATTENTION_MODE,
             return_softmax_lse=True,
@@ -99,12 +106,28 @@ class SparseFlashAttentionFunction(torch.autograd.Function):
         ctx.sparse_mode = sparse_mode
         ctx.actual_seq_qlen = actual_seq_qlen
         ctx.actual_seq_kvlen = actual_seq_kvlen
+        ctx.layout = layout
+        ctx.use_cann = use_cann
+        if return_softmax_stats:
+            dimension = 1 if layout == "BSND" else 0
+            maximum, denominator = softmax_max.squeeze(dimension), softmax_sum.squeeze(dimension)
+            ctx.mark_non_differentiable(maximum, denominator)
+            return out, maximum, denominator
         return out
 
     @staticmethod
-    def backward(ctx, d_out):
+    def backward(ctx, d_out, *_stats_grads):
         (query, key, value, sparse_indices, query_rope, key_rope, out, softmax_max, softmax_sum) = ctx.saved_tensors
-        dq, dk, dv, dq_rope, dk_rope = _SFA_GRAD(
+        operation = _SFA_GRAD
+        native_args = (float(ctx.scale), SFA_SPARSE_BLOCK_SIZE)
+        native_kwargs = {}
+        if ctx.use_cann:
+            from cann_ops_transformer.ops.attention.sparse_flash_attention_grad import sparse_flash_attention_grad
+
+            operation = sparse_flash_attention_grad
+            native_args = ()
+            native_kwargs = dict(sinks=None, scale_value=ctx.scale, sparse_block_size=SFA_SPARSE_BLOCK_SIZE)
+        dq, dk, dv, dq_rope, dk_rope, *_ = operation(
             query,
             key,
             value,
@@ -113,15 +136,15 @@ class SparseFlashAttentionFunction(torch.autograd.Function):
             out,
             softmax_max,
             softmax_sum,
-            float(ctx.scale),
-            SFA_SPARSE_BLOCK_SIZE,
+            *native_args,
             query_rope=query_rope,
             key_rope=key_rope,
             actual_seq_qlen=ctx.actual_seq_qlen,
             actual_seq_kvlen=ctx.actual_seq_kvlen,
-            layout="BSND",
+            layout=ctx.layout,
             sparse_mode=int(ctx.sparse_mode),
             attention_mode=SFA_ATTENTION_MODE,
+            **native_kwargs,
         )
         # One gradient per positional argument of apply(). The rope gradients are
         # dropped for a no-rope model because its rope tensors are constants.
@@ -136,11 +159,13 @@ class SparseFlashAttentionFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
 @register_op("sparse_flash_attention", "npu")
-def sparse_flash_attention_npu(
+def _sparse_flash_attention_npu(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -150,46 +175,85 @@ def sparse_flash_attention_npu(
     query_rope: torch.Tensor | None = None,
     key_rope: torch.Tensor | None = None,
     sparse_mode: int = SFA_SPARSE_MODE_CAUSAL,
-) -> torch.Tensor:
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    return_softmax_stats: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Attention over the indexer's selected keys, with no dense mask.
 
     query is the absorbed query [B, S, N, kv_lora_rank]; key and value are the
     shared compressed latent [B, S, 1, kv_lora_rank]. topk_indices is the
-    indexer's [B, S, topk], with -1 marking unused slots.
+    indexer's [B, S, topk], with -1 marking unused slots. Packed TND inputs
+    and callers requesting stats use CANN SFA/SFAG.
     """
-    if query.shape[-1] != SFA_QK_HEAD_DIM:
+    use_cann = cu_seqlens is not None or return_softmax_stats
+    if not use_cann and not _HAS_TORCH_NPU_SFA:
+        log_warning_once(
+            logger,
+            "Operator 'sparse_flash_attention' not available for device 'npu', falling back to CPU implementation",
+        )
+        return get_op("sparse_flash_attention", "cpu")(
+            query,
+            key,
+            value,
+            topk_indices,
+            scale,
+            rope_head_dim,
+            query_rope,
+            key_rope,
+            sparse_mode,
+        )
+    if not use_cann and query.shape[-1] != SFA_QK_HEAD_DIM:
         raise NotImplementedError(
             f"The operator only accepts qk_head_dim={SFA_QK_HEAD_DIM} (the absorbed "
             f"MLA layout), got {query.shape[-1]}. W_UK must be folded into the query."
         )
-    if key.shape[2] != 1 or value.shape[2] != 1:
+    if key.shape[-2] != 1 or value.shape[-2] != 1:
         raise NotImplementedError(
-            f"The operator only accepts kv_head_num=1, got key {key.shape[2]} / "
-            f"value {value.shape[2]}. Pass the shared latent, not expanded K/V."
+            f"The operator only accepts kv_head_num=1, got key {key.shape[-2]} / "
+            f"value {value.shape[-2]}. Pass the shared latent, not expanded K/V."
         )
 
-    query, key, value = (t.contiguous() for t in (query, key, value))
-    query_rope, key_rope = make_rope_pair(query, key, rope_head_dim, query_rope, key_rope)
+    shared_kv = key is value
+    query, key = query.contiguous(), key.contiguous()
+    value = key if shared_kv else value.contiguous()
+    query_rope, key_rope = make_rope_pair(
+        query,
+        key,
+        rope_head_dim,
+        query_rope,
+        key_rope,
+        check_width=not use_cann,
+    )
 
-    batch, seq_len = query.shape[0], query.shape[1]
-    # Always supplied: the reference adaptation passes these even for a dense
-    # batch, and leaving them None makes the operator return something that
-    # matches no reference formula.
-    actual_seq_qlen = torch.full((batch,), seq_len, dtype=torch.int32, device=query.device)
+    layout = "BSND"
+    actual_seq_qlen = None
+    if cu_seqlens is not None:
+        layout = "TND"
+        actual_seq_qlen = cu_seqlens[1:].contiguous()
+    elif not use_cann:
+        # The legacy torch_npu kernel needs lengths even for a dense batch.
+        actual_seq_qlen = torch.full((query.shape[0],), query.shape[1], dtype=torch.int32, device=query.device)
 
-    out = SparseFlashAttentionFunction.apply(
+    return SparseFlashAttentionFunction.apply(
         query,
         key,
         value,
-        topk_indices.unsqueeze(2).to(torch.int32).contiguous(),
+        topk_indices.unsqueeze(-2).to(torch.int32).contiguous(),
         query_rope,
         key_rope,
         scale,
         actual_seq_qlen,
         actual_seq_qlen,
         sparse_mode,
+        layout,
+        return_softmax_stats,
     )
-    return out
+
+
+# GLM uses this export to check availability of the legacy torch_npu path.
+# The registered dispatcher also supports CANN-only installations.
+sparse_flash_attention_npu = _sparse_flash_attention_npu if _HAS_TORCH_NPU_SFA else None
 
 
 __all__ = ["sparse_flash_attention_npu"]

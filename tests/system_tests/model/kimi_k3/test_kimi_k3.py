@@ -83,8 +83,8 @@ def _set_attn_implementation(model_config, attn_implementation):
 
 def get_model_processor(config):
     """Build a reduced-layer, randomly initialized Kimi-K3 model for ST."""
-    from fsdp_turbo.models.kimi import register_kimi_k3
-    from fsdp_turbo.models.kimi.kimi_k3_processor import KimiK3Processor
+    from fsdp_turbo.models.kimi.kimi_k3 import register_kimi_k3
+    from fsdp_turbo.models.kimi.kimi_k3.kimi_k3_processor import KimiK3Processor
 
     register_kimi_k3()
     model_config = AutoConfig.from_pretrained(

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from .utils import _BUILTIN_MODELS
 
 if TYPE_CHECKING:
-    from .kimi.modeling_kimi_k3 import KimiK3ForConditionalGeneration  # noqa: F401
+    from .kimi.kimi_k3.modeling_kimi_k3 import KimiK3ForConditionalGeneration  # noqa: F401
     from .qwen.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration  # noqa: F401
     from .qwen.qwen3_5 import Qwen3_5ForConditionalGeneration  # noqa: F401
     from .qwen.qwen3_5_moe import Qwen3_5MoeForConditionalGeneration  # noqa: F401

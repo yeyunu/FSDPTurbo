@@ -24,7 +24,7 @@ memory:
 
 ## 与上下文并行（CP）的关系
 
-Qwen3.8和Kimi K3的Chunk Loss均支持与CP组合。Kimi K3上超长序列（100k+）下推荐同时开启。CP前向（`fsdp_turbo/models/kimi/kimi_k3_cp.py`）检测到
+Qwen3.8和Kimi K3的Chunk Loss均支持与CP组合。Kimi K3上超长序列（100k+）下推荐同时开启。CP前向（`fsdp_turbo/models/kimi/kimi_k3/kimi_k3_cp.py`）检测到
 `memory.chunk_loss`后走`cp_chunk_lm_loss`（`fsdp_turbo/distributed/context_parallel/loss.py`）：
 
 - 标签仍按**完整序列**全局移位后切分到本rank（与CP感知损失同一套`_shift_and_shard_labels`），跨rank边界样本不丢失；

@@ -82,7 +82,7 @@ else:
 from fsdp_turbo.memory.chunk_loss.chunk_loss import calculate_lm_loss, chunk_loss
 from .kimi_flash_attention import context_parallel_active
 from fsdp_turbo.utils.device import get_accelerator_name
-from ..utils import register_model
+from ...utils import register_model
 
 from fsdp_turbo.distributed.context_parallel.batch import shard_fused_sequence_inputs
 from fsdp_turbo.distributed.context_parallel.loss import cp_compute_lm_loss
@@ -94,10 +94,8 @@ from fsdp_turbo.distributed.context_parallel.kda_hybrid.p2p import (
 from fsdp_turbo.distributed.context_parallel.ulysses.utils import ulysses_all_to_all
 from fsdp_turbo.distributed.context_parallel.kv_allgather.utils import kv_allgather
 from fsdp_turbo.ops.kda_p2p import chunk_kda_p2p
-from fsdp_turbo.ops.flash_attn import flash_attention_forward
-
-if get_accelerator_name() == "npu":
-    import torch_npu
+from fsdp_turbo.ops.flash_attn import flash_attention_forward, vision_attention
+from fsdp_turbo.ops.rope import rope
 
 from .kimi_moe_patch import apply_kimi_k3_moe_patch
 
@@ -152,19 +150,7 @@ def multihead_attention(
             where dim = num_heads * head_dim
     """
     if get_accelerator_name() == "npu":
-        attn_out = torch_npu.npu_fusion_attention(
-            q,
-            k,
-            v,
-            head_num=q.shape[1],
-            pse=None,
-            atten_mask=None,
-            scale=1.0 / math.sqrt(q.shape[-1]),
-            keep_prob=1,
-            input_layout="TND",
-            actual_seq_qlen=q_cu_seqlens,
-            actual_seq_kvlen=k_cu_seqlens,
-        )[0]
+        attn_out = vision_attention(q, k, v, q_cu_seqlens, k_cu_seqlens)
     else:
         attn_out = flash_attn_varlen_func(
             q,
@@ -271,8 +257,8 @@ def apply_rope(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor) -> t
         # Modification start
         cos = get_global_param("cos")
         sin = get_global_param("sin")
-        xq_out = torch_npu.npu_rotary_mul(xq.float(), cos, sin, rotary_mode="interleave")
-        xk_out = torch_npu.npu_rotary_mul(xk.float(), cos, sin, rotary_mode="interleave")
+        xq_out = rope(xq.float().unsqueeze(0), cos[..., ::2], sin[..., ::2], interleaved=True).squeeze(0)
+        xk_out = rope(xk.float().unsqueeze(0), cos[..., ::2], sin[..., ::2], interleaved=True).squeeze(0)
         # Modification end
     else:
         freqs_cis = freqs_cis.unsqueeze(-2)  # ..., 1, head_dim/2

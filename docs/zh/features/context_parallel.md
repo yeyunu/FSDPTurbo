@@ -89,7 +89,7 @@ distributed:
 module_patches: []
 ```
 
-Kimi K3基础模型与Hybrid CP工厂统一位于`fsdp_turbo/models/kimi/modeling_kimi_k3.py`，通过同一模块选择模型类。
+Kimi K3基础模型与Hybrid CP工厂统一位于`fsdp_turbo/models/kimi/kimi_k3/modeling_kimi_k3.py`，通过同一模块选择模型类。
 KDA专用P2P状态通信位于`distributed/context_parallel/kda_hybrid/p2p.py`；顶层`hybrid_cp.py`提供公共运行时与绑定，`kcp/`保留一维KCP实现。
 
 Hybrid P2P无需函数替换，patch列表设为`[]`。`mla_backend: ulysses`使用顺序切分，

@@ -188,7 +188,7 @@ def get_ulysses_attention_fn(fn: Callable, group: dist.ProcessGroup):
         # the dense-mask reconstruction above (the Kimi dispatcher carries the
         # marker because it always selects the flash kernel under CP). The
         # marker and the CP_EXCHANGED_KWARG receipt are defined in
-        # fsdp_turbo.models.kimi.kimi_flash_attention; they are matched by
+        # fsdp_turbo.models.kimi.kimi_k3.kimi_flash_attention; they are matched by
         # their literal names here because distributed code must not import
         # the model package.
         flash_causal = getattr(fn, "_fsdp_turbo_flash_causal", False)

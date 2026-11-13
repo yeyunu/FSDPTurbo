@@ -161,7 +161,7 @@ def get_ulysses_kda_forward(
             lower_bound=module.gate_lower_bound,
             transpose_state_layout=True,
             cu_seqlens=None,
-            skip_recompute=getattr(module.config, "skip_kda_recompute", False),
+            disable_recompute=getattr(module.config, "skip_kda_recompute", None),
         )
 
         output = output.reshape(batch_size, full_seq_len, -1)

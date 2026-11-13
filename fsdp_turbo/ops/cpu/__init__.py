@@ -43,6 +43,7 @@ from fsdp_turbo.ops.cpu.sparse_attention import indexed_sparse_attention_torch, 
 from fsdp_turbo.ops.cpu.situ_glu import situ_glu_cpu
 from fsdp_turbo.ops.cpu.flash_attn import flash_attention_cpu
 from fsdp_turbo.ops.cpu.rotary_mul import rotary_mul_cpu
+from fsdp_turbo.ops.cpu.lightning_indexer import lightning_indexer_topk_cpu, lightning_indexer_kl_loss_cpu
 from fsdp_turbo.ops.cpu.tilekernels_mhc import tilekernels_mhc_post_cpu
 
 from fsdp_turbo.ops.cpu.sparse_indexer_loss import sparse_indexer_gradient_torch
@@ -50,11 +51,13 @@ from fsdp_turbo.ops.cpu.sparse_indexer_loss import sparse_indexer_gradient_torch
 from fsdp_turbo.ops.cpu.vision_flash_attention import fused_vision_flash_attention_cpu
 
 __all__ = [
+    'lightning_indexer_topk_cpu',
+    'lightning_indexer_kl_loss_cpu',
     'lightning_indexer_cpu',
     'indexer_kl_loss_cpu',
     'selected_attention_cpu',
     'fused_vision_flash_attention_cpu',
-    "sparse_indexer_gradient_torch",
+    'sparse_indexer_gradient_torch',
     'attention_output_projection_cpu',
     'dequant_fp8_blockwise_cpu',
     'dequant_int8_per_row_cpu',

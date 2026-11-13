@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Huawei Technologies Co., Ltd. All rights reserved.
-"""PyTorch fallback for the fused lightning indexer."""
+"""PyTorch references for lightning index selection and training KL loss."""
 
 import torch
 
@@ -94,3 +94,73 @@ def fused_lightning_indexer_cpu(
     selected = selected.gather(-1, order)
     indices = torch.nn.functional.pad(selected, (0, topk - width), value=-1)
     return indices.int(), candidates, candidate_lengths
+
+
+@register_op("lightning_indexer_topk", "cpu")
+def lightning_indexer_topk_cpu(
+    query: torch.Tensor, key: torch.Tensor, weights: torch.Tensor, topk: int, cu_seqlens: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Return document-local causal top-k indices for BSND or unpadded TND."""
+    if cu_seqlens is not None:
+        boundaries = cu_seqlens.tolist()
+        return torch.cat(
+            [
+                lightning_indexer_topk_cpu(
+                    query[start:end].unsqueeze(0), key[start:end].unsqueeze(0), weights[start:end].unsqueeze(0), topk
+                ).squeeze(0)
+                for start, end in zip(boundaries[:-1], boundaries[1:])
+            ]
+        )
+    scores = torch.einsum("bshd,bnd->bshn", query.float(), key.float()).relu()
+    scores = torch.einsum("bsh,bshn->bsn", weights.float(), scores)
+    sequence, key_length = query.shape[1], key.shape[1]
+    visible = (
+        torch.arange(sequence, device=query.device)[:, None] >= torch.arange(key_length, device=query.device)[None, :]
+    )
+    scores = scores.masked_fill(~visible, -torch.inf)
+    indices = torch.argsort(scores, dim=-1, descending=True, stable=True)[..., : min(topk, key_length)]
+    selected = visible[None, :, :].expand_as(scores).gather(-1, indices)
+    indices = indices.masked_fill(~selected, -1).to(torch.int32)
+    return torch.nn.functional.pad(indices, (0, topk - indices.shape[-1]), value=-1).unsqueeze(2)
+
+
+@register_op("lightning_indexer_kl_loss", "cpu")
+def lightning_indexer_kl_loss_cpu(
+    query_index: torch.Tensor,
+    key_index: torch.Tensor,
+    weights: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    indices: torch.Tensor,
+    maximum: torch.Tensor,
+    denominator: torch.Tensor,
+    scale: float,
+    cu_seqlens: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mean sparse teacher KL for BSND/TND; only indexer features receive gradients."""
+    from fsdp_turbo.ops.cpu.sparse_attention import sparse_attention_selected_mask
+
+    if cu_seqlens is not None:
+        boundaries = cu_seqlens.tolist()
+        tensors = (query_index, key_index, weights, query, key, query_rope, key_rope, indices, maximum, denominator)
+        return (
+            sum(
+                lightning_indexer_kl_loss_cpu(*(tensor[start:end].unsqueeze(0) for tensor in tensors), scale)
+                * (end - start)
+                for start, end in zip(boundaries[:-1], boundaries[1:])
+            )
+            / query_index.shape[0]
+        )
+    selected = sparse_attention_selected_mask(indices.squeeze(-2), key.shape[1])
+    with torch.no_grad():
+        teacher_scores = (
+            torch.einsum("bshd,bnd->bshn", query.float(), key.squeeze(2).float())
+            + torch.einsum("bshr,bnr->bshn", query_rope.float(), key_rope.squeeze(2).float())
+        ) * scale
+        teacher = teacher_scores.masked_fill(~selected.unsqueeze(2), -torch.inf).softmax(-1).mean(2)
+    scores = torch.einsum("bshd,bnd->bshn", query_index.float(), key_index.float()).relu()
+    scores = torch.einsum("bsh,bshn->bsn", weights.float(), scores)
+    log_probability = scores.masked_fill(~selected, -torch.inf).log_softmax(-1).masked_fill(~selected, 0)
+    return (teacher * (teacher.clamp_min(1e-30).log() - log_probability)).sum(-1).mean()

@@ -12,7 +12,7 @@ from unittest.mock import patch
 class KimiK3RegistrationTests(unittest.TestCase):
     def test_registration_is_lazy_and_selects_local_classes_on_repeated_calls(self):
         package_name = '_test_local_kimi'
-        source = Path(__file__).resolve().parents[2] / 'fsdp_turbo/models/kimi/__init__.py'
+        source = Path(__file__).resolve().parents[2] / 'fsdp_turbo/models/kimi/kimi_k3/__init__.py'
         specification = importlib.util.spec_from_file_location(package_name, source)
         package = importlib.util.module_from_spec(specification)
         # Importing the package must not import Transformers or accelerator modeling.

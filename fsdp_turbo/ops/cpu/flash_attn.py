@@ -87,3 +87,27 @@ def causal_flash_attention_cpu(query, key, value, *, scaling=None, dropout=0.0, 
         scale=scaling,
         is_causal=is_causal,
     )
+
+
+@register_op("vision_attention", "cpu")
+def vision_attention_cpu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_endpoints: torch.Tensor | tuple[int, ...],
+    key_endpoints: torch.Tensor | tuple[int, ...],
+) -> torch.Tensor:
+    """Portable bidirectional TND attention with independent image boundaries."""
+    q_ends = query_endpoints.tolist() if isinstance(query_endpoints, torch.Tensor) else query_endpoints
+    k_ends = key_endpoints.tolist() if isinstance(key_endpoints, torch.Tensor) else key_endpoints
+    outputs = []
+    q_start = k_start = 0
+    for q_end, k_end in zip(q_ends, k_ends):
+        if q_end > q_start:
+            q = query[q_start:q_end].transpose(0, 1)
+            k = key[k_start:k_end].transpose(0, 1)
+            v = value[k_start:k_end].transpose(0, 1)
+            scores = (q.float() @ k.float().transpose(-1, -2)) * (query.shape[-1] ** -0.5)
+            outputs.append((scores.softmax(-1).to(v.dtype) @ v).transpose(0, 1))
+        q_start, k_start = q_end, k_end
+    return torch.cat(outputs)

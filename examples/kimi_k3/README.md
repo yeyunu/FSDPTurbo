@@ -8,15 +8,14 @@
 ## 模型文件准备
 
 从下载的 Kimi-K3 模型目录中复制 `media_utils.py` 到 FSDPTurbo 的
-`fsdp_turbo/models/kimi/` 目录，使它与 `kimi_k3_processor.py` 同级。
+`fsdp_turbo/models/kimi/kimi_k3/` 目录，使它与 `kimi_k3_processor.py` 同级。
 
 在训练服务器上执行以下命令，并将路径替换为实际位置：
 
 ```bash
 HF_PATH="/download/Kimi-K3"
-TURBO_PATH="/home/workspace/FSDPTurbo"
 
-cp "${HF_PATH}/media_utils.py" "${TURBO_PATH}/fsdp_turbo/models/kimi/"
+cp "${HF_PATH}/media_utils.py" "${TURBO_PATH}/fsdp_turbo/models/kimi/kimi_k3/"
 ```
 
 请保留仓库内已适配的 `modeling_kimi_k3.py`、`modeling_kimi_linear.py`
@@ -25,10 +24,10 @@ tokenizer与processor资源由`model.tokenizer_name_or_path`指定。
 
 ## 模型代码加载
 
-`train.py` 和系统测试先调用 `fsdp_turbo.models.kimi.register_kimi_k3()`，
+`train.py` 和系统测试先调用 `fsdp_turbo.models.kimi.kimi_k3.register_kimi_k3()`，
 将仓库内的 `KimiK3Config`、`KimiLinearConfig` 和 `KimiK3ForConditionalGeneration`
 注册到 Transformers。随后使用 `trust_remote_code=False` 加载配置和模型，
-确保使用 `fsdp_turbo/models/kimi/` 内的 `modeling_kimi_k3.py` 与
+确保使用 `fsdp_turbo/models/kimi/kimi_k3/` 内的 `modeling_kimi_k3.py` 与
 `modeling_kimi_linear.py`，包括本地算子和 MoE 适配。
 `model_name_or_path` 仍指定配置及权重来源；processor 显式使用仓库内的
 `KimiK3Processor`，保留对列表文本输入的适配。其 tokenizer 和图像处理器
@@ -68,7 +67,7 @@ distributed:
 # Kimi K3 必须先完成文本与图像 token 融合，再切分序列。
 module_patches:
   - target: modeling_kimi_k3.KimiK3ForConditionalGeneration.forward
-    replacement: fsdp_turbo.models.kimi.kimi_k3_cp.kimi_k3_model_forward
+    replacement: fsdp_turbo.models.kimi.kimi_k3.kimi_k3_cp.kimi_k3_model_forward
 ```
 
 各配置项的作用如下：

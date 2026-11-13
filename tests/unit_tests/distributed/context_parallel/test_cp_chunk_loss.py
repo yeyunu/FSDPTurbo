@@ -158,7 +158,7 @@ def _fsdp_sharded_head_worker(rank, world_size, port, seq_len, chunk_size):
 
         from fsdp_turbo.distributed.context_parallel.batch import pad_tensor_to_group, split_tensor_to_group
         from fsdp_turbo.memory.chunk_loss.chunkloss_lm_head import apply_chunkloss_module
-        from fsdp_turbo.models.kimi.kimi_k3_cp import _cp_chunk_loss_fn
+        from fsdp_turbo.models.kimi.kimi_k3.kimi_k3_cp import _cp_chunk_loss_fn
 
         torch.manual_seed(2024)
         batch, hidden_dim, vocab, ignore_index = 1, 8, 16, -100
@@ -212,7 +212,7 @@ def _ulysses_roundtrip_worker(rank, world_size, port):
     _init_gloo(rank, world_size, port)
     try:
         from fsdp_turbo.distributed.context_parallel.ulysses.ulysses_attention import get_ulysses_attention_fn
-        from fsdp_turbo.models.kimi.kimi_flash_attention import kimi_flash_attention_forward
+        from fsdp_turbo.models.kimi.kimi_k3.kimi_flash_attention import kimi_flash_attention_forward
 
         torch.manual_seed(99)
         batch, heads, local_len, head_dim = 1, 2, 4, 3
@@ -274,7 +274,7 @@ class CpChunkLossTests(unittest.TestCase):
 
 class KimiFlashAttentionTests(unittest.TestCase):
     def _run_flash(self, module, q, k, v, attention_mask=None, **kwargs):
-        from fsdp_turbo.models.kimi.kimi_flash_attention import kimi_flash_attention_forward
+        from fsdp_turbo.models.kimi.kimi_k3.kimi_flash_attention import kimi_flash_attention_forward
 
         output, weights = kimi_flash_attention_forward(
             module, q, k, v, attention_mask=attention_mask, scaling=q.shape[-1] ** -0.5, **kwargs
@@ -313,7 +313,7 @@ class FlashCPWiringTests(unittest.TestCase):
     """The flash kernel must sit behind a CP wrapper whenever CP is active."""
 
     def test_unwrapped_call_without_wrapper_names_the_config(self):
-        import fsdp_turbo.models.kimi.kimi_flash_attention as kfa
+        import fsdp_turbo.models.kimi.kimi_k3.kimi_flash_attention as kfa
 
         module = _FlashModule()
         q, k, v = (torch.randn(1, 2, 4, 3) for _ in range(3))

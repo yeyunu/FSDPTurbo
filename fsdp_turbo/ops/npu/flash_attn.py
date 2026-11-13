@@ -188,3 +188,29 @@ def flash_attention_npu(
 
     attn_output = _npu_fa_bnsd(query, key, value, head_num, scaling, dropout, atten_mask, sparse_mode)
     return attn_output, None
+
+
+@register_op("vision_attention", "npu")
+def vision_attention_npu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_endpoints: torch.Tensor | tuple[int, ...],
+    key_endpoints: torch.Tensor | tuple[int, ...],
+) -> torch.Tensor:
+    """Preserve K3's native bidirectional TND attention call and autograd."""
+    import torch_npu
+
+    return torch_npu.npu_fusion_attention(
+        query,
+        key,
+        value,
+        head_num=query.shape[1],
+        pse=None,
+        atten_mask=None,
+        scale=query.shape[-1] ** -0.5,
+        keep_prob=1,
+        input_layout="TND",
+        actual_seq_qlen=query_endpoints,
+        actual_seq_kvlen=key_endpoints,
+    )[0]

@@ -78,13 +78,28 @@ def sparse_flash_attention(
     query_rope=None,
     key_rope=None,
     sparse_mode=SFA_SPARSE_MODE_CAUSAL,
-):
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    return_softmax_stats: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Attend over the indexer's selected keys without building a dense mask.
 
     query is the absorbed MLA query [B, S, N, kv_lora_rank]; key and value are
     the shared compressed latent [B, KV, 1, kv_lora_rank]; topk_indices is the
     indexer's [B, S, topk] with -1 marking unused slots.
+
+    With int32 ``cu_seqlens=[0,...,T]``, Q/K/V and RoPE use unpadded TND,
+    and indices [T, topk] are local to each sequence. When requested, the
+    output is followed by detached FP32 softmax maxima and exponential sums
+    shaped [B,S,H] for BSND or [T,H] for TND.
     """
+    options = {}
+    if cu_seqlens is not None or return_softmax_stats:
+        options = dict(
+            cu_seqlens=cu_seqlens,
+            return_softmax_stats=return_softmax_stats,
+            device_type=query.device.type,
+        )
     return dispatch_op(
         "sparse_flash_attention",
         query,
@@ -96,4 +111,5 @@ def sparse_flash_attention(
         query_rope=query_rope,
         key_rope=key_rope,
         sparse_mode=sparse_mode,
+        **options,
     )

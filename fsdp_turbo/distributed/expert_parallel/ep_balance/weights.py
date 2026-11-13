@@ -36,6 +36,8 @@ class EPBalanceWeights:
 
     def prepare_gate_up(self, gate_up_weights: torch.Tensor, down_weights: torch.Tensor) -> torch.Tensor:
         """Finish gate/up transfer and start down transfer before the first GEMM."""
+        if self.strategy is None:
+            return gate_up_weights
         self.strategy.executor.wait_async_works_finished(name="gate_up_weights")
         gate_up_weights = self._append(gate_up_weights, self.dup_gate_up_weights, "gate_up_weights")
         self.dup_down_weights = self.strategy.executor.async_experts_param_comm(

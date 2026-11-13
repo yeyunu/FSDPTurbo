@@ -26,7 +26,7 @@ class KimiK3Trainer(BaseTrainer):
 
     def build_tokenizer(self):
         if self.config.data.is_multimodal:
-            from fsdp_turbo.models.kimi.kimi_k3_processor import KimiK3Processor
+            from fsdp_turbo.models.kimi.kimi_k3.kimi_k3_processor import KimiK3Processor
 
             print_rank(logger.info, "> Building Processor (multimodal)...")
             processor = KimiK3Processor.from_pretrained(
@@ -39,12 +39,12 @@ class KimiK3Trainer(BaseTrainer):
 
     def build_model(self) -> torch.nn.Module:
         """Load one repository-local K3 reference family, then attach parallelism."""
-        from fsdp_turbo.models.kimi import register_kimi_k3
-        from fsdp_turbo.models.kimi.modeling_kimi_k3 import (
+        from fsdp_turbo.models.kimi.kimi_k3 import register_kimi_k3
+        from fsdp_turbo.models.kimi.kimi_k3.modeling_kimi_k3 import (
             KimiK3ForConditionalGeneration,
             build_kimi_k3_model_class,
         )
-        from fsdp_turbo.models.kimi.modeling_kimi_linear import KimiDeltaAttention, KimiMLAAttention
+        from fsdp_turbo.models.kimi.kimi_k3.modeling_kimi_linear import KimiDeltaAttention, KimiMLAAttention
 
         register_kimi_k3()
         print_rank(logger.info, "> Building KimiK3 Model...")
@@ -81,7 +81,7 @@ class KimiK3Trainer(BaseTrainer):
         convert_model_dtype(model, self.config.model.torch_dtype)
         if self.config.memory.chunk_loss:
             # The CP-aware forward reads these attributes off the top-level model
-            # (see fsdp_turbo/models/kimi/kimi_k3_cp.py); the switches live in
+            # (see fsdp_turbo/models/kimi/kimi_k3/kimi_k3_cp.py); the switches live in
             # config.yaml under ``memory``.
             # The chunked loss runs inside the head's module call, so lm_head's
             # gradient goes through FSDP's reduce-scatter like any other sharded

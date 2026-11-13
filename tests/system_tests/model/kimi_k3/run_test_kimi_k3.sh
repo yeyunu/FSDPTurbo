@@ -17,7 +17,7 @@ cp -r /home/dataset/Kimi-K3/* /home/dataset/Kimi-K3-tmp/ || exit 1
 # Only copy missing files, preserving existing local modeling and training adapters.
 KIMI_MODEL_DIR="$(python - <<'PY'
 from pathlib import Path
-import fsdp_turbo.models.kimi as kimi
+import fsdp_turbo.models.kimi.kimi_k3 as kimi
 
 print(Path(kimi.__file__).resolve().parent)
 PY
@@ -47,9 +47,9 @@ python - <<'PY'
 from importlib.util import find_spec
 
 for module_name in (
-    'fsdp_turbo.models.kimi.configuration_kimi_k3',
-    'fsdp_turbo.models.kimi.modeling_kimi_k3',
-    'fsdp_turbo.models.kimi.modeling_kimi_linear',
+    'fsdp_turbo.models.kimi.kimi_k3.configuration_kimi_k3',
+    'fsdp_turbo.models.kimi.kimi_k3.modeling_kimi_k3',
+    'fsdp_turbo.models.kimi.kimi_k3.modeling_kimi_linear',
 ):
     if find_spec(module_name) is None:
         raise ModuleNotFoundError(f'Required local model module is missing: {module_name}')

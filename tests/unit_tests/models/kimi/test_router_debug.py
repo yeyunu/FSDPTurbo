@@ -13,19 +13,19 @@ torch = pytest.importorskip("torch")
 from fsdp_turbo.fsdp_turbo_config import KimiRouterDebugConfig  # noqa: E402
 
 try:  # noqa: SIM105 - the plain package path needs transformers
-    from fsdp_turbo.models.kimi.router_debug import (  # noqa: E402
+    from fsdp_turbo.models.kimi.kimi_k3.router_debug import (  # noqa: E402
         _exact_counts,
         _synthetic_indices,
         custom_routing,
         record_load,
     )
 except ModuleNotFoundError as error:  # e.g. no transformers: load the file directly
-    if error.name not in ("transformers", "fsdp_turbo.models.kimi.router_debug"):
+    if error.name not in ("transformers", "fsdp_turbo.models.kimi.kimi_k3.router_debug"):
         raise
     import importlib.util
     from pathlib import Path
 
-    _path = Path(__file__).parents[4] / "fsdp_turbo" / "models" / "kimi" / "router_debug.py"
+    _path = Path(__file__).parents[4] / "fsdp_turbo" / "models" / "kimi" / "kimi_k3" / "router_debug.py"
     _spec = importlib.util.spec_from_file_location("router_debug_under_test", _path)
     _module = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_module)

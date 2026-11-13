@@ -13,9 +13,16 @@ def chunk_kda(
     g: torch.Tensor,
     beta: torch.Tensor,
     *args: object,
+    disable_recompute: bool | None = None,
     **kwargs: object,
-) -> tuple[torch.Tensor | None, ...]:
-    """Apply chunked Kimi Delta Attention using the active device backend."""
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Apply chunked Kimi Delta Attention using the active device backend.
+
+    When disable_recompute is None, use the backend default. A boolean
+    controls reconstruction of KDA intermediates during the kernel backward.
+    """
+    if disable_recompute is not None:
+        kwargs["disable_recompute"] = disable_recompute
     return dispatch_op('chunk_kda', q, k, v, g, beta, *args, device_type=q.device.type, **kwargs)
 
 

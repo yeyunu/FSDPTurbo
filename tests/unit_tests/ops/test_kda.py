@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from fsdp_turbo.ops import registry
@@ -5,20 +6,29 @@ from fsdp_turbo.ops.kda import chunk_kda
 from fsdp_turbo.ops.registry import get_op
 
 
-def test_chunk_kda_dispatches_to_registered_cpu_op(monkeypatch):
+@pytest.mark.parametrize("disable_recompute", [None, False, True])
+def test_chunk_kda_dispatches_to_registered_cpu_op(monkeypatch, disable_recompute):
     calls = []
 
     def fake_chunk_kda(*args, **kwargs):
         calls.append((args, kwargs))
         return 'output', 'final_state'
 
-    monkeypatch.setattr(torch.accelerator, 'current_accelerator', lambda: torch.device('cpu'))
+    def unexpected_backend(*args, **kwargs):
+        pytest.fail('CPU input must select the CPU backend')
+
+    monkeypatch.setattr(torch.accelerator, 'current_accelerator', lambda: torch.device('cuda'))
     monkeypatch.setitem(registry._OPERATOR_REGISTRY['chunk_kda'], 'cpu', fake_chunk_kda)
+    monkeypatch.setitem(registry._OPERATOR_REGISTRY['chunk_kda'], 'cuda', unexpected_backend)
 
-    result = chunk_kda('q', 'k', 'v', 'g', 'beta', output_final_state=True)
+    inputs = tuple(torch.tensor(i) for i in range(5))
+    result = chunk_kda(*inputs, output_final_state=True, disable_recompute=disable_recompute)
 
+    expected_kwargs = {"output_final_state": True}
+    if disable_recompute is not None:
+        expected_kwargs["disable_recompute"] = disable_recompute
     assert result == ('output', 'final_state')
-    assert calls == [(('q', 'k', 'v', 'g', 'beta'), {'output_final_state': True})]
+    assert calls == [(inputs, expected_kwargs)]
 
 
 def test_chunk_kda_has_cpu_fallback():

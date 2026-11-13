@@ -10,6 +10,7 @@ Query/key/value arrive in **BNSD** layout ``[B, H, S, D]``.
 """
 
 import logging
+
 import torch
 
 from fsdp_turbo.ops.registry import dispatch_op
@@ -30,7 +31,7 @@ def causal_flash_attention(
     dropout: float = 0.0,
     is_causal: bool = True,
 ) -> torch.Tensor:
-    """Native-causal flash attention for BNSD tensors, dispatched by device.
+    """Native-causal flash attention for BNSD tensors, dispatched by the query device.
 
     Causality comes from the kernel itself -- NPU ``npu_fusion_attention`` with
     ``sparse_mode=3``, SDPA ``is_causal`` on CPU/CUDA -- so no dense
@@ -109,3 +110,20 @@ def register_flash_attention():
         _FLASH_ATTN_REGISTERED = True
     except (ImportError, AttributeError) as exc:
         log_warning_once(logger, f"flash_attention_2 backend not registered: {exc}")
+
+
+def vision_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_endpoints: torch.Tensor | tuple[int, ...],
+    key_endpoints: torch.Tensor | tuple[int, ...],
+) -> torch.Tensor:
+    """Bidirectional TND vision attention using cumulative sequence endpoints.
+
+    Endpoints exclude the initial zero on the native NPU path, matching K3's
+    established encoder contract. Returns a tensor with the query layout.
+    """
+    return dispatch_op(
+        "vision_attention", query, key, value, query_endpoints, key_endpoints, device_type=query.device.type
+    )

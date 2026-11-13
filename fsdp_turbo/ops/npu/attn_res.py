@@ -5,6 +5,8 @@
 
 import logging
 
+import torch
+
 from fsdp_turbo.ops.registry import register_op
 from fsdp_turbo.utils.log import print_rank
 
@@ -17,13 +19,13 @@ except ImportError:
     # Keep the fallback import conditional, as in the chunk_kda backend selector.
     from fsdp_turbo.ops.cpu.attn_res import attn_res_cpu as _attn_res_impl  # pylint: disable=ungrouped-imports
 
-    _ATTN_RES_BACKEND = 'eager'
+    ATTN_RES_BACKEND = 'eager'
     print_rank(
         logger.warning,
         "AscendC attention residuals are unavailable; falling back to the eager implementation.",
     )
 else:
-    _ATTN_RES_BACKEND = 'ascendc'
+    ATTN_RES_BACKEND = 'ascendc'
     # This module executes at import time, before BaseTrainer._init_distributed
     # configures logging, so a logger record would be dropped; print straight to
     # stdout via print_rank (rank-0 only) so the marker shows in every launch mode.
@@ -31,9 +33,15 @@ else:
 
 
 @register_op('attn_res', 'npu')
-def attn_res_npu(prefix_sum, block_residual, proj_weight, norm_weight, variance_epsilon):
-    """Run attention residuals with the selected NPU implementation."""
-    if _ATTN_RES_BACKEND == 'ascendc':
+def attn_res_npu(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    proj_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor:
+    """Run the fused NPU implementation or fall back to eager when permitted."""
+    if ATTN_RES_BACKEND == 'ascendc':
         return _attn_res_impl(prefix_sum, block_residual, proj_weight, norm_weight, norm_eps=variance_epsilon)
     return _attn_res_impl(prefix_sum, block_residual, proj_weight, norm_weight, variance_epsilon)
 

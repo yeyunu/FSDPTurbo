@@ -80,6 +80,14 @@ def indexed_sparse_attention_torch(
     return attention_output.to(query.dtype)
 
 
+def sparse_attention_selected_mask(indices: torch.Tensor, key_length: int) -> torch.Tensor:
+    """Decode -1-padded key indices into a shared boolean mask."""
+    # Use an extra column so padding cannot overwrite a valid key.
+    selected = torch.zeros((*indices.shape[:-1], key_length + 1), device=indices.device, dtype=torch.bool)
+    selected.scatter_(-1, indices.long().masked_fill(indices < 0, key_length), True)
+    return selected[..., :key_length]
+
+
 @register_op("sparse_flash_attention", "cpu")
 def sparse_flash_attention_torch(
     query: torch.Tensor,
@@ -91,15 +99,51 @@ def sparse_flash_attention_torch(
     query_rope: torch.Tensor | None = None,
     key_rope: torch.Tensor | None = None,
     sparse_mode: int = 3,
-) -> torch.Tensor:
+    *,
+    cu_seqlens: torch.Tensor | None = None,
+    return_softmax_stats: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Gather-based reference for ``npu_sparse_flash_attention`` (MLA-absorb DSA).
 
     query is the absorbed query [B, S, N, D]; key and value are the shared latent
     [B, KV, 1, D]; topk_indices is [B, S, topk] with -1 marking unused slots.
     The indices already encode causality and padding, so ``sparse_mode`` needs
-    no separate handling here.
+    no separate handling here. Packed inputs use document-local indices.
     """
-    del sparse_mode
+    if cu_seqlens is not None:
+        boundaries = cu_seqlens.tolist()
+        inputs = (query, key, value, topk_indices)
+        parts = [
+            sparse_flash_attention_torch(
+                *(tensor[start:end].unsqueeze(0) for tensor in inputs),
+                softmax_scale,
+                rope_head_dim,
+                None if query_rope is None else query_rope[start:end].unsqueeze(0),
+                None if key_rope is None else key_rope[start:end].unsqueeze(0),
+                sparse_mode,
+                return_softmax_stats=return_softmax_stats,
+            )
+            for start, end in zip(boundaries[:-1], boundaries[1:])
+        ]
+        if return_softmax_stats:
+            return tuple(torch.cat(tensors, dim=1).squeeze(0) for tensors in zip(*parts))
+        return torch.cat(parts, dim=1).squeeze(0)
+
+    if return_softmax_stats:
+        # The dense reference avoids materializing an [B,S,topk,D] gather
+        # for each latent and retains FP32 weights for the KL reference.
+        selected = sparse_attention_selected_mask(topk_indices, key.shape[1])
+        scores = torch.einsum("bshd,bnd->bshn", query.float(), key.squeeze(2).float())
+        if rope_head_dim:
+            if query_rope is None or key_rope is None:
+                raise ValueError(f"rope_head_dim={rope_head_dim} but no rope tensors were given.")
+            scores = scores + torch.einsum("bshr,bnr->bshn", query_rope.float(), key_rope.squeeze(2).float())
+        scores = (scores * softmax_scale).masked_fill(~selected.unsqueeze(2), -torch.inf)
+        maximum = scores.amax(-1)
+        denominator = (scores - maximum.unsqueeze(-1)).exp().sum(-1)
+        output = torch.einsum("bshn,bnd->bshd", scores.softmax(-1), value.squeeze(2).float())
+        return output.to(query.dtype), maximum.detach(), denominator.detach()
+
     batch_size, sequence_length, _, head_dim = query.shape
     kv_length = key.shape[1]
     topk_size = topk_indices.shape[-1]
