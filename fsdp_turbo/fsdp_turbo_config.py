@@ -1168,7 +1168,9 @@ class FSDPTurboConfig:
             if self.distributed.ep_plan is None
             else self.distributed.ep_plan
         )
-        if not isinstance(self.distributed.ep_plan.enable_efsdp_prefetch, bool):
+        # Legacy EP plans without this field keep prefetch enabled.
+        enable_efsdp_prefetch = getattr(self.distributed.ep_plan, "enable_efsdp_prefetch", True)
+        if not isinstance(enable_efsdp_prefetch, bool):
             raise ValueError("distributed.ep_plan.enable_efsdp_prefetch must be boolean.")
         if self.distributed.ep_plan.gradient_divide_factor is None:
             # Divide across all expert mesh dims (edp * efsdp * ep). torchrun
