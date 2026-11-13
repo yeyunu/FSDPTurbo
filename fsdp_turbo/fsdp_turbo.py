@@ -290,7 +290,9 @@ class FSDPTurbo(torch.nn.Module):
         self.model = swap_activation_modules(self.model, self.config.memory.swap_activation_plan.apply_modules)
 
     def _capture_tp_info_on_mx_linear(self):
-        if self.config.distributed.tensor_parallel_size <= 1:
+        quantization_plan = self.config.quantization.quantization_plan
+        quantization_enabled = quantization_plan.converters or quantization_plan.quant_recipe
+        if self.config.distributed.tensor_parallel_size <= 1 or not quantization_enabled:
             return
         from fsdp_turbo.quantization.mx_formats.mx_linear import MXLinear
         from fsdp_turbo.quantization.qat.w8a16.w8a16_linear import W8A16Linear

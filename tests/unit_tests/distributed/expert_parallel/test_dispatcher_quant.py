@@ -29,7 +29,7 @@ def test_experts_computation_passes_owner_and_attr_to_quant_gemm():
 
     with (
         patch(
-            "fsdp_turbo.distributed.expert_parallel.dispatcher.quant_grouped_gemm",
+            "fsdp_turbo.quantization.utils.quant_grouped_gemm",
             side_effect=lambda *a, **k: torch.randn(a[0].shape[0], a[1].shape[-2], dtype=torch.bfloat16),
         ) as quant_gemm,
         patch("fsdp_turbo.distributed.expert_parallel.dispatcher.grouped_matmul"),
@@ -109,7 +109,7 @@ def test_experts_computation_without_quant_config_uses_plain_gemm():
     x, gate_up, down = _inputs()
 
     with (
-        patch("fsdp_turbo.distributed.expert_parallel.dispatcher.quant_grouped_gemm") as quant_gemm,
+        patch("fsdp_turbo.quantization.utils.quant_grouped_gemm") as quant_gemm,
         patch(
             "fsdp_turbo.distributed.expert_parallel.dispatcher.grouped_matmul",
             wraps=grouped_matmul,

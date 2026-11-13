@@ -9,9 +9,6 @@ from torch.distributed._functional_collectives import all_to_all_single_autograd
 from fsdp_turbo.distributed.expert_parallel.comm import gather_along_first_dim_expert_parallel
 from fsdp_turbo.ops.moe import grouped_matmul, permute, unpermute, swiglu, clipped_swiglu, clamp_swiglu
 from fsdp_turbo.ops.clipped_swiglu import clipped_swiglu as clipped_swiglu_activation
-from fsdp_turbo.quantization.utils import quant_grouped_gemm
-from fsdp_turbo.quantization.qat.w4a16.w4a16_config import W4A16Config
-from fsdp_turbo.quantization.qat.w4a16.w4a16_gmm import mx_quant_group_gemm
 from fsdp_turbo.distributed.expert_parallel.utils import (
     get_num_global_tokens_per_local_expert,
     pop_dispatch_splits,
@@ -151,8 +148,11 @@ def experts_computation(
     positive limits. Empty token buffers retain zero gradients to both weights.
     Routing probabilities are applied by the caller during combination.
     """
-    is_w4a16 = isinstance(quant_config, W4A16Config)
+    is_w4a16 = False
+    if quant_config is not None:
+        from fsdp_turbo.quantization.qat.w4a16.w4a16_config import W4A16Config
 
+        is_w4a16 = isinstance(quant_config, W4A16Config)
     if hidden_states.shape[0] == 0:
         if ep_balance is not None:
             down_weights = ep_balance.prepare_down(down_weights)
@@ -163,6 +163,8 @@ def experts_computation(
 
     def gemm_fn(x, w, weight_attr):
         if is_w4a16:
+            from fsdp_turbo.quantization.qat.w4a16.w4a16_gmm import mx_quant_group_gemm
+
             num_local_experts = gate_up_weights.shape[0]
             hidden_size = gate_up_weights.shape[-1]
             if weight_attr == "gate_up_proj":
@@ -180,6 +182,8 @@ def experts_computation(
                 ori_weight=w,
             )
         if quant_config is not None:
+            from fsdp_turbo.quantization.utils import quant_grouped_gemm
+
             return quant_grouped_gemm(
                 x,
                 w,

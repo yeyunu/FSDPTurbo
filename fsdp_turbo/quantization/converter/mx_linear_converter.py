@@ -24,7 +24,7 @@ class MXLinearConverter:
         # Configure MXFP8
         self.config = get_mxfp8linear_config(config)
 
-    def convert(self, model: nn.Module):
+    def convert(self, model: nn.Module) -> None:
         """
         Converts the linear layers of `model` to `MXLinear`.
         Note that today, only dynamic tensor scaling (the default) is supported.
@@ -32,12 +32,14 @@ class MXLinearConverter:
         """
 
         from fsdp_turbo.quantization.quantize import quantize_
+        from fsdp_turbo.quantization.mx_formats.mx_linear import _mx_linear_transform
 
         quantize_(
             model,
             config=self.config,
             filter_fn=module_filter_fn,
             device=next((p.device for p in model.parameters()), None),
+            handler=_mx_linear_transform,
         )
 
 
