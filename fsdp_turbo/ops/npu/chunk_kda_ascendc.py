@@ -50,6 +50,11 @@ def _legacy_bwd_kwargs():
     return {"implementation": "legacy"} if "implementation" in parameters else {}
 
 
+@lru_cache(maxsize=1)
+def _bwd_supports_layout():
+    return "layout" in inspect.signature(ascendc_chunk_kda_bwd).parameters
+
+
 def _a2a3_recompute(q, k, v, g, beta, akk, *, A_log, dt_bias, cu_seqlens, use_gate_in_kernel, lower_bound):
     # A2/A3 wheels do not ship an executable AscendC KDA recompute. Use
     # the model's Triton small operators, then the AscendC state recurrence.
@@ -603,6 +608,16 @@ class ChunkKDAFunction(torch.autograd.Function):
             else:
                 bwd_kwargs = {"implementation": "optimized"}
 
+            supports_layout = _bwd_supports_layout()
+            if supports_layout:
+                bwd_kwargs["layout"] = "NTD" if is_varlen else "BNSD"
+            else:
+                # Older bindings take head-major beta, output gradient and raw gate.
+                beta_head = _bsh_to_nt(beta) if is_varlen else _bsh_to_bhs(beta)
+                to_head_major = _bsnd_to_ntd if is_varlen else _bsnd_to_bnsd
+                do_head = to_head_major(do)
+                raw_g_head = to_head_major(g_input) if ctx.use_gate_in_kernel else None
+
             dq_head, dk_head, dv_head, db_head, dg_head, dh0, dA, dbias = ascendc_chunk_kda_bwd(
                 q_head,
                 k_head,
@@ -632,17 +647,22 @@ class ChunkKDAFunction(torch.autograd.Function):
                 disable_recompute=True if ctx.platform == "a2a3" else ctx.disable_recompute,
                 use_exp2=True,
                 state_v_first=False,
-                layout="NTD" if is_varlen else "BNSD",
                 **bwd_kwargs,
                 **norm_kwargs,
             )
 
             if is_varlen:
                 dq, dk, dv = map(_ntd_to_bsnd, (dq_head, dk_head, dv_head))
-                db, dg = db_head.unsqueeze(0), dg_head.unsqueeze(0)
+                if supports_layout:
+                    db, dg = db_head.unsqueeze(0), dg_head.unsqueeze(0)
+                else:
+                    db, dg = _nt_to_bsh(db_head), _ntd_to_bsnd(dg_head)
             else:
                 dq, dk, dv = map(_bnsd_to_bsnd, (dq_head, dk_head, dv_head))
-                db, dg = db_head, dg_head
+                if supports_layout:
+                    db, dg = db_head, dg_head
+                else:
+                    db, dg = _bhs_to_bsh(db_head), _bnsd_to_bsnd(dg_head)
             if dbias is not None:
                 dbias = dbias.reshape(dt_bias.shape)
         else:
