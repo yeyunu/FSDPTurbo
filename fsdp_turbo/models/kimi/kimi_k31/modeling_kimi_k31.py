@@ -73,7 +73,7 @@ else:
     flash_attn_varlen_func = None
 from fsdp_turbo.utils.device import get_accelerator_name
 
-from fsdp_turbo.ops.flash_attn import flash_attention_forward
+from fsdp_turbo.ops.flash_attn import flash_attention_forward, vision_attention
 from fsdp_turbo.ops.rope import rope
 
 
@@ -105,8 +105,8 @@ def multihead_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_cu_seqlens: torch.Tensor | None = None,
-    k_cu_seqlens: torch.Tensor | None = None,
+    q_cu_seqlens: torch.Tensor | tuple[int, ...] | None = None,
+    k_cu_seqlens: torch.Tensor | tuple[int, ...] | None = None,
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     deterministic: bool = False,
@@ -128,6 +128,9 @@ def multihead_attention(
         output: shape (batch_size, seqlen, dim) or (tot_seqlens, dim) if packing,
             where dim = num_heads * head_dim
     """
+    if isinstance(q_cu_seqlens, tuple) and isinstance(k_cu_seqlens, tuple):
+        return vision_attention(q, k, v, q_cu_seqlens, k_cu_seqlens).flatten(start_dim=-2)
+
     attn_out, _ = flash_attention_forward(
         module,
         q.transpose(0, 1).unsqueeze(0),
@@ -523,7 +526,7 @@ class MoonViTEncoderLayer(nn.Module):
     def attention_qkvpacked(
         self,
         x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: torch.Tensor | tuple[int, ...],
         max_seqlen: torch.Tensor,
         rope_freqs_cis: torch.Tensor | None = None,
     ):
@@ -565,7 +568,7 @@ class MoonViTEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
+        cu_seqlens: torch.Tensor | tuple[int, ...],
         max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
         **kwargs,
@@ -588,6 +591,7 @@ class MoonViT3dEncoder(nn.Module):
     def __init__(self, hidden_dim: int, num_layers: int, block_cfg: dict, use_deterministic_attn: bool = False) -> None:
         super().__init__()
         self.use_deterministic_attn = use_deterministic_attn
+        self.attn_implementation = block_cfg.get("attn_implementation", "flash_attention_2")
 
         qkv_hidden_size = (
             block_cfg['hidden_dim'] if block_cfg.get('qkv_hidden_size') is None else block_cfg['qkv_hidden_size']
@@ -623,9 +627,11 @@ class MoonViT3dEncoder(nn.Module):
         )
 
         max_seqlen = lengths.max()
-        cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
-
-        # All attention backends expect boundaries [0, end_image_1, ...].
+        if hidden_states.device.type == "npu" and self.attn_implementation == "flash_attention_2":
+            # Match K3: materialize native TND endpoints once per encoder call.
+            cu_seqlens = tuple(lengths.cumsum(dim=0, dtype=torch.int32)[1:].tolist())
+        else:
+            cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
 
         cos = rope_freqs_cis.unsqueeze(-2).real.to(torch.float32).repeat_interleave(2, dim=-1).contiguous()
         sin = rope_freqs_cis.unsqueeze(-2).imag.to(torch.float32).repeat_interleave(2, dim=-1).contiguous()
