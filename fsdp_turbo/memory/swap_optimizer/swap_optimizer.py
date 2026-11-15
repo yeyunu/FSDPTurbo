@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd.  All rights reserved.
 import logging
+import os
 from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor
@@ -106,6 +107,7 @@ class SwapOptimizerOperate:
         return resident
 
     def opt_states_initialization(self):
+        pin_host_state = os.environ.get("KIMI_OPTIMIZER_PIN_MEMORY", "1") != "0"
         for group in self.param_groups:
             for param in group["params"]:
                 device_state_dtensor = self.state[param]
@@ -130,8 +132,14 @@ class SwapOptimizerOperate:
                             # Resident: states stay on device — no host copy, storage not released
                             cpu_state[key] = None
                         else:
-                            cpu_state[key] = torch.empty_like(device_state_tensor[key], pin_memory=True, device='cpu')
-                            cpu_state[key].copy_(device_state_tensor[key], non_blocking=True)
+                            if pin_host_state:
+                                cpu_state[key] = torch.empty_like(
+                                    device_state_tensor[key], pin_memory=True, device='cpu'
+                                )
+                                cpu_state[key].copy_(device_state_tensor[key], non_blocking=True)
+                            else:
+                                # Device state was just initialized to zero.
+                                cpu_state[key] = torch.zeros_like(device_state_tensor[key], device='cpu')
 
                             device_state_tensor[key].storage().resize_(0)
 
