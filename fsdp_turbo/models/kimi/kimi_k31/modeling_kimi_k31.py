@@ -135,7 +135,6 @@ def multihead_attention(
         v.transpose(0, 1).unsqueeze(0),
         is_causal=False,
         cu_seq_lens_q=q_cu_seqlens,
-        device_type=q.device.type,
     )
     attn_out = attn_out.squeeze(0)
     if isinstance(attn_out, tuple):
