@@ -315,7 +315,7 @@ class ParallelState(metaclass=Singleton):
                 dimension_groups.append(
                     torch.distributed.new_group(
                         ranks=ranks,
-                        backend=torch.distributed.get_backend(),
+                        backend="hccl" if device_type == "npu" else ("nccl" if device_type == "cuda" else "gloo"),
                         use_local_synchronization=True,
                     )
                 )
@@ -350,7 +350,10 @@ class ParallelState(metaclass=Singleton):
         if flatten:
             # Keep the root layout for FSDP to concatenate this mesh with EP/TP.
             # An explicit backend bypasses DeviceMesh's default WORLD-group reuse.
-            flatten_options = {'backend_override': torch.distributed.get_backend()} if self.split_com_groups else {}
+            flatten_options = {}
+            if self.split_com_groups:
+                device_backend = torch.distributed.Backend.default_device_backend_map[get_accelerator_name()]
+                flatten_options['backend_override'] = (device_backend, None)
             flattened_mesh = sub_mesh._flatten(mesh_dim_name=new_mesh_name, **flatten_options)
             self.device_mesh_map[new_mesh_name] = flattened_mesh
             if self.split_com_groups:

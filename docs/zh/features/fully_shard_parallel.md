@@ -111,3 +111,8 @@ CPU Offload 开启时本地参数在 CPU 物化，否则在当前加速器物化
 ## 断点续训
 
 通过`checkpoint`配置段控制权重与优化器状态的保存/恢复，详见[断点续训](./checkpoint_resume.md)。
+
+
+### 独立子通信组与设备后端
+
+`distributed.split_com_groups=True` 时，flatten 子 mesh 按实际设备选择注册后端（NPU/HCCL、CUDA/NCCL、CPU/Gloo），使用 PyTorch 2.10 的 `(backend, pg_options)` 覆盖形式。WORLD 可保留 CPU 与设备混合后端；FSDP 的设备子组不继承额外 CPU/Gloo 后端，避免混合后端下重复创建 Gloo 子组。关闭该配置时保留原有行为。子 mesh 的共同根布局和 EP/FSDP 拼接关系保持不变。

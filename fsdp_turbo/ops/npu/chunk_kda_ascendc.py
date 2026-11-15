@@ -746,6 +746,8 @@ def chunk_kda_ascendc(
     wheel wrapper bugs may require upgrading the wheel.
     ``chunk_size=32`` continues to use the Triton recompute implementation.
     """
+    if 'skip_recompute' in kwargs:
+        disable_recompute = bool(kwargs.pop('skip_recompute'))
     if kwargs.pop('use_cache', False):
         raise ValueError("The AscendC KDA implementation currently supports training without KV cache only.")
     if initial_state is not None:
@@ -815,7 +817,31 @@ def chunk_kda_ascendc(
 
     if scale is None:
         scale = K**-0.5
-    return ChunkKDAFunction.apply(
+    # AscendC short tails (<16 rows) are not repeatable. Pad each document
+    # to a complete chunk; future zero rows cannot affect valid causal outputs.
+    # Padding outside the autograd Function also crops input gradients naturally.
+    boundaries = _host_int_tuple(cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens)
+    boundaries = (0, T) if boundaries is None else boundaries
+    lengths = [end - begin for begin, end in zip(boundaries, boundaries[1:])]
+    padded_lengths = [((length + chunk_size - 1) // chunk_size) * chunk_size for length in lengths]
+    crop_segments = []
+    if chunk_size == 64 and lengths != padded_lengths:
+        padded_boundaries = [0]
+        for length, padded_length in zip(lengths, padded_lengths):
+            crop_segments.append((padded_boundaries[-1], length))
+            padded_boundaries.append(padded_boundaries[-1] + padded_length)
+        def pad_documents(tensor):
+            segments = []
+            for begin, end, padded_length in zip(boundaries, boundaries[1:], padded_lengths):
+                segment = tensor[:, begin:end]
+                padding_shape = (tensor.shape[0], padded_length - (end - begin), *tensor.shape[2:])
+                segments.extend((segment, tensor.new_zeros(padding_shape)))
+            return torch.cat(segments, dim=1)
+        q, k, v, g, beta = (pad_documents(tensor) for tensor in (q, k, v, g, beta))
+        if cu_seqlens is not None:
+            cu_seqlens = cu_seqlens.new_tensor(padded_boundaries)
+            cu_seqlens_cpu = torch.tensor(padded_boundaries, dtype=cu_seqlens.dtype)
+    result = ChunkKDAFunction.apply(
         q,
         k,
         v,
@@ -839,3 +865,8 @@ def chunk_kda_ascendc(
         disable_recompute,
         return_intermediate_states,
     )
+
+    if crop_segments:
+        output = torch.cat([result[0][:, begin:begin + length] for begin, length in crop_segments], dim=1)
+        return (output, *result[1:])
+    return result

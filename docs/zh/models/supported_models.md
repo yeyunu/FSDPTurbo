@@ -47,3 +47,9 @@ MoE模型（Mixture of Experts Model）通过门控网络将输入路由到部�
 ## 新模型适配
 
 新模型的接入方式参见[模型适配指南](../develop/model_adaptation.md)。
+
+### Kimi K3.1 AscendC KDA 短尾重计算
+
+固定输入的短尾（chunk64余数小于16）可产生前向/重算数值差异并改变MoE路由。AscendC入口将每个文档独立补零到完整chunk，融合KDA计算后裁回有效token；文档边界同步扩展，保持因果可见性、原始路由数学及有效输入梯度。整块路径不补齐；此训练入口仍不支持初始/最终缓存状态。验证记录见runtime-multinode/tests/kda-short-tail-replay-npu.log（修复前）及后续fixed日志。
+
+短尾修复验证：7组长度重复/重算精确一致；多文档FP32参考mean=1.47871e-5、max=0.000350919；原始权重单层FSDP32/EP8/eFSDP4、不同短尾长度、CPU offload及pin_memory=True两轮重算输入/路由精确一致。完整93层训练仍待验证。

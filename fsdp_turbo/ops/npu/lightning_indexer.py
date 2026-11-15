@@ -575,6 +575,9 @@ def lightning_indexer_topk_npu(
     Uses the installed AscendC operator without a local C++ extension.
     Optional int32 ``cu_seqlens=[0,...,T]`` selects TND and local key indices.
     """
+    # LayerNorm may return FP32 under FSDP mixed precision. LI requires
+    # query and key to share the model's FP16/BF16 activation dtype.
+    key = key.to(dtype=query.dtype)
     layout = "BSND" if cu_seqlens is None else "TND"
     endpoints = None if cu_seqlens is None else cu_seqlens[1:].contiguous()
     indices, _ = torch_npu.npu_lightning_indexer(
@@ -675,6 +678,9 @@ def lightning_indexer_kl_loss_npu(
     Optional ``cu_seqlens=[0,...,T]`` selects TND; loss and gradients are
     normalized by T once, independent of the number of documents.
     """
+    # Cast outside the custom autograd function so the original FP32
+    # LayerNorm output receives the correctly converted gradient.
+    key_index = key_index.to(dtype=query_index.dtype)
     return _AscendCIndexerKLLoss.apply(
         query_index,
         key_index,

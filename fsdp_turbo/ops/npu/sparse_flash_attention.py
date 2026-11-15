@@ -41,6 +41,20 @@ _SFA = getattr(torch_npu, "npu_sparse_flash_attention", None)
 _SFA_GRAD = getattr(torch_npu, "npu_sparse_flash_attention_grad", None)
 _HAS_TORCH_NPU_SFA = _SFA is not None and _SFA_GRAD is not None
 
+# CANN releases may expose SFA/SFAG solely through TorchNPU. Both bindings
+# return softmax max/sum; preserve the same sparse kernel and autograd contract.
+try:
+    from cann_ops_transformer.ops.attention.sparse_flash_attention import sparse_flash_attention as _CANN_SFA
+    from cann_ops_transformer.ops.attention.sparse_flash_attention_grad import sparse_flash_attention_grad as _CANN_SFA_GRAD
+except ModuleNotFoundError as error:
+    if error.name not in {
+        "cann_ops_transformer.ops.attention.sparse_flash_attention",
+        "cann_ops_transformer.ops.attention.sparse_flash_attention_grad",
+    }:
+        raise
+    _CANN_SFA = _CANN_SFA_GRAD = None
+_HAS_CANN_SFA = _CANN_SFA is not None and _CANN_SFA_GRAD is not None
+
 
 def make_rope_pair(query, key, rope_head_dim, query_rope=None, key_rope=None, *, check_width=True):
     """Return the (query_rope, key_rope) pair the operator requires.
@@ -79,10 +93,10 @@ class SparseFlashAttentionFunction(torch.autograd.Function):
         layout,
         return_softmax_stats,
     ):
-        use_cann = layout == "TND" or return_softmax_stats
+        use_cann = _HAS_CANN_SFA and (layout == "TND" or return_softmax_stats)
         operation = _SFA
         if use_cann:
-            from cann_ops_transformer.ops.attention.sparse_flash_attention import sparse_flash_attention as operation
+            operation = _CANN_SFA
         out, softmax_max, softmax_sum, *_ = operation(
             query,
             key,
@@ -186,7 +200,7 @@ def _sparse_flash_attention_npu(
     indexer's [B, S, topk], with -1 marking unused slots. Packed TND inputs
     and callers requesting stats use CANN SFA/SFAG.
     """
-    use_cann = cu_seqlens is not None or return_softmax_stats
+    use_cann = _HAS_CANN_SFA and (cu_seqlens is not None or return_softmax_stats)
     if not use_cann and not _HAS_TORCH_NPU_SFA:
         log_warning_once(
             logger,
