@@ -1083,7 +1083,15 @@ class KimiK31ForConditionalGeneration(KimiK31PreTrainedModel):
         attention_mask = attention_mask.to(target_device)
 
         # 4. Fill the embeddings based on the mask.
-        final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
+        mm_merge_chunk = getattr(self.config, "mm_merge_chunk_tokens", 0)
+        if mm_merge_chunk > 0:
+            for start in range(0, batch_indices.shape[0], mm_merge_chunk):
+                end = start + mm_merge_chunk
+                final_embedding[batch_indices[start:end], text_to_overwrite[start:end]] = inputs_embeds[
+                    batch_indices[start:end], non_image_indices[start:end]
+                ]
+        else:
+            final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
         final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]
         if labels is not None:
             final_labels[batch_indices, text_to_overwrite] = labels[batch_indices, non_image_indices]
