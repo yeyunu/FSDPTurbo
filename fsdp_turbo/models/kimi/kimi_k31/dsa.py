@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 from fsdp_turbo.ops.flash_attn import flash_attention_forward
 from fsdp_turbo.ops.lightning_indexer import lightning_indexer_topk, lightning_indexer_kl_loss
-from fsdp_turbo.ops.sparse_attention import sparse_flash_attention
+from fsdp_turbo.ops.sparse_mla import sparse_mla
 from .configuration_kimi_k31 import KimiLinearConfig
 from .modeling_kimi_k31 import KimiK31ForConditionalGeneration as KimiK31BaseForConditionalGeneration
 from .modeling_kimi_linear import (
@@ -42,9 +42,7 @@ class LightningIndexer(nn.Module):
         self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
 
-    def project(
-        self, hidden_states: torch.Tensor, query_latent: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def project(self, hidden_states: torch.Tensor, query_latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project detached main-model features to indexer Q/K and unscaled weights."""
         batch, sequence, _ = hidden_states.shape
         hidden_states, query_latent = hidden_states.detach(), query_latent.detach()
@@ -93,10 +91,10 @@ class KimiDSAAttention(KimiMLAAttention):
         latent, key_rotary = compressed.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent = self.kv_a_layernorm(latent)
         if self.indexer.implementation == "ascendc":
-            return self._forward_sparse_mla(
-                hidden_states, query_latent, query, latent, key_rotary, attention_mask, cu_seqlens
-            )
-        expanded = self.kv_b_proj(latent).view(batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            return self._forward_sparse_mla(hidden_states, query_latent, query, latent, key_rotary, attention_mask, cu_seqlens)
+        expanded = self.kv_b_proj(latent).view(
+            batch, sequence, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
         key_plain, value = expanded.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         key = torch.cat((key_plain, key_rotary.unsqueeze(2).expand(-1, -1, self.num_heads, -1)), dim=-1)
         query, key, value = (tensor.transpose(1, 2) for tensor in (query, key, value))
@@ -105,8 +103,7 @@ class KimiDSAAttention(KimiMLAAttention):
         if cu_seqlens is not None:
             document_ids = torch.repeat_interleave(
                 torch.arange(cu_seqlens.numel() - 1, device=hidden_states.device),
-                torch.diff(cu_seqlens.flatten()),
-                output_size=sequence,
+                torch.diff(cu_seqlens.flatten()), output_size=sequence,
             )
             visible = visible & (document_ids[:, None] == document_ids[None, :])
         if attention_mask is not None:
@@ -169,14 +166,10 @@ class KimiDSAAttention(KimiMLAAttention):
             output = output * self.g_proj(hidden_states).sigmoid()
         return self.o_proj(output)
 
+
     def _forward_sparse_mla(
-        self,
-        hidden_states: torch.Tensor,
-        query_latent: torch.Tensor,
-        query: torch.Tensor,
-        latent: torch.Tensor,
-        key_rotary: torch.Tensor,
-        attention_mask: torch.Tensor | None,
+        self, hidden_states: torch.Tensor, query_latent: torch.Tensor, query: torch.Tensor,
+        latent: torch.Tensor, key_rotary: torch.Tensor, attention_mask: torch.Tensor | None,
         cu_seqlens: torch.Tensor | None,
     ) -> torch.Tensor:
         """Apply absorbed MLA with the same parameter tensors and explicit source scale."""
@@ -196,16 +189,11 @@ class KimiDSAAttention(KimiMLAAttention):
                 valid = visible.any(-1)
             lengths = valid.sum(-1).tolist()
             for item, length in enumerate(lengths):
-                if not torch.equal(valid[item], positions < length) or (
-                    attention_mask.ndim != 2
-                    and not torch.equal(visible[item, :length, :length], causal[:length, :length])
-                ):
-                    raise NotImplementedError(
-                        "Fused DSA supports causal sequences with optional right padding; packed masks require the eager impl"
-                    )
+                if (not torch.equal(valid[item], positions < length)
+                        or (attention_mask.ndim != 2 and not torch.equal(visible[item, :length, :length], causal[:length, :length]))):
+                    raise NotImplementedError("Fused DSA supports causal sequences with optional right padding; packed masks require the eager impl")
         projection = self.kv_b_proj.weight.view(
-            self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
-        )
+            self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
         key_projection, value_projection = projection.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
         # Absorb the key projection into Q and move the value projection after
         # attention, preserving the original projection parameters and scale.
@@ -215,7 +203,7 @@ class KimiDSAAttention(KimiMLAAttention):
         # For Hidx=32,Didx=128 the combined multiplier is exactly 1/64,
         # representable in BF16 without an additional rounding operation.
         index_weights = index_weights * (self.indexer.num_heads * self.indexer.head_dim) ** -0.5
-        from dsa_trace import training_stage
+        from fsdp_turbo.ops.kimi_alignment_trace import training_stage
         training_stage(self, query_latent=query_latent, query=query, latent=latent,
             key_rotary=key_rotary, query_absorbed=query_absorbed,
             index_query=index_query, index_key=index_key, index_weights=index_weights,
@@ -230,62 +218,27 @@ class KimiDSAAttention(KimiMLAAttention):
             if length == 0:
                 outputs.append(hidden_states.new_zeros((1, sequence, self.num_heads, self.v_head_dim)))
                 continue
-            parts = [
-                tensor[item, :length]
-                for tensor in (
-                    index_query,
-                    index_key,
-                    index_weights,
-                    query_absorbed,
-                    latent.unsqueeze(2),
-                    query_rope,
-                    key_rotary.unsqueeze(2),
-                )
-            ]
+            parts = [tensor[item, :length] for tensor in
+                     (index_query, index_key, index_weights, query_absorbed,
+                      latent.unsqueeze(2), query_rope, key_rotary.unsqueeze(2))]
             if cu_seqlens is None:
                 # Rebuild the canonical singleton batch stride for BSND.
                 parts = [tensor.unsqueeze(0) for tensor in parts]
             index_query_part, index_key_part, weights_part, query_part, key_part, query_rope_part, key_rope_part = parts
-            indices = lightning_indexer_topk(
-                index_query_part, index_key_part, weights_part, self.indexer.topk, cu_seqlens
-            )
-            output, maximum, denominator = sparse_flash_attention(
-                query_part,
-                key_part,
-                key_part,
-                indices.squeeze(-2),
-                self.scaling,
-                rope_head_dim=self.qk_rope_head_dim,
-                query_rope=query_rope_part,
-                key_rope=key_rope_part,
-                cu_seqlens=cu_seqlens,
-                return_softmax_stats=True,
-            )
+            indices = lightning_indexer_topk(index_query_part, index_key_part, weights_part,
+                                             self.indexer.topk, cu_seqlens)
+            output, maximum, denominator = sparse_mla(query_part, key_part, query_rope_part,
+                                                       key_rope_part, indices, self.scaling, cu_seqlens)
             training_stage(self, indices=indices, attention_core=output,
                 maximum=maximum, denominator=denominator,
                 query_part=query_part, key_part=key_part,
                 query_rope=query_rope_part, key_rope=key_rope_part)
             if self.training:
-                losses.append(
-                    lightning_indexer_kl_loss(
-                        index_query_part,
-                        index_key_part,
-                        weights_part,
-                        query_part.detach(),
-                        key_part.detach(),
-                        query_rope_part.detach(),
-                        key_rope_part.detach(),
-                        indices,
-                        maximum,
-                        denominator,
-                        self.scaling,
-                        cu_seqlens,
-                    )
-                    * length
-                )
-            output = torch.einsum("...hr,hdr->...hd", output, value_projection).reshape(
-                1, length, self.num_heads, self.v_head_dim
-            )
+                losses.append(lightning_indexer_kl_loss(index_query_part, index_key_part, weights_part,
+                                                         query_part.detach(), key_part.detach(), query_rope_part.detach(),
+                                                         key_rope_part.detach(), indices, maximum, denominator,
+                                                         self.scaling, cu_seqlens) * length)
+            output = torch.einsum("...hr,hdr->...hd", output, value_projection).reshape(1, length, self.num_heads, self.v_head_dim)
             training_stage(self, value_output=output)
             outputs.append(F.pad(output, (0, 0, 0, 0, 0, sequence - length)))
         if self.training:
@@ -294,7 +247,6 @@ class KimiDSAAttention(KimiMLAAttention):
         if self.use_output_gate:
             output = output * self.g_proj(hidden_states).sigmoid()
         return self.o_proj(output)
-
 
 class KimiTurboDecoderLayer(KimiDecoderLayer):
     """Construct the EP-compatible MoE subclass without changing reference classes."""

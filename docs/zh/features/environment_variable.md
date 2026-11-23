@@ -68,3 +68,10 @@ export ASCEND_LAUNCH_BLOCKING=1
 ## MoonEP调试
 
 `trace_enabled`、`trace_sync_enabled`、`vmm_probe_enabled`、`npu_async_comm` 已迁到 `ep_plan.moonep_config`，默认全部关闭。见[专家并行](./expert_parallel.md)。
+
+
+## Kimi训推一致性实验
+
+KIMI_ALIGNMENT_RECURRENT_KDA仅在值为1时启用参考递归路径，
+默认关闭。读取入口为fsdp_turbo.utils.env.kimi_alignment_enabled。
+该路径用于精度验证，性能尚待评测。

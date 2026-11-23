@@ -29,3 +29,8 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 
 __all__ = ["env_flag", "get_local_rank", "sparse_flash_mla_validation_enabled"]
+
+
+def kimi_alignment_enabled() -> bool:
+    """Enable the opt-in deterministic Kimi recurrence."""
+    return os.environ.get("KIMI_ALIGNMENT_RECURRENT_KDA") == "1"

@@ -73,7 +73,7 @@ else:
     flash_attn_varlen_func = None
 from fsdp_turbo.utils.device import get_accelerator_name
 
-from fsdp_turbo.ops.flash_attn import flash_attention_forward, vision_attention
+from fsdp_turbo.ops.flash_attn import flash_attention_forward
 from fsdp_turbo.ops.rope import rope
 
 
@@ -105,14 +105,12 @@ def multihead_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    q_cu_seqlens: torch.Tensor | tuple[int, ...] | None = None,
-    k_cu_seqlens: torch.Tensor | tuple[int, ...] | None = None,
+    q_cu_seqlens: torch.Tensor | None = None,
+    k_cu_seqlens: torch.Tensor | None = None,
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     deterministic: bool = False,
     skip_recompute: bool = False,
-    *,
-    module: nn.Module,
 ):
     """Multi-head attention using flash attention 2.
 
@@ -128,11 +126,8 @@ def multihead_attention(
         output: shape (batch_size, seqlen, dim) or (tot_seqlens, dim) if packing,
             where dim = num_heads * head_dim
     """
-    if isinstance(q_cu_seqlens, tuple) and isinstance(k_cu_seqlens, tuple):
-        return vision_attention(q, k, v, q_cu_seqlens, k_cu_seqlens).flatten(start_dim=-2)
-
     attn_out, _ = flash_attention_forward(
-        module,
+        None,
         q.transpose(0, 1).unsqueeze(0),
         k.transpose(0, 1).unsqueeze(0),
         v.transpose(0, 1).unsqueeze(0),
@@ -526,7 +521,7 @@ class MoonViTEncoderLayer(nn.Module):
     def attention_qkvpacked(
         self,
         x: torch.Tensor,
-        cu_seqlens: torch.Tensor | tuple[int, ...],
+        cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor,
         rope_freqs_cis: torch.Tensor | None = None,
     ):
@@ -559,7 +554,6 @@ class MoonViTEncoderLayer(nn.Module):
             max_seqlen_q=max_seqlen,
             deterministic=self.use_deterministic_attn,
             skip_recompute=self.skip_flash_attn_recompute,
-            module=self,
         )
 
         attn_out = self.wo(attn_out)
@@ -568,7 +562,7 @@ class MoonViTEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor | tuple[int, ...],
+        cu_seqlens: torch.Tensor,
         max_seqlen: int,
         rope_freqs_cis: torch.Tensor | None = None,
         **kwargs,
@@ -591,7 +585,6 @@ class MoonViT3dEncoder(nn.Module):
     def __init__(self, hidden_dim: int, num_layers: int, block_cfg: dict, use_deterministic_attn: bool = False) -> None:
         super().__init__()
         self.use_deterministic_attn = use_deterministic_attn
-        self.attn_implementation = block_cfg.get("attn_implementation", "flash_attention_2")
 
         qkv_hidden_size = (
             block_cfg['hidden_dim'] if block_cfg.get('qkv_hidden_size') is None else block_cfg['qkv_hidden_size']
@@ -627,11 +620,9 @@ class MoonViT3dEncoder(nn.Module):
         )
 
         max_seqlen = lengths.max()
-        if hidden_states.device.type == "npu" and self.attn_implementation == "flash_attention_2":
-            # Match K3: materialize native TND endpoints once per encoder call.
-            cu_seqlens = tuple(lengths.cumsum(dim=0, dtype=torch.int32)[1:].tolist())
-        else:
-            cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = lengths.to(hidden_states.device).cumsum(dim=0, dtype=torch.int32)
+
+        # All attention backends expect boundaries [0, end_image_1, ...].
 
         cos = rope_freqs_cis.unsqueeze(-2).real.to(torch.float32).repeat_interleave(2, dim=-1).contiguous()
         sin = rope_freqs_cis.unsqueeze(-2).imag.to(torch.float32).repeat_interleave(2, dim=-1).contiguous()
@@ -1083,15 +1074,7 @@ class KimiK31ForConditionalGeneration(KimiK31PreTrainedModel):
         attention_mask = attention_mask.to(target_device)
 
         # 4. Fill the embeddings based on the mask.
-        mm_merge_chunk = getattr(self.config, "mm_merge_chunk_tokens", 0)
-        if mm_merge_chunk > 0:
-            for start in range(0, batch_indices.shape[0], mm_merge_chunk):
-                end = start + mm_merge_chunk
-                final_embedding[batch_indices[start:end], text_to_overwrite[start:end]] = inputs_embeds[
-                    batch_indices[start:end], non_image_indices[start:end]
-                ]
-        else:
-            final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
+        final_embedding[batch_indices, text_to_overwrite] = inputs_embeds[batch_indices, non_image_indices]
         final_attention_mask[batch_indices, text_to_overwrite] = attention_mask[batch_indices, non_image_indices]
         if labels is not None:
             final_labels[batch_indices, text_to_overwrite] = labels[batch_indices, non_image_indices]
@@ -1195,19 +1178,14 @@ class KimiK31ForConditionalGeneration(KimiK31PreTrainedModel):
                 cu_seqlens = cu_seqlens.squeeze(0)
             if cu_seqlens.ndim != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
                 raise ValueError("cu_seqlens must be an integer vector or a single-row integer matrix.")
-            if (
-                cu_seqlens.numel() < 2
-                or cu_seqlens[0].item() != 0
-                or cu_seqlens[-1].item() != sequence_shape[1]
-                or not torch.all(cu_seqlens[1:] > cu_seqlens[:-1]).item()
-            ):
+            if (cu_seqlens.numel() < 2 or cu_seqlens[0].item() != 0
+                    or cu_seqlens[-1].item() != sequence_shape[1]
+                    or not torch.all(cu_seqlens[1:] > cu_seqlens[:-1]).item()):
                 raise ValueError("cu_seqlens must strictly increase from zero to the physical sequence length.")
             if attention_mask is not None:
-                if (
-                    attention_mask.shape != sequence_shape
-                    or not torch.all((attention_mask == 0) | (attention_mask == 1)).item()
-                    or torch.any(attention_mask[:, 1:] > attention_mask[:, :-1]).item()
-                ):
+                if (attention_mask.shape != sequence_shape
+                        or not torch.all((attention_mask == 0) | (attention_mask == 1)).item()
+                        or torch.any(attention_mask[:, 1:] > attention_mask[:, :-1]).item()):
                     raise ValueError("Packed attention_mask must be a binary token mask with optional right padding.")
             target_device = input_ids.device if input_ids is not None else inputs_embeds.device
             if attention_mask is None:
@@ -1227,11 +1205,8 @@ class KimiK31ForConditionalGeneration(KimiK31PreTrainedModel):
             inputs_embeds = self.get_input_embeddings()(input_ids)
 
             # 2. Merge text and images
-            if (
-                pixel_values is not None
-                and len(pixel_values) > 0
-                and (input_ids.shape[1] != 1 or cu_seqlens is not None)
-            ):
+            if (pixel_values is not None and len(pixel_values) > 0
+                    and (input_ids.shape[1] != 1 or cu_seqlens is not None)):
                 image_features = self._extract_image_features(pixel_values, grid_thws)
                 if self.mm_projector:
                     image_features = self.mm_projector(image_features)
@@ -1263,12 +1238,8 @@ class KimiK31ForConditionalGeneration(KimiK31PreTrainedModel):
                 patch_size = self.vision_tower.patch_size
                 patch_height, patch_width = (patch_size, patch_size) if isinstance(patch_size, int) else patch_size
                 dummy_pixels = torch.zeros(
-                    kernel_height * kernel_width,
-                    3,
-                    patch_height,
-                    patch_width,
-                    device=inputs_embeds.device,
-                    dtype=self.vision_tower.patch_embed.proj.weight.dtype,
+                    kernel_height * kernel_width, 3, patch_height, patch_width,
+                    device=inputs_embeds.device, dtype=self.vision_tower.patch_embed.proj.weight.dtype,
                 )
                 dummy_grid = torch.tensor([[1, kernel_height, kernel_width]], device=inputs_embeds.device)
                 dummy_features = self._extract_image_features(dummy_pixels, dummy_grid)

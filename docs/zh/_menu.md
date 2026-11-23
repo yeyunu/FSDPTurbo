@@ -26,3 +26,5 @@
 - [性能调优](./training/tuning/performance_tuning.md)
 - [特性开发](./develop/feature_development.md)
 - [FAQ](FAQ.md)
+
+- [Kimi训推一致性](features/kimi_alignment.md)

@@ -44,7 +44,6 @@
 
 import math
 from collections.abc import Callable
-from functools import partial
 from typing import Any
 
 import torch
@@ -111,7 +110,7 @@ class KimiK_3_MoeRMSNormGated(nn.Module):
 
     def forward(self, hidden_states, gate=None):
         input_dtype = hidden_states.dtype
-        if hidden_states.device.type == "npu":
+        if get_accelerator_name() == "npu":
             hidden_states = rms_norm(hidden_states, self.weight, self.variance_epsilon)
             hidden_states = hidden_states * F.sigmoid(gate)
         else:
@@ -170,7 +169,7 @@ class SituAndMul(nn.Module):
             beta=self.beta,
             linear_beta=self.linear_beta,
             activate_left=True,
-            use_eager=self.use_eager or x.device.type == "cpu",
+            use_eager=self.use_eager,
         )
 
 
@@ -317,7 +316,7 @@ class KimiRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        if hidden_states.device.type == "npu":
+        if get_accelerator_name() == "npu":
             if hidden_states.dtype != self.weight.dtype:
                 hidden_states = hidden_states.to(self.weight.dtype)
             return rms_norm(hidden_states, self.weight, self.variance_epsilon)
@@ -720,7 +719,7 @@ class KimiDeltaAttention(nn.Module):
             lower_bound=self.gate_lower_bound,
             transpose_state_layout=True,
             cu_seqlens=cu_seqlens,
-            disable_recompute=getattr(self.config, "skip_kda_recompute", None),
+            skip_recompute=getattr(self.config, "skip_kda_recompute", False),
         )
 
         if cache_params is not None:
@@ -1009,12 +1008,7 @@ def _apply_attention_residual(
 ) -> torch.Tensor:
     # A plain Linear can use the fused weight-only operator. Wrappers such as
     # PEFT must run their forward so adapters, dropout and FSDP hooks participate.
-    if type(projection) is nn.Linear:  # pylint: disable=unidiomatic-typecheck
-        # The fused NPU backward requires at least 64 tokens.
-        if prefix_sum.device.type == "npu" and prefix_sum.shape[0] < 64:
-            return attn_res(
-                prefix_sum, block_residual, projection.weight, norm_weight, variance_epsilon, device_type="cpu"
-            )
+    if type(projection) is nn.Linear:
         return residual_function(prefix_sum, block_residual, projection.weight, norm_weight, variance_epsilon)
     values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
     values_float = values.float()
@@ -1056,7 +1050,7 @@ class KimiDecoderLayer(nn.Module):
         self.use_attn_residuals = getattr(config, "attn_res_block_size", None) is not None
         if self.use_attn_residuals:
             self.attn_res_block_size = config.attn_res_block_size
-            self.attn_res_fn = partial(attn_res, implementation=config.attn_res_implementation)
+            self.attn_res_fn = attn_res
             self.self_attention_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.mlp_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.self_attention_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
@@ -1246,9 +1240,15 @@ class KimiLinearModel(KimiPreTrainedModel):
         if self.use_attn_residuals:
             self.output_attn_res_norm = KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
-            self.attn_res_fn = partial(attn_res, implementation=config.attn_res_implementation)
+            self.attn_res_fn = attn_res
 
-        if getattr(config, "_attn_implementation", None) is None:
+        if getattr(config, "_attn_implementation", None) is not None:
+            # if config._attn_implementation != "flash_attention_2":
+            #     logger.warning_once(f"Ignoring the provided attention implementation {config._attn_implementation}")
+            #     logger.warning_once("Using flash_attention_2 backend instead.")
+            #     config._attn_implementation = "flash_attention_2"
+            logger.warning_once("Using {config._attn_implementation} backend.")
+        else:
             config._attn_implementation = "flash_attention_2"
 
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
@@ -1306,16 +1306,12 @@ class KimiLinearModel(KimiPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = (
-            attention_mask
-            if cu_seqlens is not None
-            else create_causal_mask(
-                config=self.config,
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
-            )
+        causal_mask = attention_mask if cu_seqlens is not None else create_causal_mask(
+            config=self.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
         )
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
 
