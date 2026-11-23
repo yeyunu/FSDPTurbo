@@ -23,6 +23,11 @@ def chunk_kda(
     """
     if disable_recompute is not None:
         kwargs["disable_recompute"] = disable_recompute
+    from kda_alignment import enabled, training_kda
+    if enabled() and q.device.type == 'npu':
+        def native(q, k, v, g, beta, **options):
+            return dispatch_op('chunk_kda', q, k, v, g, beta, device_type=q.device.type, **options)
+        return training_kda(native, q, k, v, g, beta, args, kwargs)
     return dispatch_op('chunk_kda', q, k, v, g, beta, *args, device_type=q.device.type, **kwargs)
 
 

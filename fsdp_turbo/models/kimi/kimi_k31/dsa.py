@@ -215,6 +215,11 @@ class KimiDSAAttention(KimiMLAAttention):
         # For Hidx=32,Didx=128 the combined multiplier is exactly 1/64,
         # representable in BF16 without an additional rounding operation.
         index_weights = index_weights * (self.indexer.num_heads * self.indexer.head_dim) ** -0.5
+        from dsa_trace import training_stage
+        training_stage(self, query_latent=query_latent, query=query, latent=latent,
+            key_rotary=key_rotary, query_absorbed=query_absorbed,
+            index_query=index_query, index_key=index_key, index_weights=index_weights,
+            key_projection=key_projection, value_projection=value_projection)
         if cu_seqlens is not None:
             # Remove global right padding, including documents entirely in it.
             # All valid documents share one TND call and document-local indices.
@@ -256,6 +261,10 @@ class KimiDSAAttention(KimiMLAAttention):
                 cu_seqlens=cu_seqlens,
                 return_softmax_stats=True,
             )
+            training_stage(self, indices=indices, attention_core=output,
+                maximum=maximum, denominator=denominator,
+                query_part=query_part, key_part=key_part,
+                query_rope=query_rope_part, key_rope=key_rope_part)
             if self.training:
                 losses.append(
                     lightning_indexer_kl_loss(
@@ -277,6 +286,7 @@ class KimiDSAAttention(KimiMLAAttention):
             output = torch.einsum("...hr,hdr->...hd", output, value_projection).reshape(
                 1, length, self.num_heads, self.v_head_dim
             )
+            training_stage(self, value_output=output)
             outputs.append(F.pad(output, (0, 0, 0, 0, 0, sequence - length)))
         if self.training:
             self.indexer_loss = sum(losses) / max(sum(lengths), 1) if losses else index_weights.float().sum() * 0

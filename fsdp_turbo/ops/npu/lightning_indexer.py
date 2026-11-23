@@ -681,6 +681,22 @@ def lightning_indexer_kl_loss_npu(
     # Cast outside the custom autograd function so the original FP32
     # LayerNorm output receives the correctly converted gradient.
     key_index = key_index.to(dtype=query_index.dtype)
+    if query.shape[-2] not in {32, 48, 64, 128}:
+        # This CANN LIG kernel rejects other teacher head counts (K3.1 uses 96).
+        # Keep the KL objective and autograd, using the device-agnostic reference
+        # with the tensors on their original NPU device.
+        import warnings
+        from fsdp_turbo.ops.cpu.lightning_indexer import lightning_indexer_kl_loss_cpu
+        warnings.warn(
+            f"LIG teacher heads={query.shape[-2]} unsupported by fused CANN kernel; "
+            "using differentiable PyTorch KL reference on the current device.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return lightning_indexer_kl_loss_cpu(
+            query_index, key_index, weights, query, key, query_rope, key_rope,
+            indices, maximum, denominator, scale, cu_seqlens,
+        )
     return _AscendCIndexerKLLoss.apply(
         query_index,
         key_index,

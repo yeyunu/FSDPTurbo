@@ -116,6 +116,7 @@ class SparseFlashAttentionFunction(torch.autograd.Function):
             return_softmax_lse=True,
         )
         ctx.save_for_backward(query, key, value, sparse_indices, query_rope, key_rope, out, softmax_max, softmax_sum)
+        ctx.shared_kv = key.data_ptr() == value.data_ptr() and key.shape == value.shape
         ctx.scale = scale
         ctx.sparse_mode = sparse_mode
         ctx.actual_seq_qlen = actual_seq_qlen
@@ -141,25 +142,47 @@ class SparseFlashAttentionFunction(torch.autograd.Function):
             operation = sparse_flash_attention_grad
             native_args = ()
             native_kwargs = dict(sinks=None, scale_value=ctx.scale, sparse_block_size=SFA_SPARSE_BLOCK_SIZE)
-        dq, dk, dv, dq_rope, dk_rope, *_ = operation(
-            query,
-            key,
-            value,
-            sparse_indices,
-            d_out.contiguous(),
-            out,
-            softmax_max,
-            softmax_sum,
-            *native_args,
-            query_rope=query_rope,
-            key_rope=key_rope,
-            actual_seq_qlen=ctx.actual_seq_qlen,
-            actual_seq_kvlen=ctx.actual_seq_kvlen,
-            layout=ctx.layout,
-            sparse_mode=int(ctx.sparse_mode),
-            attention_mode=SFA_ATTENTION_MODE,
-            **native_kwargs,
-        )
+        def call_grad(q, qr, dout, output, maximum, denominator):
+            return operation(
+                q, key, value, sparse_indices, dout.contiguous(), output,
+                maximum, denominator, *native_args,
+                query_rope=qr, key_rope=key_rope,
+                actual_seq_qlen=ctx.actual_seq_qlen,
+                actual_seq_kvlen=ctx.actual_seq_kvlen,
+                layout=ctx.layout, sparse_mode=int(ctx.sparse_mode),
+                attention_mode=SFA_ATTENTION_MODE, **native_kwargs,
+            )
+
+        if query.shape[-2] == 96:
+            if not ctx.shared_kv:
+                raise NotImplementedError("96-head SFAG compatibility path is validated only for MLA shared K/V latent")
+            # CANN 9.2 SFAG supports 48 query heads but rejects 96. Heads are
+            # independent in the forward softmax; only shared K/V gradients
+            # must be summed. Preserve the original 96-head forward and its
+            # exact saved output/max/sum, splitting only the backward call.
+            log_warning_once(logger, "96-head SFAG uses two 48-head backward calls with FP32 shared-gradient accumulation")
+            if softmax_max.shape[-1] != 96 or softmax_sum.shape[-1] != 96:
+                raise RuntimeError("Unexpected SFAG softmax-stat head layout for 96-head backward")
+            parts = []
+            for start in (0, 48):
+                heads = slice(start, start + 48)
+                parts.append(call_grad(
+                    query[..., heads, :].contiguous(),
+                    query_rope[..., heads, :].contiguous(),
+                    d_out[..., heads, :].contiguous(),
+                    out[..., heads, :].contiguous(),
+                    softmax_max[..., heads].contiguous(),
+                    softmax_sum[..., heads].contiguous(),
+                ))
+            dq = torch.cat([p[0] for p in parts], dim=-2)
+            dk = (parts[0][1].float() + parts[1][1].float()).to(key)
+            dv = (parts[0][2].float() + parts[1][2].float()).to(value)
+            dq_rope = torch.cat([p[3] for p in parts], dim=-2)
+            dk_rope = (parts[0][4].float() + parts[1][4].float()).to(key_rope)
+        else:
+            dq, dk, dv, dq_rope, dk_rope, *_ = call_grad(
+                query, query_rope, d_out, out, softmax_max, softmax_sum
+            )
         # One gradient per positional argument of apply(). The rope gradients are
         # dropped for a no-rope model because its rope tensors are constants.
         return (
