@@ -54,11 +54,14 @@ def expert_parallelize_modules(
         module.num_local_experts = module.num_global_experts // ep_size
         local_expert_indices_offset = ep_rank * module.num_local_experts
         module.local_expert_indices = [local_expert_indices_offset + i for i in range(module.num_local_experts)]
+        # This small integer lookup depends only on the runtime EP layout.
+        # Build it on the host on Ascend to avoid launching Range during sharding.
+        index_device = "cpu" if ep_mesh.device_type == "npu" else ep_mesh.device_type
         module.expert_ids_per_ep_rank = torch.arange(
             module.num_global_experts,
             dtype=torch.int32,
-            device=ep_mesh.device_type,
-        ).remainder(module.num_local_experts)
+            device=index_device,
+        ).remainder(module.num_local_experts).to(ep_mesh.device_type)
 
         # Per-container a2a split-cache policy; left unset keeps the original paths.
         if dispatch_split_policy is not None:

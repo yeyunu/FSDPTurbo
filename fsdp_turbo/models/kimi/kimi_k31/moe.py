@@ -632,6 +632,24 @@ class KimiMoeExperts(nn.Module):
             fused=True,
         )
 
+    def ep_forward_mc2(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+        *,
+        ep_group: Any,
+        fixed_router: bool,
+    ) -> torch.Tensor:
+        """Reuse K3's MC2 transport with K3.1's weights and SiTU activation."""
+
+        from ..kimi_k3.kimi_moe_patch import PatchKimiMoeExperts
+
+        return PatchKimiMoeExperts.ep_forward_mc2(
+            self, hidden_states, top_k_index, top_k_weights,
+            ep_group=ep_group, fixed_router=fixed_router,
+        )
+
     def _ep_forward(
         self,
         hidden_states: torch.Tensor,
@@ -670,7 +688,7 @@ class KimiMoeExperts(nn.Module):
             torch.zeros(self.num_global_experts, dtype=torch.int32, device=top_k_index.device),
         )
         indices, split_sizes = dispatch_preprocess(
-            ep_group, top_k_index, self.num_global_experts, expert_ids_per_ep_rank
+            ep_group, top_k_index, self.num_global_experts, expert_ids_per_ep_rank, expert_module=self
         )
         if fused and (indices[0] == 0).any():
             fused = False

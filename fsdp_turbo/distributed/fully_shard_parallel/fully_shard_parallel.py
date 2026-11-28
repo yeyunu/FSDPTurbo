@@ -39,9 +39,15 @@ def fully_shard_parallel_modules(
     strategy = get_fsdp_strategy(fsdp_plan.fsdp_implementation)
     fully_shard_fn = strategy.get_unified_fully_shard_fn()
 
+    parents = {child: parent for parent in model.modules() for child in parent.children()
+               if getattr(child, "_kimi_preserve_gate_precision", False)}
+    split_attention = {}
     for module, plan in fsdp_modules.items():
         module_config = config.copy()
         module_config.update(plan)
+        if module in parents:
+            split_attention[module] = module_config
+            continue
         if getattr(module, "_fsdp_turbo_chunk_loss_head", False):
             # This head returns an FP32 loss sum rather than BF16 logits.
             # Keep the scalar in FP32 until normalization outside the head.
@@ -54,6 +60,30 @@ def fully_shard_parallel_modules(
             )
         hook_module = find_hook_module(module, hook_modules)
         fully_shard_fn(module, hook_module=hook_module, **module_config)
+    # Wrap independent MLP/expert units first. Each remaining parameter belongs
+    # to one group, with the same checkpoint names and runtime mesh as before.
+    if parents.keys() != split_attention.keys():
+        raise RuntimeError("Each precision-preserving KDA attention needs its own FSDP plan entry")
+    for attention, options in split_attention.items():
+        decoder = parents[attention]
+        if decoder in fsdp_modules:
+            raise RuntimeError("KDA decoder and its attention cannot both be pre-wrapped")
+        auxiliary = {attention.A_log, attention.dt_bias}
+        if any(p.dtype != torch.float32 for p in auxiliary):
+            raise RuntimeError("KDA checkpoint auxiliaries must use FP32 storage")
+        policy = options["mp_policy"]
+        dense_options = dict(options)
+        dense_options["ignored_params"] = options["ignored_params"] | auxiliary
+        # This extra decoder-boundary hook manages weights only. Leave its input
+        # and output activation dtypes as dictated by the model's own forward.
+        dense_options["mp_policy"] = MixedPrecisionPolicy(param_dtype=policy.param_dtype,
+            reduce_dtype=policy.reduce_dtype, output_dtype=None, cast_forward_inputs=False)
+        fully_shard_fn(decoder, **dense_options)
+        aux_options = dict(options)
+        aux_options["ignored_params"] = options["ignored_params"] | (set(attention.parameters()) - auxiliary)
+        aux_options["mp_policy"] = MixedPrecisionPolicy(param_dtype=None, reduce_dtype=policy.reduce_dtype,
+            output_dtype=policy.output_dtype, cast_forward_inputs=False)
+        fully_shard_fn(attention, **aux_options)
     fully_shard_fn(model, **config)
     if ignored_modules and fsdp_mesh.device_type != "cpu":
         device = torch.device(f"{fsdp_mesh.device_type}:{torch.accelerator.current_device_index()}")
@@ -245,6 +275,10 @@ def get_prefetch_order(
                 if module in fsdp_modules and module_name_match(pattern, name)
             )
         )
+    if any(getattr(unit, "_kimi_preserve_gate_precision", False) for unit in wrapped_modules_in_order):
+        parents = {child: parent for parent in model.modules() for child in parent.children()
+                   if getattr(child, "_kimi_preserve_gate_precision", False)}
+        wrapped_modules_in_order = [parents.get(unit, unit) for unit in wrapped_modules_in_order]
     return wrapped_modules_in_order
 
 

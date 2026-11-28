@@ -1,6 +1,10 @@
 # Copyright (c) 2025, Huawei Technologies Co., Ltd. All rights reserved.
 import torch
 from fsdp_turbo.ops.registry import register_op
+from fsdp_turbo.utils.log import print_rank
+
+_mc2_forward_logged = False
+_mc2_inference_logged = False
 
 try:
     import torch_npu
@@ -36,6 +40,11 @@ class AllToAllGroupedMatmul(torch.autograd.Function):
             trans_mm_weight=shared_weight is not None,
             permute_out_flag=True,
         )
+
+        global _mc2_forward_logged
+        if not _mc2_forward_logged:
+            print_rank(print, f"KIMI_MC2_NPU_EXECUTED npu_alltoallv_gmm ep_size={ep_world_size}")
+            _mc2_forward_logged = True
 
         ctx.save_for_backward(weights, shared_inputs, shared_weight, permute_output)
         ctx.hcomm = hcomm
@@ -167,6 +176,22 @@ class GroupedMatmulAllToAll(torch.autograd.Function):
 def all2all_grouped_matmul_npu(
     inputs, weights, group, send_counts, recv_counts, shared_inputs=None, shared_weight=None, group_list_device=None
 ):
+    if not torch.is_grad_enabled():
+        rank = torch.distributed.get_global_rank(group, torch.distributed.get_rank(group))
+        hcomm = group._get_backend(torch.device("npu")).get_hccl_comm_name(rank)
+        output, shared_output, _ = torch_npu.npu_alltoallv_gmm(
+            inputs, weights, hcomm, torch.distributed.get_world_size(group),
+            send_counts.tolist() if torch.is_tensor(send_counts) else send_counts,
+            recv_counts.tolist() if torch.is_tensor(recv_counts) else recv_counts,
+            mm_x=shared_inputs, mm_weight=shared_weight,
+            trans_gmm_weight=True, trans_mm_weight=shared_weight is not None,
+            permute_out_flag=False,
+        )
+        global _mc2_inference_logged
+        if not _mc2_inference_logged:
+            print_rank(print, "KIMI_MC2_OLD_LOGPROB_NPU_EXECUTED npu_alltoallv_gmm permute_out=False")
+            _mc2_inference_logged = True
+        return (output, shared_output) if shared_inputs is not None else output
     output = AllToAllGroupedMatmul.apply(
         inputs, weights, group, send_counts, recv_counts, shared_inputs, shared_weight, group_list_device
     )

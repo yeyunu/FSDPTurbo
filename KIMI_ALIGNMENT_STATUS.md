@@ -1,4 +1,8 @@
-# Kimi K3.1 BF16 alignment experiment
+# Two-node full-depth acceptance (2026-11-28)
+
+93 layers, 56 routed experts, top-16, BF16 on 16 Ascend devices. Rollout, independent old and gradient-enabled actor agreed on all 14,022 valid response tokens across three PPO updates. [Checkpoint module for the private model-code view](examples/kimi_alignment/full93/checkpoint-code/moe.py) · [FSDP precision groups](fsdp_turbo/distributed/fully_shard_parallel/fully_shard_parallel.py)
+
+## Historical four-layer snapshot (2026-11-23)
 
 This branch preserves a coordinated four-layer experiment across yeyunu/verl,
 yeyunu/vllm-ascend, yeyunu/vllm, and yeyunu/FSDPTurbo.
